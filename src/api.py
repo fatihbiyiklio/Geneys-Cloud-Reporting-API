@@ -1,5 +1,5 @@
 import requests
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 
 class GenesysAPI:
     def __init__(self, auth_data):
@@ -125,7 +125,7 @@ class GenesysAPI:
 
     def get_queue_daily_stats(self, queue_ids, interval=None):
         if not interval:
-            now_utc = datetime.now(UTC)
+            now_utc = datetime.now(timezone.utc)
             start_of_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
             interval = f"{start_of_day.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{now_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
 
