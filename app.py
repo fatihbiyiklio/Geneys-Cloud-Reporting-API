@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta, time, UTC
+from datetime import datetime, timedelta, time, timezone
 import sys
 import os
 import json
@@ -796,7 +796,7 @@ else:
                      now_local = datetime.now()
                      start_local = datetime.combine(now_local.date(), time(0, 0))
                      start_utc = start_local - timedelta(hours=3)
-                     end_utc = datetime.now(UTC)
+                     end_utc = datetime.now(timezone.utc)
                      query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
                 
                 elif st.session_state.dashboard_mode == "Yesterday":
