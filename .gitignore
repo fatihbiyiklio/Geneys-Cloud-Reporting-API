@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.app.pid
+.secret.key
+credentials.enc
+credentials.json
+.DS_Store
+.env
