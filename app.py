@@ -39,7 +39,10 @@ if not any(t.name == "SessionMonitor" for t in threading.enumerate()):
 # Add src to path to allow imports if running directly
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.lang import get_text, ALL_METRICS, DEFAULT_METRICS
+import src.lang
+import importlib
+importlib.reload(src.lang)
+from src.lang import get_text, STRINGS, DEFAULT_METRICS
 from src.auth import authenticate
 from src.api import GenesysAPI
 from src.processor import process_analytics_response, to_excel, fill_interval_gaps, process_observations, process_daily_stats
@@ -190,10 +193,75 @@ if 'users_map' not in st.session_state:
     st.session_state.users_map = {}
 if 'queues_map' not in st.session_state:
     st.session_state.queues_map = {}
+if 'users_info' not in st.session_state:
+    st.session_state.users_info = {}
 if 'language' not in st.session_state:
     st.session_state.language = "TR"
-if 'page' not in st.session_state:
-    st.session_state.page = "Menu"
+# --- HELPER: CONFIG PERSISTENCE ---
+CONFIG_FILE = "dashboard_config.json"
+PRESETS_FILE = "presets.json"
+
+def load_dashboard_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"layout": 1, "cards": []}
+
+def save_dashboard_config(layout, cards):
+    try:
+        data = {"layout": layout, "cards": cards}
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error saving config: {e}")
+
+def load_presets():
+    """Load report presets from file."""
+    if os.path.exists(PRESETS_FILE):
+        try:
+            with open(PRESETS_FILE, "r") as f:
+                data = json.load(f)
+                # Ensure it's the new list-based format
+                if isinstance(data, list):
+                    return data
+                # Convert old dictionary format to new list format if needed
+                return []
+        except:
+            pass
+    return []
+
+def save_presets(presets):
+    """Save report presets to file."""
+    try:
+        with open(PRESETS_FILE, "w") as f:
+            json.dump(presets, f)
+    except Exception as e:
+        print(f"Error saving presets: {e}")
+
+def get_all_configs_json():
+    """Combines all configurations into a single JSON for export."""
+    dashboard = load_dashboard_config()
+    presets = load_presets()
+    return json.dumps({
+        "dashboard": dashboard,
+        "report_presets": presets
+    }, indent=2)
+
+def import_all_configs(json_data):
+    """Restores configurations from a JSON string."""
+    try:
+        data = json.loads(json_data)
+        if "dashboard" in data:
+            save_dashboard_config(data["dashboard"].get("layout", 1), data["dashboard"].get("cards", []))
+        if "report_presets" in data:
+            save_presets(data["report_presets"])
+        return True
+    except Exception as e:
+        print(f"Error importing configs: {e}")
+        return False
 
 # --- SIDEBAR ---
 saved_creds = load_credentials()
@@ -234,13 +302,13 @@ with st.sidebar:
                     gen_api = GenesysAPI(api_client)
                     users = gen_api.get_users()
                     st.session_state.users_map = {u['name']: u['id'] for u in users}
+                    st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
                     
                     queues = gen_api.get_queues()
                     st.session_state.queues_map = {q['name']: q['id'] for q in queues}
                     
                     # Fetch Presence Definitions for mapping UUIDs
-                    if 'presence_map' not in st.session_state:
-                         st.session_state.presence_map = gen_api.get_presence_definitions()
+                    st.session_state.presence_map = gen_api.get_presence_definitions()
 
                     st.rerun()
                     st.rerun()
@@ -248,9 +316,34 @@ with st.sidebar:
                     st.error(f"Error: {error}")
     
     if st.session_state.api_client:
+        st.write("---")
         if st.button("Logout"):
             st.session_state.api_client = None
             st.rerun()
+
+    st.write("---")
+    st.subheader(get_text(lang, "export_config"))
+    st.download_button(
+        label=get_text(lang, "export_config"),
+        data=get_all_configs_json(),
+        file_name=f"genesys_config_{datetime.now().strftime('%Y%m%d')}.json",
+        mime="application/json",
+        width='stretch'
+    )
+    
+    st.write("---")
+    st.subheader(get_text(lang, "import_config"))
+    uploaded_file = st.file_uploader(get_text(lang, "import_config"), type=["json"])
+    if uploaded_file is not None:
+        if st.button(get_text(lang, "save"), key="import_btn"):
+            content = uploaded_file.getvalue().decode("utf-8")
+            if import_all_configs(content):
+                st.success(get_text(lang, "config_imported"))
+                # Clear dashboard cache so it reloads from file
+                if 'dashboard_config_loaded' in st.session_state:
+                    del st.session_state.dashboard_config_loaded
+            else:
+                st.error(get_text(lang, "config_import_error"))
 
 # --- HELPER: PLOTLY CHARTS ---
 def create_gauge_chart(value, title, height=250):
@@ -283,29 +376,6 @@ def create_donut_chart(data_dict, title, height=300):
     fig.update_layout(height=height, margin=dict(l=20, r=20, t=50, b=20))
     return fig
 
-# --- HELPER: CONFIG PERSISTENCE ---
-CONFIG_FILE = "dashboard_config.json"
-
-def load_dashboard_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                data = json.load(f)
-                # Migration: If list, convert to new dict format
-                if isinstance(data, list):
-                    return {"layout": 1, "cards": data}
-                return data
-        except:
-            return {"layout": 1, "cards": []}
-    return {"layout": 1, "cards": []}
-
-def save_dashboard_config(layout, cards):
-    try:
-        data = {"layout": layout, "cards": cards}
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        print(f"Error saving config: {e}")
 
 # --- MAIN LOGIC ---
 lang = st.session_state.language
@@ -321,60 +391,155 @@ else:
     # --- PAGE: REPORTS ---
     if st.session_state.page == get_text(lang, "menu_reports"):
         st.title(get_text(lang, "menu_reports"))
+
+        # --- PRESET MANAGEMENT (NEW) ---
+        presets = load_presets()
+        preset_names = [p['name'] for p in presets]
         
-        # 1. Row: Report Type and Selection
+        c_pre1, c_pre2, c_pre3 = st.columns([2, 1, 1])
+        
+        with c_pre1:
+            selected_preset_name = st.selectbox(
+                get_text(lang, "select_view"),
+                [get_text(lang, "no_view_selected")] + preset_names,
+                key="preset_selector"
+            )
+            
+        if selected_preset_name != get_text(lang, "no_view_selected"):
+            # Apply preset if selected
+            preset = next((p for p in presets if p['name'] == selected_preset_name), None)
+            if preset:
+                # Explicitly update session state keys to force widgets to sync
+                st.session_state.active_preset = preset
+                st.session_state.rep_type = preset.get("type", "report_agent")
+                st.session_state.rep_names = preset.get("names", [])
+                st.session_state.rep_metrics = preset.get("metrics", DEFAULT_METRICS)
+                st.session_state.rep_gran = preset.get("granularity_label", preset.get("granularity", "Toplam"))
+                st.session_state.rep_fill = preset.get("fill_gaps", False)
+
+        with st.expander(get_text(lang, "save_view")):
+            c_sv1, c_sv2 = st.columns([3, 1], vertical_alignment="bottom")
+            new_preset_name = c_sv1.text_input(get_text(lang, "preset_name"), placeholder="Günlük Raporum...")
+            if c_sv2.button(get_text(lang, "save"), use_container_width=True, type="primary"):
+                if new_preset_name:
+                    # Collect current state from keys we'll define below
+                    new_preset = {
+                        "name": new_preset_name,
+                        "type": st.session_state.get("rep_type", "agent_report"),
+                        "names": st.session_state.get("rep_names", []),
+                        "metrics": st.session_state.get("rep_metrics", DEFAULT_METRICS),
+                        "granularity": gran_opt.get(st.session_state.get("rep_gran", get_text(lang, "total")), "P1D"),
+                        "granularity_label": st.session_state.get("rep_gran", get_text(lang, "total")),
+                        "fill_gaps": st.session_state.get("rep_fill", False)
+                    }
+                    # Update or Add
+                    presets = [p for p in presets if p['name'] != new_preset_name]
+                    presets.append(new_preset)
+                    save_presets(presets)
+                    st.success(get_text(lang, "view_saved"))
+                    st.rerun()
+
+        if selected_preset_name != get_text(lang, "no_view_selected"):
+            c_del1, c_del2 = st.columns([1, 3])
+            if c_del1.button(get_text(lang, "delete_view"), type="secondary", use_container_width=True):
+                presets = [p for p in presets if p['name'] != selected_preset_name]
+                save_presets(presets)
+                st.info(get_text(lang, "view_deleted"))
+                st.rerun()
+        
+        st.write("---")
+        
+        # Determine base values for widgets (preset or session)
+        def_p = st.session_state.get("active_preset", {})
+        
         c1, c2 = st.columns([1, 1])
         with c1:
             report_type_key = st.radio(
                 get_text(lang, "report_type"),
-                ["agent_report", "workgroup_report", "detailed_report"],
+                ["report_agent", "report_queue", "report_detailed"],
                 format_func=lambda x: get_text(lang, x),
-                horizontal=True
+                horizontal=True,
+                key="rep_type",
+                index=["report_agent", "report_queue", "report_detailed"].index(def_p.get("type", "report_agent"))
             )
-            report_type = "Agent" if report_type_key == "agent_report" else ("Workgroup" if report_type_key == "workgroup_report" else "Detailed")
+            report_type = "Agent" if report_type_key == "report_agent" else ("Workgroup" if report_type_key == "report_queue" else "Detailed")
 
         with c2:
-            if report_type == "Agent":
-                selected_names = st.multiselect(get_text(lang, "select_agents"), list(st.session_state.users_map.keys()))
+            if report_type in ["Agent", "Detailed"]:
+                selected_names = st.multiselect(
+                    get_text(lang, "select_agents"), 
+                    list(st.session_state.users_map.keys()),
+                    key="rep_names",
+                    default=def_p.get("names", []) if def_p.get("type") in ["report_agent", "report_detailed"] else []
+                )
                 selected_ids = [st.session_state.users_map[name] for name in selected_names]
             elif report_type == "Workgroup":
-                selected_names = st.multiselect(get_text(lang, "select_workgroups"), list(st.session_state.queues_map.keys()))
+                selected_names = st.multiselect(
+                    get_text(lang, "select_workgroups"), 
+                    list(st.session_state.queues_map.keys()),
+                    key="rep_names",
+                    default=def_p.get("names", []) if def_p.get("type") == "report_queue" else []
+                )
                 selected_ids = [st.session_state.queues_map[name] for name in selected_names]
-            else:
-                selected_names = st.multiselect(get_text(lang, "select_agents"), list(st.session_state.users_map.keys()))
-                selected_ids = [st.session_state.users_map[name] for name in selected_names]
 
         # 2. Row: Dates and Times (UTC+3)
         st.write("---")
-        c3, c4 = st.columns(2)
+        c3, c4 = st.columns(2, vertical_alignment="bottom")
         with c3:
-            d1, t1 = st.columns(2)
+            d1, t1 = st.columns(2, vertical_alignment="bottom")
             start_date = d1.date_input("Start Date / Başlangıç", datetime.today())
             start_time = t1.time_input(get_text(lang, "start_time"), time(0, 0))
         with c4:
-            d2, t2 = st.columns(2)
+            d2, t2 = st.columns(2, vertical_alignment="bottom")
             end_date = d2.date_input("End Date / Bitiş", datetime.today())
             end_time = t2.time_input(get_text(lang, "end_time"), time(23, 59))
             
         # Granularity and Gap Filling
-        g1, g2 = st.columns([1, 1])
+        g1, g2 = st.columns([1, 1], vertical_alignment="bottom")
         gran_opt = {
             get_text(lang, "total"): "P1D",
             get_text(lang, "30min"): "PT30M",
             get_text(lang, "1hour"): "PT1H"
         }
-        selected_gran_label = g1.selectbox(get_text(lang, "granularity"), list(gran_opt.keys()))
+        
+        # Match label string from value
+        saved_gran = def_p.get("granularity", "P1D")
+        if saved_gran in gran_opt.values():
+            def_gran_label = list(gran_opt.keys())[list(gran_opt.values()).index(saved_gran)]
+        else:
+            def_gran_label = list(gran_opt.keys())[0]
+        selected_gran_label = g1.selectbox(
+            get_text(lang, "granularity"), 
+            list(gran_opt.keys()),
+            key="rep_gran",
+            index=list(gran_opt.keys()).index(def_gran_label)
+        )
         granularity = gran_opt[selected_gran_label]
         
-        do_fill_gaps = g2.checkbox(get_text(lang, "fill_gaps"), value=False)
+        do_fill_gaps = g2.checkbox(
+            get_text(lang, "fill_gaps"), 
+            value=def_p.get("fill_gaps", False),
+            key="rep_fill"
+        )
 
-        # 3. Row: Metrics Selection
+          # Metrics Selection
         st.write("---")
+        from src.lang import ALL_METRICS as ALL_M
+        
+        # Determine default metrics based on report type
+        auto_def_metrics = ["nOffered", "nAnswered", "tAnswered", "tTalk", "tHandle"]
+            
+        def_metrics = def_p.get("metrics", auto_def_metrics)
+        # Ensure all selected metrics exist in the list
+        selection_options = ALL_M
+        def_metrics = [m for m in def_metrics if m in selection_options]
+        
         selected_metrics = st.multiselect(
-            get_text(lang, "metrics_label"),
-            ALL_METRICS,
-            default=DEFAULT_METRICS,
-            format_func=lambda m: get_text(lang, m)
+            get_text(lang, "metrics"),
+            selection_options,
+            default=def_metrics,
+            format_func=lambda x: get_text(lang, x),
+            key="rep_metrics"
         )
 
         # 4. Action
@@ -391,34 +556,148 @@ else:
                     
                     group_by = ['userId'] if report_type == "Agent" else (['queueId'] if report_type == "Workgroup" else ['userId', 'queueId'])
                     filter_type = 'user' if report_type in ["Agent", "Detailed"] else 'queue'
-                    api_response = gen_api.get_analytics_conversations_aggregate(
-                        start_dt_utc, end_dt_utc, granularity=granularity,
-                        group_by=group_by, filter_type=filter_type, 
-                        filter_ids=selected_ids if selected_ids else None, metrics=selected_metrics
-                    )
                     
-                    id_map = {**{v: k for k, v in st.session_state.users_map.items()}, **{v: k for k, v in st.session_state.queues_map.items()}}
-                    df = process_analytics_response(api_response, id_map, report_type.lower())
+                    # Check if we have call metrics selected
+                    call_metrics_selected = [m for m in selected_metrics if not m.startswith("t") or m in ["tTalk", "tAcw", "tHandle", "tHeld", "tWait", "tAcd", "tAlert", "tAnswered", "tAbandon", "tOutbound"]]
                     
+                    api_response = None
+                    if call_metrics_selected:
+                        api_response = gen_api.get_analytics_conversations_aggregate(
+                            start_dt_utc, end_dt_utc, granularity=granularity,
+                            group_by=group_by, filter_type=filter_type, 
+                            filter_ids=selected_ids if selected_ids else None, metrics=selected_metrics
+                        )
+
+                    if api_response and "error" in api_response:
+                        st.error(f"API Error: {api_response['error']}")
+                    else:
+                        # Create queue lookup map (ID -> Name)
+                        queue_lookup = {v: k for k, v in st.session_state.queues_map.items()}
+
+                        if report_type in ["Agent", "Detailed"]:
+                            lookup_map = st.session_state.users_info
+                        else:
+                            lookup_map = queue_lookup
+                            
+                        df = process_analytics_response(api_response, lookup_map, report_type.lower(), queue_map=queue_lookup)
+                    
+                    # If df is empty but it's an agent-based report, we should still create a base df for users
+                    # If df is empty but it's an agent-based report, we should still create a base df for users
+                    if df.empty and report_type in ["Agent", "Detailed"]:
+                        agent_data = []
+                        target_uids = selected_ids if selected_ids else list(st.session_state.users_info.keys())
+                        for uid in target_uids:
+                            uinfo = st.session_state.users_info.get(uid, {})
+                            raw_user = uinfo.get('username', "")
+                            row = {
+                                "Name": uinfo.get('name', uid),
+                                "Username": raw_user.split('@')[0] if raw_user else "",
+                                "Id": uid
+                            }
+                            if report_type == "Detailed":
+                                row["WorkgroupName"] = "-"
+                                row["AgentName"] = row["Name"]
+                                row["Id"] = f"{uid}|-"
+                            agent_data.append(row)
+                        df = pd.DataFrame(agent_data)
+                    
+                    # --- FETCH PRESENCE DATA IF REQUESTED ---
+                    presence_keys = ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "col_staffed_time"]
+                    detail_keys = ["col_login", "col_logout"]
+                    
+                    user_ids_to_query = selected_ids if selected_ids else list(st.session_state.users_info.keys())
+                    
+                    # Merge status durations
+                    if any(m in selected_metrics for m in presence_keys) and report_type in ["Agent", "Detailed"]:
+                        presence_resp = gen_api.get_user_aggregates(start_dt_utc, end_dt_utc, user_ids_to_query)
+                        from src.processor import process_user_aggregates
+                        presence_map = process_user_aggregates(presence_resp, st.session_state.get('presence_map'))
+                        
+                        if presence_map:
+                            for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime"]:
+                                col_name = pk if pk != "StaffedTime" else "col_staffed_time"
+                                if not df.empty:
+                                    uid_col = "Id"
+                                    df[col_name] = df[uid_col].apply(lambda x: presence_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0))
+
+                    # Merge Login/Logout details
+                    if any(m in selected_metrics for m in detail_keys) and report_type in ["Agent", "Detailed"]:
+                        details_resp = gen_api.get_user_status_details(start_dt_utc, end_dt_utc, user_ids_to_query)
+                        from src.processor import process_user_details
+                        details_map = process_user_details(details_resp)
+                        
+                        if details_map:
+                            if not df.empty:
+                                if "col_login" in selected_metrics:
+                                    df["col_login"] = df["Id"].apply(lambda x: details_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
+                                if "col_logout" in selected_metrics:
+                                    df["col_logout"] = df["Id"].apply(lambda x: details_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
+
                     if not df.empty:
                         if do_fill_gaps and granularity != "P1D":
                             df = fill_interval_gaps(df, start_dt_local, end_dt_local, granularity)
                             
                         # Final column filtering and renaming
-                        base_cols = ["AgentName", "WorkgroupName"] if report_type == "Detailed" else ["Name"]
+                        if report_type == "Detailed":
+                            base_cols = ["AgentName", "Username", "WorkgroupName"]
+                        elif report_type in ["Agent", "Productivity"]:
+                            base_cols = ["Name", "Username"]
+                        else:
+                            base_cols = ["Name"]
+
                         if "Interval" in df.columns: base_cols = ["Interval"] + base_cols
-                        cols_to_keep = [c for c in base_cols if c in df.columns] + [m for m in selected_metrics if m in df.columns]
-                        if "AvgHandle" in df.columns: cols_to_keep.append("AvgHandle")
+                        
+                        # Prepare list of metrics to include (both from call and presence)
+                        all_disp_metrics = selected_metrics + (["AvgHandle"] if "AvgHandle" in df.columns else [])
+                        cols_to_keep = [c for c in base_cols if c in df.columns] + [m for m in all_disp_metrics if m in df.columns]
                         
                         df_final = df[cols_to_keep].copy()
+                        
+                        # Fix: Ensure ALL selected metrics exist in df_final even if they were missing from API
+                        for sm in selected_metrics:
+                            if sm not in df_final.columns:
+                                df_final[sm] = 0
+                                
+                        # Re-calculate cols_to_keep to include newly added zeros
+                        cols_to_keep = [c for c in base_cols if c in df_final.columns] + [m for m in all_disp_metrics if m in df_final.columns]
+                        df_final = df_final[cols_to_keep]
+                        
+                        # Filter out rows with no data if requested (implicitly yes based on user feedback)
+                        # We check if all selected metrics are 0 or Null
+                        # metric_cols_in_df = [m for m in selected_metrics if m in df_final.columns]
+                        # if metric_cols_in_df:
+                        #     # Replace NaN with 0 for checking
+                        #     df_check = df_final[metric_cols_in_df].fillna(0)
+                        #     # Keep row if ANY metric is non-zero (or non-empty for strings like Login/Logout if we considered them, but usually they come with numeric presence)
+                        #     # Actually, Login/Logout are strings. presence columns are numbers.
+                        #     # If report is Productivity, we surely want to hide if everything is 0/NA.
+                        #      
+                        #     # Simple logic: fail if all numerics are 0 AND all strings are N/A or empty
+                        #     def has_data(row):
+                        #         for col in metric_cols_in_df:
+                        #             val = row[col]
+                        #             if isinstance(val, (int, float)) and val != 0: return True
+                        #             if isinstance(val, str) and val not in ["", "N/A", "0"]: return True
+                        #         return False
+                        #         
+                        #     # df_final = df_final[df_final.apply(has_data, axis=1)]
+                        #     pass
+                        
                         rename_map = {
                             "Interval": get_text(lang, "col_interval"),
                             "AgentName": get_text(lang, "col_agent"),
+                            "Username": get_text(lang, "col_username"),
                             "WorkgroupName": get_text(lang, "col_workgroup"),
                             "Name": get_text(lang, "col_agent") if report_type == 'Agent' else get_text(lang, "col_workgroup"),
-                            "AvgHandle": get_text(lang, "col_avg_handle")
+                            "AvgHandle": get_text(lang, "col_avg_handle"),
+                            "col_staffed_time": get_text(lang, "col_staffed_time"),
+                            "col_login": get_text(lang, "col_login"),
+                            "col_logout": get_text(lang, "col_logout")
                         }
-                        for m in selected_metrics: rename_map[m] = get_text(lang, m)
+                        for m in selected_metrics: 
+                            if m not in rename_map:
+                                rename_map[m] = get_text(lang, m)
+                                
                         st.dataframe(df_final.rename(columns=rename_map), width='stretch')
                         st.download_button(get_text(lang, "download_excel"), data=to_excel(df_final.rename(columns=rename_map)), 
                                            file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")

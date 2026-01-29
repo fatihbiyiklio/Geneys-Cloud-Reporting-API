@@ -1,1 +1,1 @@
-{"Agent": ["nOffered", "nAnswered", "nConnected", "nConsult", "nOutbound", "nBlindTransferred", "nTransferred"]}
+[{"name": "Agent Workgroup \u00dcretim Raporu", "type": "report_detailed", "names": [], "metrics": ["nOffered", "nAnswered", "tAnswered", "tTalk", "tHandle", "nAbandon", "nTransferred", "oServiceLevel", "tAbandon", "tAcw", "tHeld", "tWait", "tAcd", "tAlert", "tOutbound", "nBlindTransferred"], "granularity": "Toplam", "fill_gaps": false}]

@@ -48,7 +48,7 @@ def process_daily_stats(response, lookup_map):
                     stats[q_name]["SL_Denominator"] += s.get('denominator', 0)
     return stats
 
-def process_analytics_response(response, lookup_map, report_type):
+def process_analytics_response(response, lookup_map, report_type, queue_map=None):
     """Processes dictionary-based analytics response into DataFrame."""
     data = []
     if not response or 'results' not in response:
@@ -60,16 +60,22 @@ def process_analytics_response(response, lookup_map, report_type):
         queue_id = group.get("queueId")
         
         row_base = {}
-        if report_type in ['user', 'agent']:
-            name = lookup_map.get(user_id, user_id) if user_id else "Unknown"
-            row_base = {"Name": name, "Id": user_id}
+        if report_type in ['user', 'agent', 'productivity']:
+            user_info = lookup_map.get(user_id, {}) if user_id else {}
+            name = user_info.get('name', user_id if user_id else "Unknown")
+            raw_username = user_info.get('username', "")
+            username = raw_username.split('@')[0] if raw_username else ""
+            row_base = {"Name": name, "Username": username, "Id": user_id}
         elif report_type in ['queue', 'workgroup']:
             name = lookup_map.get(queue_id, queue_id) if queue_id else "Unknown"
             row_base = {"Name": name, "Id": queue_id}
         elif report_type == 'detailed':
-            agent_name = lookup_map.get(user_id, user_id) if user_id else "Unknown"
-            queue_name = lookup_map.get(queue_id, queue_id) if queue_id else "Unknown"
-            row_base = {"AgentName": agent_name, "WorkgroupName": queue_name, "Id": f"{user_id}|{queue_id}"}
+            user_info = lookup_map.get(user_id, {}) if user_id else {}
+            agent_name = user_info.get('name', user_id if user_id else "Unknown")
+            raw_username = user_info.get('username', "")
+            username = raw_username.split('@')[0] if raw_username else ""
+            queue_name = queue_map.get(queue_id, queue_id) if queue_map and queue_id else (lookup_map.get(queue_id, queue_id) if queue_id else "Unknown")
+            row_base = {"AgentName": agent_name, "Username": username, "WorkgroupName": queue_name, "Id": f"{user_id}|{queue_id}"}
 
         data_list = result_row.get('data', [])
         for interval_data in data_list:
@@ -100,12 +106,29 @@ def process_analytics_response(response, lookup_map, report_type):
                     val = stats.get('count', 0)
                 
                 row[m_name] = val
+                
+                # Manual aliases for re-mapped metrics
+                if m_name == "tAcw": row["nWrapup"] = stats.get('count', 0)
+                if m_name == "tNotResponding": row["nNotResponding"] = stats.get('count', 0)
+                if m_name == "nOutbound": row["nOutbound"] = val
+                if m_name == "nOffered": row["nAlert"] = val  # For agents, Offered = Alerted
+                if m_name == "tAlert": row["nAlert"] = stats.get('count', 0)
+                if m_name == "tHandle": row["nHandled"] = stats.get('count', 0)
+                
+                # tOutbound is tricky, usually we don't have separate tOutbound metric in response if we mapped it to tTalk?
+                # Actually if we mapped tOutbound to tTalk, we just get tTalk. Use tTalk as tOutbound? 
+                # Or just let it be. User asked for "Dış Arama Süresi". 
+                # If we mapped it to tTalk, we should duplicate tTalk to tOutbound.
+                if m_name == "tTalk": row["tOutbound"] = val 
+                if m_name == "tDialing": row["tOutbound"] = val # If we used tDialing
             data.append(row)
 
     df = pd.DataFrame(data)
     if not df.empty:
         if report_type == 'detailed':
-            group_cols = ["AgentName", "WorkgroupName", "Id"]
+            group_cols = ["AgentName", "Username", "WorkgroupName", "Id"]
+        elif report_type in ['user', 'agent', 'productivity']:
+            group_cols = ["Name", "Username", "Id"]
         else:
             group_cols = ["Name", "Id"]
             
@@ -115,7 +138,7 @@ def process_analytics_response(response, lookup_map, report_type):
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
         df = df.groupby(group_cols)[numeric_cols].sum().reset_index()
         
-        if report_type in ['user', 'agent', 'detailed']:
+        if report_type in ['user', 'agent', 'detailed', 'productivity']:
             if "nOffered" in df.columns and "nAlert" in df.columns:
                 df["nOffered"] = df.apply(lambda x: x["nAlert"] if x["nOffered"] == 0 else x["nOffered"], axis=1)
         
@@ -211,6 +234,116 @@ def process_observations(resp, id_map, presence_map=None):
                 row["ServiceLevel"] = round((sum(sl_values) / len(sl_values)) * 100, 1)
 
     return list(data_map.values())
+
+def process_user_aggregates(resp, presence_map=None):
+    """Processes user status aggregates into a dictionary of metric durations."""
+    results = {}
+    if not resp or 'results' not in resp:
+        return results
+
+    for result in resp['results']:
+        user_id = result.get('group', {}).get('userId')
+        user_data = {
+            "tMeal": 0, "tMeeting": 0, "tAvailable": 0, "tBusy": 0, 
+            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "StaffedTime": 0
+        }
+        
+        data_list = result.get('data', [])
+        for d in data_list:
+            metrics = d.get('metrics', [])
+            for m_obj in metrics:
+                m_name = m_obj.get('metric')
+                stats = m_obj.get('stats', {})
+                duration = stats.get('sum', 0) / 1000 # Convert to seconds
+                
+                qualifier = m_obj.get('qualifier', '')
+                
+                # Map qualifier to standard name
+                if presence_map and qualifier in presence_map:
+                    mapped = presence_map[qualifier].lower()
+                else:
+                    mapped = qualifier.lower()
+                
+                # Map to our columns
+                # Handle English, Turkish, and System Enum formats
+                
+                # On Queue matching (often system presence "ON_QUEUE")
+                if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped: 
+                    user_data["tOnQueue"] += duration
+                
+                # Meal matching
+                elif "meal" in mapped or "yemek" in mapped: 
+                    user_data["tMeal"] += duration
+                
+                # Meeting matching
+                elif "meeting" in mapped or "toplantı" in mapped: 
+                    user_data["tMeeting"] += duration
+                
+                # Training matching
+                elif "training" in mapped or "eğitim" in mapped: 
+                    user_data["tTraining"] += duration
+                
+                # Available/Ready matching
+                elif "available" in mapped or "hazır" in mapped: 
+                    user_data["tAvailable"] += duration
+                
+                # Busy matching
+                elif "busy" in mapped or "meşgul" in mapped: 
+                    user_data["tBusy"] += duration
+                
+                # Away matching
+                elif "away" in mapped or "uzakta" in mapped: 
+                    user_data["tAway"] += duration
+                
+                # Staffed time is generally sum of all except Offline.
+                # In User Aggregates, presence metrics represent active presence.
+                if m_name in ["tSystemPresence", "tOrganizationPresence"] and "offline" not in mapped:
+                    user_data["StaffedTime"] += duration
+        
+        # Avoid double counting if both system and org presence are returned
+        # Usually tOrganizationPresence is more specific.
+        results[user_id] = user_data
+    return results
+
+def process_user_details(resp):
+    """Processes user details to find first login and last logout of the period."""
+    results = {}
+    if not resp or 'userDetails' not in resp:
+        return results
+
+    for user in resp['userDetails']:
+        user_id = user.get('userId')
+        primary_presences = user.get('primaryPresence', [])
+        
+        # Filter out offline status
+        active_presences = [p for p in primary_presences if p.get('systemPresence', '').lower() != 'offline']
+        
+        if active_presences:
+            # Sort by start time
+            active_presences.sort(key=lambda x: x.get('startTime', ''))
+            
+            first_login_utc = active_presences[0].get('startTime')
+            last_logout_utc = active_presences[-1].get('endTime')
+            
+            # Format and adjust to UTC+3
+            from datetime import timedelta
+            def format_utc_to_local(utc_str):
+                if not utc_str: return "N/A"
+                try:
+                    dt = datetime.fromisoformat(utc_str.replace('Z', ''))
+                    dt_local = dt + timedelta(hours=3)
+                    return dt_local.strftime("%H:%M:%S")
+                except:
+                    return "N/A"
+            
+            results[user_id] = {
+                "Login": format_utc_to_local(first_login_utc),
+                "Logout": format_utc_to_local(last_logout_utc)
+            }
+        else:
+            results[user_id] = {"Login": "N/A", "Logout": "N/A"}
+            
+    return results
 
 def to_excel(df):
     from io import BytesIO

@@ -29,14 +29,19 @@ class GenesysAPI:
                 data = self._get("/api/v2/users", params={"pageNumber": page_number, "pageSize": 100})
                 if 'entities' in data:
                     for user in data['entities']:
-                        users.append({'id': user['id'], 'name': user['name']})
+                        users.append({
+                            'id': user['id'], 
+                            'name': user['name'],
+                            'username': user.get('username', '')
+                        })
                     if not data.get('nextUri'):
                         break
                     page_number += 1
                 else:
                     break
-        except Exception:
-            print("Error: Could not fetch users from Genesys Cloud.")
+        except Exception as e:
+            print(f"Error: {e}")
+            return {"error": str(e)}
         return users
 
     def get_queues(self):
@@ -74,6 +79,12 @@ class GenesysAPI:
                 if m == "nAnswered": new_metrics.append("tAnswered")
                 elif m == "nAbandon": new_metrics.append("tAbandon")
                 elif m == "nOffered": new_metrics.extend(["nOffered", "tAlert"])
+                elif m == "nWrapup": new_metrics.append("tAcw") 
+                elif m == "nNotResponding": new_metrics.append("tNotResponding")
+                elif m == "nAlert": new_metrics.extend(["nOffered", "tAlert"])
+                elif m == "nHandled": new_metrics.append("tHandle")
+                elif m == "nOutbound": new_metrics.append("nOutbound")
+                elif m == "tOutbound": new_metrics.append("tTalk") 
                 else: new_metrics.append(m)
             metrics = list(set(new_metrics))
 
@@ -149,7 +160,17 @@ class GenesysAPI:
                 data = self._get("/api/v2/presence/definitions", params={"pageNumber": page_number, "pageSize": 100})
                 if 'entities' in data:
                     for p in data['entities']:
-                        definitions[p['id']] = p['systemPresence']
+                        # Try to get the best label
+                        labels = p.get('languageLabels', {})
+                        label = labels.get('en_US') or labels.get('tr_TR')
+                        if not label and labels:
+                            # If no en_US or tr_TR, take any
+                            label = list(labels.values())[0]
+                        
+                        if not label:
+                            label = p.get('systemPresence', '')
+                            
+                        definitions[p['id']] = label
                     if not data.get('nextUri'):
                         break
                     page_number += 1
@@ -158,3 +179,66 @@ class GenesysAPI:
         except Exception:
             print("Error: Presence definitions fetch failed.")
         return definitions
+
+    def get_user_aggregates(self, start_date, end_date, user_ids):
+        """Fetches user status aggregates (durations) for a list of users, batching requests if needed."""
+        if not user_ids: return {"results": []}
+        
+        BATCH_SIZE = 100
+        combined_results = []
+        
+        for i in range(0, len(user_ids), BATCH_SIZE):
+            batch = user_ids[i:i + BATCH_SIZE]
+            
+            # Use flat predicates for standard OR filtering
+            predicates = [
+                {"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid}
+                for uid in batch
+            ]
+            
+            query = {
+                "interval": f"{start_date.isoformat()}Z/{end_date.isoformat()}Z",
+                "groupBy": ["userId"],
+                "filter": {
+                    "type": "or",
+                    "predicates": predicates
+                },
+                "metrics": ["tSystemPresence", "tOrganizationPresence"]
+            }
+            try:
+                data = self._post("/api/v2/analytics/users/aggregates/query", query)
+                if data and 'results' in data:
+                    combined_results.extend(data['results'])
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching batch {i}: {e}")
+                # Continue fetching other batches
+            except Exception as e:
+                print(f"Error fetching batch {i}: {e}")
+                
+        return {"results": combined_results}
+
+    def get_user_status_details(self, start_date, end_date, user_ids):
+        """Fetches historical user status details for login/logout calculation, batching requests if needed."""
+        if not user_ids: return {}
+        
+        BATCH_SIZE = 50 
+        combined_details = []
+        
+        for i in range(0, len(user_ids), BATCH_SIZE):
+            batch = user_ids[i:i + BATCH_SIZE]
+            
+            query = {
+                "interval": f"{start_date.isoformat()}Z/{end_date.isoformat()}Z",
+                "userFilters": [
+                    {"type": "or", "predicates": [{"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid} for uid in batch]}
+                ],
+                "paging": {"pageSize": 100}
+            }
+            try:
+                data = self._post("/api/v2/analytics/users/details/query", query)
+                if data and 'userDetails' in data:
+                    combined_details.extend(data['userDetails'])
+            except Exception as e:
+                print(f"Error details batch {i}: {e}")
+                
+        return {"userDetails": combined_details}
