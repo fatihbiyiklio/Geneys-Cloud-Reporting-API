@@ -16,6 +16,21 @@ def resolve_path(path):
 
 PID_FILE = ".app.pid"
 
+def check_single_instance():
+    """Ensures only one instance of the app is running by killing the previous one."""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                old_pid = int(f.read().strip())
+            # Check if process exists and kill it
+            try:
+                os.kill(old_pid, signal.SIGTERM)
+                time.sleep(2) # Wait for it to shutdown and free the port
+            except:
+                pass
+        except:
+            pass
+    
     # Try to write the new PID, handle PermissionError (common on Windows if file is locked)
     try:
         # If file exists, try to remove it first to break potential locks
