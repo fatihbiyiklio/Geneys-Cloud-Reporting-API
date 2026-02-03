@@ -1,5 +1,5 @@
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 class GenesysAPI:
     def __init__(self, auth_data):
@@ -19,6 +19,51 @@ class GenesysAPI:
         response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data)
         response.raise_for_status()
         return response.json()
+    
+    # ... (other methods remain unchanged) ...
+
+    def get_conversation_details(self, start_date, end_date):
+        """Fetches detailed conversation records within date range, chunking if necessary."""
+        all_conversations = []
+        
+        # Genesys Analytics Details limit is typically 31 days.
+        # We chunk by 14 days to be safe and manage payload size.
+        chunk_days = 14
+        current_start = start_date
+        
+        while current_start < end_date:
+            current_end = min(current_start + timedelta(days=chunk_days), end_date)
+            interval = f"{current_start.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{current_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+            
+            try:
+                page_number = 1
+                while True:
+                    query = {
+                        "interval": interval,
+                        "paging": {"pageSize": 100, "pageNumber": page_number},
+                        "order": "asc",
+                        "orderBy": "conversationStart"
+                    }
+                    
+                    data = self._post("/api/v2/analytics/conversations/details/query", query)
+                    
+                    if 'conversations' in data:
+                        all_conversations.extend(data['conversations'])
+                        if not data.get('conversations') or len(data['conversations']) < 100:
+                            break
+                        page_number += 1
+                    else:
+                        break
+                        
+                    # Safe break to prevent infinite loops or OOM
+                    if page_number > 200: break 
+            except Exception as e:
+                print(f"Error fetching conversation details for chunk {interval}: {e}")
+                # We continue to next chunk instead of failing completely, usually.
+                
+            current_start = current_end
+            
+        return {"conversations": all_conversations}
 
     def get_users(self):
         """Fetches all users using direct API with paging."""
@@ -63,44 +108,106 @@ class GenesysAPI:
             print("Error: Could not fetch queues from Genesys Cloud.")
         return queues
 
+    def get_wrapup_codes(self):
+        """Fetches all wrap-up codes for mapping."""
+        codes = {}
+        try:
+            page_number = 1
+            while True:
+                data = self._get("/api/v2/routing/wrapupcodes", params={"pageNumber": page_number, "pageSize": 100})
+                if 'entities' in data:
+                    for code in data['entities']:
+                        codes[code['id']] = code['name']
+                    if not data.get('nextUri'):
+                        break
+                    page_number += 1
+                else:
+                    break
+        except Exception as e:
+            print(f"Error fetching wrap-up codes: {e}")
+        return codes
+
     def get_analytics_conversations_aggregate(self, start_date, end_date, granularity="P1D", group_by=None, filter_type=None, filter_ids=None, metrics=None):
-        interval = f"{start_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-        
         dimension = "userId" if filter_type == 'user' else "queueId"
-        predicates = [{"type": "dimension", "dimension": dimension, "value": fid} for fid in (filter_ids or [])]
+        operator = "matches"
+        predicates = [{"type": "dimension", "dimension": dimension, "operator": operator, "value": fid} for fid in (filter_ids or [])]
         
         filter_clause = {"type": "or", "predicates": predicates} if predicates else None
+
+        # Helper to convert UI metrics to API metrics
+        def convert_metrics(input_mets, is_queue):
+            new_mets = []
+            for m in input_mets:
+                if m == "nAnswered": new_mets.append("tAnswered")
+                elif m == "nAbandon": new_mets.append("tAbandon")
+                elif m == "nOffered" and not is_queue: new_mets.append("tAlert") # For users, Offered=Alert
+                elif m == "nOffered" and is_queue: new_mets.append("nOffered")
+                elif m == "nWrapup": new_mets.append("tAcw") 
+                elif m == "nHandled": new_mets.append("tHandle")
+                elif m == "nOutbound": new_mets.extend(["nOutbound", "tTalk"])
+                elif m == "nNotResponding": new_mets.append("tNotResponding")
+                elif m == "nAlert": new_mets.append("tAlert")
+                elif m == "nConsultTransferred": new_mets.append("nTransferred")
+                elif m == "AvgHandle": new_mets.append("tHandle")
+                else: new_mets.append(m)
+            return list(set(new_mets))
 
         if not metrics:
             metrics = ["nOffered", "tAnswered", "tAbandon", "tTalk", "tHandle"]
         else:
-            new_metrics = []
-            for m in metrics:
-                if m == "nAnswered": new_metrics.append("tAnswered")
-                elif m == "nAbandon": new_metrics.append("tAbandon")
-                elif m == "nOffered": new_metrics.extend(["nOffered", "tAlert"])
-                elif m == "nWrapup": new_metrics.append("tAcw") 
-                elif m == "nNotResponding": new_metrics.append("tNotResponding")
-                elif m == "nAlert": new_metrics.extend(["nOffered", "tAlert"])
-                elif m == "nHandled": new_metrics.append("tHandle")
-                elif m == "nOutbound": new_metrics.append("nOutbound")
-                elif m == "tOutbound": new_metrics.append("tTalk") 
-                else: new_metrics.append(m)
-            metrics = list(set(new_metrics))
+            # Convert UI metrics to API metrics
+            metrics = convert_metrics(metrics, dimension == "queueId")
+            
+            if dimension == "queueId":
+                queue_valid = {
+                    "nOffered", "nAbandon", "tAnswered", "tAbandon", "tTalk", "tHeld", "tAcw", 
+                    "tHandle", "tAlert", "tWait", "oServiceLevel", "nTransferred", "nConnected", 
+                    "nOutbound", "nBlindTransferred", "tDialing", "tContacting", "nError",
+                    "tFlowOut", "tVoicemail", "nOverSla", "tNotResponding"
+                }
+                metrics = [m for m in metrics if m in queue_valid]
+            else:
+                userId_safe = {
+                    "tTalk", "tHeld", "tAcw", "tHandle", "tAlert", "tAnswered", "tAbandon", "tWait", 
+                    "nTransferred", "nConnected", "nOutbound", "nBlindTransferred", "tDialing", "tContacting",
+                    "tNotResponding", "nOverSla", "tFlowOut", "tVoicemail", "tAcd", "tOrganizationResponse", "nError"
+                }
+                metrics = [m for m in metrics if m in userId_safe]
 
-        query = {
-            "interval": interval,
-            "granularity": granularity,
-            "metrics": metrics
-        }
-        if group_by: query["groupBy"] = group_by
-        if filter_clause: query["filter"] = filter_clause
+        combined_results = []
+        chunk_days = 14
+        curr = start_date
+        
+        while curr < end_date:
+            curr_end = curr + timedelta(days=chunk_days)
+            if curr_end > end_date:
+                curr_end = end_date
+            
+            # Ensure we don't query 0 duration if loop logic is weird
+            if curr_end <= curr: break
 
-        try:
-            return self._post("/api/v2/analytics/conversations/aggregates/query", query)
-        except Exception:
-            print("Error: Analytics query failed.")
-            return None
+            interval = f"{curr.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{curr_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+            
+            query = {
+                "interval": interval,
+                "granularity": granularity,
+                "metrics": metrics
+            }
+            if group_by: query["groupBy"] = group_by
+            if filter_clause: query["filter"] = filter_clause
+
+            try:
+                data = self._post("/api/v2/analytics/conversations/aggregates/query", query)
+            except Exception as e:
+                print(f"Error fetching aggregate chunk {interval}: {e}")
+                data = {}
+
+            if 'results' in data:
+                combined_results.extend(data['results'])
+            
+            curr = curr_end
+            
+        return {"results": combined_results}
 
     def get_queue_observations(self, queue_ids):
         CHUNK_SIZE = 100
@@ -150,6 +257,90 @@ class GenesysAPI:
         
         return {"results": all_results} if all_results else None
 
+    def get_queue_stats_from_details(self, queue_ids, interval):
+        """Get accurate queue stats by analyzing conversation details - counts first queue segment only."""
+        # Build filter for queue IDs
+        predicates = [{"dimension": "queueId", "value": qid} for qid in queue_ids]
+        
+        query = {
+            "interval": interval,
+            "order": "asc",
+            "orderBy": "conversationStart",
+            "paging": {"pageSize": 100, "pageNumber": 1},
+            "segmentFilters": [{
+                "type": "or",
+                "predicates": predicates
+            }]
+        }
+        
+        stats = {qid: {"Offered": 0, "Answered": 0, "Abandoned": 0} for qid in queue_ids}
+        counted_conversations = set()
+        
+        try:
+            page = 1
+            while True:
+                query["paging"]["pageNumber"] = page
+                data = self._post("/api/v2/analytics/conversations/details/query", query)
+                
+                conversations = data.get('conversations', [])
+                if not conversations:
+                    break
+                
+                for conv in conversations:
+                    conv_id = conv.get('conversationId')
+                    if conv_id in counted_conversations:
+                        continue
+                    counted_conversations.add(conv_id)
+                    
+                    # Collect ALL queue segments with their start times
+                    all_queue_segments = []
+                    
+                    for participant in conv.get('participants', []):
+                        if participant.get('purpose') == 'acd':
+                            for session in participant.get('sessions', []):
+                                for segment in session.get('segments', []):
+                                    queue_id = segment.get('queueId')
+                                    seg_start = segment.get('segmentStart')
+                                    seg_type = segment.get('segmentType')
+                                    
+                                    if queue_id and seg_start:
+                                        all_queue_segments.append({
+                                            'queue_id': queue_id,
+                                            'start': seg_start,
+                                            'type': seg_type
+                                        })
+                    
+                    if not all_queue_segments:
+                        continue
+                    
+                    # Sort by start time to find the FIRST queue
+                    all_queue_segments.sort(key=lambda x: x['start'])
+                    first_queue_id = all_queue_segments[0]['queue_id']
+                    
+                    # Only count if first queue is in our monitored queues
+                    if first_queue_id not in queue_ids:
+                        continue
+                    
+                    # Check if conversation was answered (has 'interact' segment) or abandoned
+                    was_answered = any(s['type'] == 'interact' for s in all_queue_segments if s['queue_id'] == first_queue_id)
+                    
+                    stats[first_queue_id]["Offered"] += 1
+                    if was_answered:
+                        stats[first_queue_id]["Answered"] += 1
+                    else:
+                        stats[first_queue_id]["Abandoned"] += 1
+                
+                if len(conversations) < 100:
+                    break
+                page += 1
+                if page > 100:  # Safety limit
+                    break
+                    
+        except Exception as e:
+            print(f"Error getting queue stats from details: {e}")
+        
+        return stats
+
     def get_presence_definitions(self):
         """Fetches presence definitions from API to map UUIDs."""
         definitions = {}
@@ -187,34 +378,36 @@ class GenesysAPI:
         BATCH_SIZE = 100
         combined_results = []
         
-        for i in range(0, len(user_ids), BATCH_SIZE):
-            batch = user_ids[i:i + BATCH_SIZE]
+        # Chunk by 14 days to be safe (Aggregates can handle more but reliable is better)
+        chunk_days = 14
+        curr = start_date
+        while curr < end_date:
+            curr_end = min(curr + timedelta(days=chunk_days), end_date)
+            interval = f"{curr.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{curr_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
             
-            # Use flat predicates for standard OR filtering
-            predicates = [
-                {"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid}
-                for uid in batch
-            ]
-            
-            query = {
-                "interval": f"{start_date.isoformat()}Z/{end_date.isoformat()}Z",
-                "groupBy": ["userId"],
-                "filter": {
-                    "type": "or",
-                    "predicates": predicates
-                },
-                "metrics": ["tSystemPresence", "tOrganizationPresence"]
-            }
-            try:
-                data = self._post("/api/v2/analytics/users/aggregates/query", query)
+            for i in range(0, len(user_ids), BATCH_SIZE):
+                batch = user_ids[i:i + BATCH_SIZE]
+                predicates = [
+                    {"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid}
+                    for uid in batch
+                ]
+                query = {
+                    "interval": interval,
+                    "groupBy": ["userId"],
+                    "filter": {"type": "or", "predicates": predicates},
+                    "metrics": ["tSystemPresence", "tOrganizationPresence"]
+                }
+                try:
+                    data = self._post("/api/v2/analytics/users/aggregates/query", query)
+                except Exception as e:
+                    print(f"Error fetching user aggregates batch {i} for {interval}: {e}")
+                    data = {}
+
                 if data and 'results' in data:
                     combined_results.extend(data['results'])
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching batch {i}: {e}")
-                # Continue fetching other batches
-            except Exception as e:
-                print(f"Error fetching batch {i}: {e}")
-                
+            
+            curr = curr_end
+            
         return {"results": combined_results}
 
     def get_user_status_details(self, start_date, end_date, user_ids):
@@ -224,21 +417,39 @@ class GenesysAPI:
         BATCH_SIZE = 50 
         combined_details = []
         
-        for i in range(0, len(user_ids), BATCH_SIZE):
-            batch = user_ids[i:i + BATCH_SIZE]
+        # Chunk by 7 days for Details queries
+        chunk_days = 7
+        curr = start_date
+        while curr < end_date:
+            curr_end = min(curr + timedelta(days=chunk_days), end_date)
+            interval = f"{curr.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{curr_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
             
-            query = {
-                "interval": f"{start_date.isoformat()}Z/{end_date.isoformat()}Z",
-                "userFilters": [
-                    {"type": "or", "predicates": [{"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid} for uid in batch]}
-                ],
-                "paging": {"pageSize": 100}
-            }
-            try:
-                data = self._post("/api/v2/analytics/users/details/query", query)
-                if data and 'userDetails' in data:
-                    combined_details.extend(data['userDetails'])
-            except Exception as e:
-                print(f"Error details batch {i}: {e}")
+            for i in range(0, len(user_ids), BATCH_SIZE):
+                batch = user_ids[i:i + BATCH_SIZE]
                 
+                try:
+                    page = 1
+                    while True:
+                        query = {
+                            "interval": interval,
+                            "userFilters": [
+                                {"type": "or", "predicates": [{"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid} for uid in batch]}
+                            ],
+                            "paging": {"pageSize": 100, "pageNumber": page}
+                        }
+                        
+                        data = self._post("/api/v2/analytics/users/details/query", query)
+                        
+                        if data and 'userDetails' in data:
+                            combined_details.extend(data['userDetails'])
+                            if len(data['userDetails']) < 100: break
+                            page += 1
+                            if page > 50: break # Safety limit
+                        else:
+                            break
+                except Exception as e:
+                    print(f"Error details batch {i} interval {interval}: {e}")
+            
+            curr = curr_end
+            
         return {"userDetails": combined_details}

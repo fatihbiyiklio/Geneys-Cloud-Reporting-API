@@ -37,15 +37,19 @@ def process_daily_stats(response, lookup_map):
                 m = m_obj.get('metric')
                 s = m_obj.get('stats', {})
                 
-                if m == "nOffered":
-                    stats[q_name]["Offered"] += s.get('count', 0)
-                elif m == "tAnswered":
+                # Use tAnswered count for answered calls
+                if m == "tAnswered":
                     stats[q_name]["Answered"] += s.get('count', 0)
+                # Use tAbandon count for abandoned calls
                 elif m == "tAbandon":
                     stats[q_name]["Abandoned"] += s.get('count', 0)
                 elif m == "oServiceLevel":
                     stats[q_name]["SL_Numerator"] += s.get('numerator', 0)
                     stats[q_name]["SL_Denominator"] += s.get('denominator', 0)
+        
+        # Calculate Offered as Answered + Abandoned (matches Genesys workgroup view)
+        stats[q_name]["Offered"] = stats[q_name]["Answered"] + stats[q_name]["Abandoned"]
+    
     return stats
 
 def process_analytics_response(response, lookup_map, report_type, queue_map=None):
@@ -115,12 +119,10 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 if m_name == "tAlert": row["nAlert"] = stats.get('count', 0)
                 if m_name == "tHandle": row["nHandled"] = stats.get('count', 0)
                 
-                # tOutbound is tricky, usually we don't have separate tOutbound metric in response if we mapped it to tTalk?
-                # Actually if we mapped tOutbound to tTalk, we just get tTalk. Use tTalk as tOutbound? 
-                # Or just let it be. User asked for "Dış Arama Süresi". 
-                # If we mapped it to tTalk, we should duplicate tTalk to tOutbound.
-                if m_name == "tTalk": row["tOutbound"] = val 
-                if m_name == "tDialing": row["tOutbound"] = val # If we used tDialing
+                # Aliases for missing metrics that map to tTalk in aggregate view
+                if m_name == "tTalk":
+                    row["tOutbound"] = val
+                    row["tTalkComplete"] = val
             data.append(row)
 
     df = pd.DataFrame(data)
@@ -139,8 +141,13 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         df = df.groupby(group_cols)[numeric_cols].sum().reset_index()
         
         if report_type in ['user', 'agent', 'detailed', 'productivity']:
-            if "nOffered" in df.columns and "nAlert" in df.columns:
+            # nOffered fix: Use nAlert as fallback, and ensure it's at least nAnswered
+            if "nOffered" not in df.columns: df["nOffered"] = 0
+            if "nAlert" in df.columns:
                 df["nOffered"] = df.apply(lambda x: x["nAlert"] if x["nOffered"] == 0 else x["nOffered"], axis=1)
+            
+            if "nAnswered" in df.columns:
+                df["nOffered"] = df[["nOffered", "nAnswered"]].max(axis=1)
         
         if "tHandle" in df.columns and "CountHandle" in df.columns:
             df["AvgHandle"] = df.apply(lambda x: x["tHandle"] / x["CountHandle"] if x["CountHandle"] > 0 else 0, axis=1).round(2)
@@ -149,9 +156,25 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 
+        
         for col in df.select_dtypes(include=['float']).columns:
             df[col] = df[col].round(2)
             
+    return df
+
+def format_seconds_to_hms(val):
+    if pd.isna(val) or val == 0: return "00:00:00"
+    seconds = int(round(val))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def apply_duration_formatting(df):
+    target_cols = [c for c in df.columns if (c.startswith('t') or c.startswith('Avg') or c in ['col_staffed_time', 'Duration', 'col_duration']) and pd.api.types.is_numeric_dtype(df[c])]
+    for col in target_cols:
+        df[col] = df[col].apply(format_seconds_to_hms)
+    return df
+
     return df
 
 def fill_interval_gaps(df, start_dt_local, end_dt_local, granularity):
@@ -245,7 +268,8 @@ def process_user_aggregates(resp, presence_map=None):
         user_id = result.get('group', {}).get('userId')
         user_data = {
             "tMeal": 0, "tMeeting": 0, "tAvailable": 0, "tBusy": 0, 
-            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "StaffedTime": 0
+            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "StaffedTime": 0,
+            "nNotResponding": 0
         }
         
         data_list = result.get('data', [])
@@ -295,6 +319,9 @@ def process_user_aggregates(resp, presence_map=None):
                 elif "away" in mapped or "uzakta" in mapped: 
                     user_data["tAway"] += duration
                 
+                if m_name == "tNotResponding":
+                    user_data["nNotResponding"] += stats.get('count', 0)
+
                 # Staffed time is generally sum of all except Offline.
                 # In User Aggregates, presence metrics represent active presence.
                 if m_name in ["tSystemPresence", "tOrganizationPresence"] and "offline" not in mapped:
@@ -344,6 +371,256 @@ def process_user_details(resp):
             results[user_id] = {"Login": "N/A", "Logout": "N/A"}
             
     return results
+
+def process_conversation_details(response, user_map=None, queue_map=None, wrapup_map=None, include_attributes=False):
+    """Flattens conversation detail JSON into a DataFrame."""
+    rows = []
+    if not response or 'conversations' not in response:
+        return pd.DataFrame()
+
+    def fmt_time(iso_str):
+        if not iso_str: return ""
+        try:
+            dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+            return (dt + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+        except: return iso_str
+
+    def sec_to_hms(seconds):
+        if not seconds: return "00:00:00"
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    for conv in response['conversations']:
+        row = {
+            "Id": conv.get("conversationId"),
+            "Start": fmt_time(conv.get("conversationStart")),
+            "End": fmt_time(conv.get("conversationEnd")),
+            "Direction": conv.get("originatingDirection", "N/A"),
+            "Ani": "",
+            "Dnis": "",
+            "Queue": "",
+            "Agent": "",
+            "Username": "",
+            "Wrapup": "",
+            "DisconnectType": "",
+            "Duration": 0,
+            "Talk": 0,
+            "Hold": 0,
+            "Acw": 0,
+            "Wait": 0,
+            "Alert": 0,
+            "HoldCount": 0,
+            "MediaType": ""
+        }
+        
+        if include_attributes:
+            # Explicitly initialize requested attributes so they appear as columns
+            wanted_attrs = [
+                "Guest", "callbackNumber", "queueId", "agentId", "isChat", "ptype", "pid", 
+                "callbackNote", "Screen Pop URL", "sid", "customerPhone", "callbackTime", 
+                "customerEmail", "triggerSource", "chatType", "callbackCustomerName", "pname", 
+                "pdatein", "padult", "pchild", "customerName", "scriptId", "commercialConsent", 
+                "sbj", "pageUrl", "pdateout"
+            ]
+            for wa in wanted_attrs:
+                row[wa] = ""
+
+        # Determine metrics from participants
+        for p in conv.get("participants", []):
+            purpose = p.get("purpose")
+            
+            # Extract Attributes (Participant Data) if requested
+            if include_attributes and p.get("attributes"):
+                for k, v in p.get("attributes").items():
+                    # Update row with attribute value
+                    row[k] = v
+                    
+                    # Also try to match with wanted_attrs case-insensitively to fill the specific columns
+                    for wa in wanted_attrs:
+                        if k.lower() == wa.lower():
+                             row[wa] = v
+            # Also check if participantName holds queue name for purpose=acd
+
+            # Media Type (take first non-empty)
+            if not row["MediaType"]:
+                for s in p.get("sessions", []):
+                    if s.get("mediaType"):
+                        row["MediaType"] = s.get("mediaType")
+                        break
+            
+             # Disconnect Type (from peer/agent/external usually)
+            if not row["DisconnectType"]:
+                for s in p.get("sessions", []):
+                    if s.get("disconnectType"):
+                         raw_disc = s.get("disconnectType")
+                         # Prefer specific ones
+                         if raw_disc in ["client", "system", "transfer", "endpoint"]:
+                             row["DisconnectType"] = raw_disc
+                             break
+                         row["DisconnectType"] = raw_disc
+            
+             # Disconnect Type (from peer/agent/external usually)
+            if not row["DisconnectType"]:
+                for s in p.get("sessions", []):
+                    if s.get("disconnectType"):
+                         raw_disc = s.get("disconnectType")
+                         # Prefer specific ones
+                         if raw_disc in ["client", "system", "transfer", "endpoint"]:
+                             row["DisconnectType"] = raw_disc
+                             break
+                         row["DisconnectType"] = raw_disc
+            if purpose in ["external", "customer", "outbound"]: # outbound sometimes used for external
+                # Try standard fields first
+                if not row["Ani"] and p.get("ani"): row["Ani"] = p.get("ani")
+                if not row["Dnis"] and p.get("dnis"): row["Dnis"] = p.get("dnis")
+                
+                # Check sessions for address info
+                for s in p.get("sessions", []):
+                    if not row["Ani"] and s.get("ani"): row["Ani"] = s.get("ani")
+                    if not row["Dnis"] and s.get("dnis"): row["Dnis"] = s.get("dnis")
+                    # addressOther is often the remote party
+                    if not row["Ani"] and row["Direction"] == "inbound" and s.get("addressOther"): 
+                        row["Ani"] = s.get("addressOther")
+                    if not row["Dnis"] and row["Direction"] == "outbound" and s.get("addressOther"):
+                         row["Dnis"] = s.get("addressOther")
+
+                # Fallback to participant name if look like phone number
+                if not row["Ani"] and p.get("name") and p.get("name").replace("+","").isdigit():
+                    row["Ani"] = p.get("name")
+
+            # Queue Info
+            if purpose == "acd":
+                if not row["Queue"] and p.get("participantName"): row["Queue"] = p.get("participantName")
+                if not row["Queue"]:
+                    q_id = p.get("participantId") 
+                    if queue_map:
+                         qs_rev = {v: k for k, v in queue_map.items()}
+                         if q_id in qs_rev: row["Queue"] = qs_rev[q_id]
+            
+            # Agent Info - Check for Outbound Queue here too
+            if purpose == "agent" or purpose == "user":
+                if not row["Agent"] and p.get("participantName"): 
+                     row["Agent"] = p.get("participantName")
+                
+                # Try to get better name + username
+                if p.get("userId"):
+                    uid = p.get("userId")
+                    if user_map and uid in user_map:
+                         u_obj = user_map[uid]
+                         if isinstance(u_obj, dict):
+                             row["Agent"] = u_obj.get("name", row["Agent"] or uid)
+                             if u_obj.get("username"):
+                                 row["Username"] = u_obj.get("username").split("@")[0]
+                         else:
+                             row["Agent"] = str(u_obj)
+                
+                # Outbound calls on behalf of queue often have queueId in segments
+                for s in p.get("sessions", []):
+                    # Disconnect type fallback if not set
+                    if not row["DisconnectType"] and s.get("disconnectType"):
+                        row["DisconnectType"] = s.get("disconnectType")
+                        
+                    for segment in s.get("segments", []):
+                        if not row["Queue"] and segment.get("queueId"):
+                            q_id = segment.get("queueId")
+                            if queue_map:
+                                qs_rev = {v: k for k, v in queue_map.items()} 
+                                if q_id in qs_rev: row["Queue"] = qs_rev[q_id]
+                                
+                        if segment.get("disconnectType") and not row["DisconnectType"]:
+                             row["DisconnectType"] = segment.get("disconnectType")
+
+                        if segment.get("segmentEnd") and segment.get("segmentStart"):
+                            start = datetime.fromisoformat(segment["segmentStart"].replace('Z', '+00:00'))
+                            end = datetime.fromisoformat(segment["segmentEnd"].replace('Z', '+00:00'))
+                            dur = (end - start).total_seconds()
+                            
+                            stype = segment.get("segmentType")
+                            if stype == "interact": row["Talk"] += dur
+                            elif stype == "hold": 
+                                row["Hold"] += dur
+                                row["HoldCount"] += 1
+                            elif stype == "alert": row["Alert"] += dur
+                            elif stype == "wrapup": 
+                                row["Acw"] += dur
+                                w_code = segment.get("wrapUpCode")
+                                if w_code:
+                                    if wrapup_map and w_code in wrapup_map:
+                                        row["Wrapup"] = wrapup_map[w_code]
+                                    else:
+                                        row["Wrapup"] = w_code
+        
+        # Connection/Answer Status Logic
+        is_connected = False
+        if row["Talk"] > 0: is_connected = True
+        else:
+            # Check if any customer/external participant had an interact segment that wasn't just alerting
+            # Or check if any agent had interact
+            pass
+            
+        if row["Direction"] == "inbound":
+             row["ConnectionStatus"] = "Cevaplandı" if is_connected else "Kaçan/Cevapsız"
+        elif row["Direction"] == "outbound":
+             # For outbound, if not connected:
+             # If disconnect type is proper system/error -> Unreachable
+             # If just no answer/timeout -> Missed (Cevapsız)
+             # But user wants differentiation. "Ulaşılamadı" generally means failure to reach. 
+             # "Cevapsız" means it rang but no answer.
+             # Genesys often gives 'system' disconnect for unreachable.
+             
+             if is_connected: row["ConnectionStatus"] = "Ulaşıldı"
+             else:
+                 d_type = str(row["DisconnectType"]).lower()
+                 if d_type in ["system", "error", "uncallable", "timeout"]:
+                     row["ConnectionStatus"] = "Ulaşılamadı"
+                 else:
+                     row["ConnectionStatus"] = "Kaçan/Cevapsız"
+        else:
+             row["ConnectionStatus"] = "Bağlandı" if is_connected else "Bağlanamadı"
+
+        # Final Disconnect Reason Mapping
+        disc_map = {
+            "client": "Müşteri",
+            "system": "Sistem",
+            "transfer": "Transfer",
+            "endpoint": "Uç Nokta/Agent",
+            "peer": "Agent",
+            "error": "Hata",
+            "timeout": "Zaman Aşımı",
+            "spam": "Spam",
+            "uncallable": "Aranamaz"
+        }
+        raw_disc_lower = str(row["DisconnectType"]).lower()
+        if raw_disc_lower in disc_map:
+            row["DisconnectType"] = disc_map[raw_disc_lower]
+        
+        # Clean up ANI/DNIS prefixes
+        if row["Ani"]: row["Ani"] = row["Ani"].replace("tel:", "").replace("sip:", "")
+
+        # Clean up ANI/DNIS prefixes
+        if row["Ani"]: row["Ani"] = row["Ani"].replace("tel:", "").replace("sip:", "")
+        if row["Dnis"]: row["Dnis"] = row["Dnis"].replace("tel:", "").replace("sip:", "")
+
+        # Total duration
+        if conv.get("conversationEnd") and conv.get("conversationStart"):
+            try:
+                s = datetime.fromisoformat(conv["conversationStart"].replace('Z', '+00:00'))
+                e = datetime.fromisoformat(conv["conversationEnd"].replace('Z', '+00:00'))
+                row["Duration"] = int((e - s).total_seconds())
+            except: pass
+            
+        # Format durations to HH:MM:SS
+        row["Talk"] = sec_to_hms(row["Talk"])
+        row["Hold"] = sec_to_hms(row["Hold"])
+        row["Acw"] = sec_to_hms(row["Acw"])
+        row["Wait"] = sec_to_hms(row["Wait"])
+        row["Alert"] = sec_to_hms(row["Alert"])
+        row["Duration"] = sec_to_hms(row["Duration"])
+        
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 def to_excel(df):
     from io import BytesIO

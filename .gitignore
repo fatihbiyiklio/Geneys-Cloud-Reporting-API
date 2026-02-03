@@ -8,3 +8,7 @@ credentials.enc
 credentials.json
 .DS_Store
 .env
+.session.enc
+users.json
+presets.json
+json

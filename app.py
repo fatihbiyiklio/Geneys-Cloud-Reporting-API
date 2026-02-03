@@ -12,16 +12,25 @@ import signal
 from streamlit_autorefresh import st_autorefresh
 from streamlit.runtime import Runtime
 from cryptography.fernet import Fernet
+from src.data_manager import DataManager
+from src.auth_manager import AuthManager
 
+# --- AUTH MANAGER ---
+@st.cache_resource
+def get_auth_manager():
+    return AuthManager()
+
+auth_manager = get_auth_manager()
+
+# --- BACKGROUND MONITOR ---
 def _monitor_sessions():
     """Shuts down the process when no active sessions are left."""
-    pytime.sleep(10) # Initial grace period for app to start
+    pytime.sleep(10)
     while True:
         try:
             runtime = Runtime.instance()
             session_count = len(runtime._session_mgr.list_active_sessions())
             if session_count == 0:
-                # Final grace period for refreshes
                 pytime.sleep(10)
                 session_count = len(runtime._session_mgr.list_active_sessions())
                 if session_count == 0:
@@ -30,228 +39,139 @@ def _monitor_sessions():
             pass
         pytime.sleep(5)
 
-# Initialize Session Monitor
 if not any(t.name == "SessionMonitor" for t in threading.enumerate()):
-    monitor_thread = threading.Thread(target=_monitor_sessions, name="SessionMonitor", daemon=True)
-    monitor_thread.start()
+    threading.Thread(target=_monitor_sessions, name="SessionMonitor", daemon=True).start()
 
-
-# Add src to path to allow imports if running directly
+# --- IMPORTS & PATHS ---
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-
-import src.lang
-import importlib
-importlib.reload(src.lang)
-from src.lang import get_text, STRINGS, DEFAULT_METRICS
+from src.lang import get_text, STRINGS, DEFAULT_METRICS, ALL_METRICS
 from src.auth import authenticate
 from src.api import GenesysAPI
-from src.processor import process_analytics_response, to_excel, fill_interval_gaps, process_observations, process_daily_stats
+from src.processor import process_analytics_response, to_excel, fill_interval_gaps, process_observations, process_daily_stats, process_user_aggregates, process_user_details, process_conversation_details, apply_duration_formatting
 
-# Streamlit config
+# --- CONFIGURATION ---
 st.set_page_config(page_title="Genesys Cloud Reporting", layout="wide")
 
-# Custom CSS: Hide password visibility toggle & prevent refresh fade
-st.markdown("""
-<style>
-    /* Modern Dashboard Design (V4) - SaaS Style */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    
-    html, body, [data-testid="stAppViewContainer"] {
-        font-family: 'Inter', sans-serif !important;
-        background-color: #ffffff !important;
-    }
-
-    /* Group Card - Pure White with Soft Border */
-    [data-testid="stVerticalBlockBorderWrapper"] {
-        background-color: #ffffff !important;
-        border: 1px solid #eef2f6 !important;
-        border-radius: 12px !important;
-        padding: 1.5rem !important;
-        margin-bottom: 1.5rem !important;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.02) !important;
-    }
-
-    /* Metric Boxes - Light Grey Background for Contrast */
-    [data-testid="stMetricContainer"] {
-        background-color: #f8fafb !important;
-        border: 1px solid #f1f5f9 !important;
-        padding: 1rem 0.5rem !important;
-        border-radius: 10px !important;
-        text-align: center;
-        transition: transform 0.1s ease;
-    }
-    
-    [data-testid="stMetricContainer"]:hover {
-        background-color: #f1f5f9 !important;
-    }
-
-    [data-testid="stMetricLabel"] {
-        color: #64748b !important;
-        font-size: 0.75rem !important;
-        font-weight: 600 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        margin-bottom: 4px !important;
-    }
-
-    [data-testid="stMetricValue"] {
-        color: #1e293b !important;
-        font-size: 1.6rem !important;
-        font-weight: 700 !important;
-    }
-
-    /* Divider and Spacing */
-    hr { margin: 1.5rem 0 !important; border-color: #f1f5f9 !important; }
-    
-    .stCaption { color: #94a3b8 !important; font-weight: 500 !important; }
-
-    /* Hide password visibility toggle */
-    button[aria-label="Show password text"],
-    button[aria-label="Hide password text"],
-    .stTextInput button[kind="icon"] {
-        display: none !important;
-    }
-    
-    /* Auto-refresh optimizations */
-    .stApp > div:first-child { transition: none !important; }
-    .element-container, .stMetric, .stPlotlyChart, .stContainer {
-        transition: none !important;
-        opacity: 1 !important;
-    }
-    [data-testid="stAppViewContainer"] * { transition: none !important; }
-</style>
-""", unsafe_allow_html=True)
-
-
-CREDENTIALS_FILE = "credentials.enc"  # Encrypted file
-KEY_FILE = ".secret.key"  # Hidden key file
-
-def _get_or_create_key():
-    """Get or create encryption key based on machine identifier."""
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, "rb") as f:
-            return f.read()
-    else:
-        # Generate a new key
-        key = Fernet.generate_key()
-        with open(KEY_FILE, "wb") as f:
-            f.write(key)
-        # Make file hidden on Unix systems
-        try:
-            os.chmod(KEY_FILE, 0o600)  # Owner read/write only
-        except:
-            pass
-        return key
-
-def _get_cipher():
-    """Get Fernet cipher instance."""
-    key = _get_or_create_key()
-    return Fernet(key)
-
-def load_credentials():
-    """Load and decrypt credentials from encrypted file."""
-    if os.path.exists(CREDENTIALS_FILE):
-        try:
-            cipher = _get_cipher()
-            with open(CREDENTIALS_FILE, "rb") as f:
-                encrypted_data = f.read()
-            decrypted_data = cipher.decrypt(encrypted_data)
-            return json.loads(decrypted_data.decode('utf-8'))
-        except Exception as e:
-            # If decryption fails, return empty (corrupted or wrong key)
-            return {}
-    return {}
-
-def save_credentials(client_id, client_secret, region):
-    """Encrypt and save credentials to file."""
-    cipher = _get_cipher()
-    data = json.dumps({
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "region": region
-    }).encode('utf-8')
-    encrypted_data = cipher.encrypt(data)
-    with open(CREDENTIALS_FILE, "wb") as f:
-        f.write(encrypted_data)
-    try:
-        os.chmod(CREDENTIALS_FILE, 0o600)  # Owner read/write only
-    except:
-        pass
-
-def delete_credentials():
-    """Delete encrypted credentials file."""
-    if os.path.exists(CREDENTIALS_FILE):
-        os.remove(CREDENTIALS_FILE)
-    # Also delete old unencrypted file if exists
-    if os.path.exists("credentials.json"):
-        os.remove("credentials.json")
-
-# Initialize session state
-if 'api_client' not in st.session_state:
-    st.session_state.api_client = None
-if 'users_map' not in st.session_state:
-    st.session_state.users_map = {}
-if 'queues_map' not in st.session_state:
-    st.session_state.queues_map = {}
-if 'users_info' not in st.session_state:
-    st.session_state.users_info = {}
-if 'language' not in st.session_state:
-    st.session_state.language = "TR"
-# --- HELPER: CONFIG PERSISTENCE ---
+CREDENTIALS_FILE = "credentials.enc"
+KEY_FILE = ".secret.key"
 CONFIG_FILE = "dashboard_config.json"
 PRESETS_FILE = "presets.json"
 
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [data-testid="stAppViewContainer"] { font-family: 'Inter', sans-serif !important; background-color: #ffffff !important; }
+    [data-testid="stVerticalBlockBorderWrapper"] { background-color: #ffffff !important; border: 1px solid #eef2f6 !important; border-radius: 12px !important; padding: 1.5rem !important; margin-bottom: 1.5rem !important; }
+    [data-testid="stMetricContainer"] { background-color: #f8fafb !important; border: 1px solid #f1f5f9 !important; padding: 1rem 0.5rem !important; border-radius: 10px !important; text-align: center; }
+    [data-testid="stMetricContainer"]:hover { background-color: #f1f5f9 !important; }
+    [data-testid="stMetricLabel"] { color: #64748b !important; font-size: 0.75rem !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: 0.05em; }
+    [data-testid="stMetricValue"] { color: #1e293b !important; font-size: 1.6rem !important; font-weight: 700 !important; }
+    hr { margin: 1.5rem 0 !important; border-color: #f1f5f9 !important; }
+    button[aria-label="Show password text"], button[aria-label="Hide password text"] { display: none !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- GLOBAL HELPERS (DEFINED FIRST) ---
+
+APP_SESSION_FILE = ".session.enc"
+
+def _get_or_create_key():
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "rb") as f: return f.read()
+    key = Fernet.generate_key()
+    with open(KEY_FILE, "wb") as f: f.write(key)
+    try: os.chmod(KEY_FILE, 0o600)
+    except: pass
+    return key
+
+def _get_cipher():
+    return Fernet(_get_or_create_key())
+
+def load_credentials():
+    if not os.path.exists(CREDENTIALS_FILE): return {}
+    try:
+        cipher = _get_cipher()
+        with open(CREDENTIALS_FILE, "rb") as f: data = f.read()
+        return json.loads(cipher.decrypt(data).decode('utf-8'))
+    except: return {}
+
+def save_credentials(client_id, client_secret, region):
+    cipher = _get_cipher()
+    data = json.dumps({"client_id": client_id, "client_secret": client_secret, "region": region}).encode('utf-8')
+    with open(CREDENTIALS_FILE, "wb") as f: f.write(cipher.encrypt(data))
+    try: os.chmod(CREDENTIALS_FILE, 0o600)
+    except: pass
+
+def delete_credentials():
+    if os.path.exists(CREDENTIALS_FILE): os.remove(CREDENTIALS_FILE)
+
+def generate_password(length=12):
+    """Generate a secure random password."""
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits + "!@#$%"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+# --- APP SESSION MANAGEMENT (REMEMBER ME) ---
+def load_app_session():
+    if not os.path.exists(APP_SESSION_FILE): return None
+    try:
+        cipher = _get_cipher()
+        with open(APP_SESSION_FILE, "rb") as f: data = f.read()
+        session_data = json.loads(cipher.decrypt(data).decode('utf-8'))
+        
+        # Check 3-hour expiry
+        timestamp = session_data.get("timestamp", 0)
+        if pytime.time() - timestamp > (3 * 3600):
+            delete_app_session()
+            return None
+            
+        return session_data
+    except Exception:
+        return None
+
+def save_app_session(user_data):
+    try:
+        cipher = _get_cipher()
+        # Add timestamp
+        payload = {**user_data, "timestamp": pytime.time()}
+        data = json.dumps(payload).encode('utf-8')
+        with open(APP_SESSION_FILE, "wb") as f: f.write(cipher.encrypt(data))
+        try: os.chmod(APP_SESSION_FILE, 0o600)
+        except: pass
+    except: pass
+
+def delete_app_session():
+    if os.path.exists(APP_SESSION_FILE): os.remove(APP_SESSION_FILE)
+
 def load_dashboard_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return {"layout": 1, "cards": []}
+    if not os.path.exists(CONFIG_FILE): return {"layout": 1, "cards": []}
+    try:
+        with open(CONFIG_FILE, "r") as f: return json.load(f)
+    except: return {"layout": 1, "cards": []}
 
 def save_dashboard_config(layout, cards):
     try:
-        data = {"layout": layout, "cards": cards}
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        print(f"Error saving config: {e}")
+        with open(CONFIG_FILE, "w") as f: json.dump({"layout": layout, "cards": cards}, f)
+    except: pass
 
 def load_presets():
-    """Load report presets from file."""
-    if os.path.exists(PRESETS_FILE):
-        try:
-            with open(PRESETS_FILE, "r") as f:
-                data = json.load(f)
-                # Ensure it's the new list-based format
-                if isinstance(data, list):
-                    return data
-                # Convert old dictionary format to new list format if needed
-                return []
-        except:
-            pass
-    return []
+    if not os.path.exists(PRESETS_FILE): return []
+    try:
+        with open(PRESETS_FILE, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except: return []
 
 def save_presets(presets):
-    """Save report presets to file."""
     try:
-        with open(PRESETS_FILE, "w") as f:
-            json.dump(presets, f)
-    except Exception as e:
-        print(f"Error saving presets: {e}")
+        with open(PRESETS_FILE, "w") as f: json.dump(presets, f)
+    except: pass
 
 def get_all_configs_json():
-    """Combines all configurations into a single JSON for export."""
-    dashboard = load_dashboard_config()
-    presets = load_presets()
-    return json.dumps({
-        "dashboard": dashboard,
-        "report_presets": presets
-    }, indent=2)
+    return json.dumps({"dashboard": load_dashboard_config(), "report_presets": load_presets()}, indent=2)
 
 def import_all_configs(json_data):
-    """Restores configurations from a JSON string."""
     try:
         data = json.loads(json_data)
         if "dashboard" in data:
@@ -259,722 +179,757 @@ def import_all_configs(json_data):
         if "report_presets" in data:
             save_presets(data["report_presets"])
         return True
-    except Exception as e:
-        print(f"Error importing configs: {e}")
-        return False
+    except: return False
+
+@st.cache_resource
+def get_data_manager():
+    return DataManager()
+
+data_manager = get_data_manager()
+
+def create_gauge_chart(value, title, height=250):
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number", value = value, title = {'text': title},
+        gauge = {'axis': {'range': [0, 100]}, 'bar': {'color': "#00AEC7"},
+                 'steps': [{'range': [0, 50], 'color': "#ffebee"}, {'range': [50, 80], 'color': "#fff3e0"}, {'range': [80, 100], 'color': "#e8f5e9"}]}))
+    fig.update_layout(height=height, margin=dict(l=20, r=20, t=50, b=20))
+    return fig
+
+def create_donut_chart(data_dict, title, height=300):
+    filtered_data = {k: v for k, v in data_dict.items() if v > 0} or {"N/A": 1}
+    fig = px.pie(pd.DataFrame(list(filtered_data.items()), columns=['Status', 'Count']), 
+                 values='Count', names='Status', title=title, hole=0.6, color_discrete_sequence=px.colors.qualitative.Set2)
+    fig.update_layout(height=height, margin=dict(l=20, r=20, t=50, b=20))
+    return fig
+# --- INITIALIZATION ---
+if 'api_client' not in st.session_state: st.session_state.api_client = None
+if 'users_map' not in st.session_state: st.session_state.users_map = {}
+if 'queues_map' not in st.session_state: st.session_state.queues_map = {}
+if 'users_info' not in st.session_state: st.session_state.users_info = {}
+if 'language' not in st.session_state: st.session_state.language = "TR"
+if 'app_user' not in st.session_state: st.session_state.app_user = None
+if 'wrapup_map' not in st.session_state: st.session_state.wrapup_map = {}
+
+# --- APP LOGIN ---
+if not st.session_state.app_user:
+    # Try Auto-Login from Encrypted Session File
+    saved_session = load_app_session()
+    if saved_session:
+        st.session_state.app_user = saved_session
+        st.rerun()
+
+    st.markdown("<h1 style='text-align: center;'>Genesys Reporting API</h1>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        with st.form("app_login_form"):
+            st.subheader("Uygulama Girişi / App Login")
+            u_name = st.text_input("Kullanıcı Adı / Username")
+            u_pass = st.text_input("Şifre / Password", type="password")
+            remember_me = st.checkbox("Beni Hatırla / Remember Me")
+            
+            if st.form_submit_button("Giriş / Login", use_container_width=True):
+                user_data = auth_manager.authenticate(u_name, u_pass)
+                if user_data:
+                    # Exclude password hash from session state and file
+                    safe_user_data = {k: v for k, v in user_data.items() if k != 'password'}
+                    full_user = {"username": u_name, **safe_user_data}
+                    
+                    # Handle Remember Me
+                    if remember_me:
+                        save_app_session(full_user)
+                    else:
+                        delete_app_session()
+                        
+                    st.session_state.app_user = full_user
+                    st.rerun()
+                else:
+                    st.error("Hatalı kullanıcı adı veya şifre!")
+    st.stop()
+
+# --- AUTO-LOGIN ---
+
+saved_creds = load_credentials()
+if not st.session_state.api_client and saved_creds:
+    cid, csec, reg = saved_creds.get("client_id"), saved_creds.get("client_secret"), saved_creds.get("region", "mypurecloud.ie")
+    if cid and csec:
+        client, err = authenticate(cid, csec, reg)
+        if client:
+            st.session_state.api_client = client
+            api = GenesysAPI(client)
+            users = api.get_users()
+            st.session_state.users_map = {u['name']: u['id'] for u in users}
+            st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
+            st.session_state.queues_map = {q['name']: q['id'] for q in api.get_queues()}
+            st.session_state.wrapup_map = api.get_wrapup_codes()
+            st.session_state.presence_map = api.get_presence_definitions()
+            data_manager.update_api_client(client, st.session_state.presence_map)
+            data_manager.start(st.session_state.queues_map)
 
 # --- SIDEBAR ---
-saved_creds = load_credentials()
-
 with st.sidebar:
     st.session_state.language = st.selectbox("Dil / Language", ["TR", "EN"])
     lang = st.session_state.language
+    st.write(f"Hoş geldiniz, **{st.session_state.app_user['username']}** ({st.session_state.app_user['role']})")
+    if st.button("Çıkış Yap / Logout App", type="secondary", use_container_width=True):
+        st.session_state.app_user = None
+        delete_app_session()
+        st.rerun()
     st.title("Settings / Ayarlar")
     
-    # Navigation
-    st.session_state.page = st.radio(get_text(lang, "sidebar_title"), 
-                                     [get_text(lang, "menu_reports"), get_text(lang, "menu_dashboard")])
-    
-    st.write("---")
-    client_id = st.text_input("Client ID", value=saved_creds.get("client_id", ""), type="password")
-    client_secret = st.text_input("Client Secret", value=saved_creds.get("client_secret", ""), type="password")
-    
-    regions = ["mypurecloud.ie", "mypurecloud.com", "mypurecloud.de"]
-    saved_region = saved_creds.get("region", "mypurecloud.ie")
-    region_index = regions.index(saved_region) if saved_region in regions else 0
-    region = st.selectbox("Region", regions, index=region_index)
-    
-    remember_me = st.checkbox(get_text(lang, "remember_me"), value=bool(saved_creds))
-    
-    if st.button("Login"):
-        if client_id and client_secret:
-            with st.spinner("Authenticating..."):
-                api_client, error = authenticate(client_id, client_secret, region)
-                if api_client:
-                    st.session_state.api_client = api_client
-                    st.success("Login Success!")
-                    
-                    if remember_me:
-                        save_credentials(client_id, client_secret, region)
-                    else:
-                        delete_credentials()
-                    
-                    gen_api = GenesysAPI(api_client)
-                    users = gen_api.get_users()
-                    st.session_state.users_map = {u['name']: u['id'] for u in users}
-                    st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
-                    
-                    queues = gen_api.get_queues()
-                    st.session_state.queues_map = {q['name']: q['id'] for q in queues}
-                    
-                    # Fetch Presence Definitions for mapping UUIDs
-                    st.session_state.presence_map = gen_api.get_presence_definitions()
+    # Define menu options based on role
+    menu_options = []
+    role = st.session_state.app_user['role']
+    if role in ["Admin", "Manager", "Reports User"]:
+        menu_options.append(get_text(lang, "menu_reports"))
+    if role in ["Admin", "Manager", "Dashboard User"]:
+        menu_options.append(get_text(lang, "menu_dashboard"))
+    if role == "Admin":
+        menu_options.append("Kullanıcı Yönetimi")
 
-                    st.rerun()
-                    st.rerun()
-                else:
-                    st.error(f"Error: {error}")
+    st.session_state.page = st.radio(get_text(lang, "sidebar_title"), menu_options)
+    st.write("---")
     
-    if st.session_state.api_client:
-        st.write("---")
-        if st.button("Logout"):
+    # Admin-only Credentials Section
+    if role == "Admin":
+        st.subheader("Genesys API Credentials")
+        c_id = st.text_input("Client ID", value=saved_creds.get("client_id", ""), type="password")
+        c_sec = st.text_input("Client Secret", value=saved_creds.get("client_secret", ""), type="password")
+        regions = ["mypurecloud.ie", "mypurecloud.com", "mypurecloud.de"]
+        region = st.selectbox("Region", regions, index=regions.index(saved_creds.get("region", "mypurecloud.ie")) if saved_creds.get("region") in regions else 0)
+        remember = st.checkbox(get_text(lang, "remember_me"), value=bool(saved_creds))
+        
+        if st.button("Login (Genesys)"):
+            if c_id and c_sec:
+                with st.spinner("Authenticating..."):
+                    client, err = authenticate(c_id, c_sec, region)
+                    if client:
+                        st.session_state.api_client = client
+                        if remember: save_credentials(c_id, c_sec, region)
+                        else: delete_credentials()
+                        api = GenesysAPI(client)
+                        users = api.get_users()
+                        st.session_state.users_map = {u['name']: u['id'] for u in users}
+                        st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
+                        st.session_state.queues_map = {q['name']: q['id'] for q in api.get_queues()}
+                        st.session_state.wrapup_map = api.get_wrapup_codes()
+                        st.session_state.presence_map = api.get_presence_definitions()
+                        data_manager.update_api_client(client, st.session_state.presence_map)
+                        data_manager.start(st.session_state.queues_map)
+                        st.rerun()
+                    else: st.error(f"Error: {err}")
+    
+    # Keep the Genesys Logout if needed, or hide it if not Admin?
+    # Actually, once logged in to Genesys, it's global for the app session.
+    # But only Admin can CHANGE it.
+    
+    if st.session_state.api_client and role == "Admin":
+        if st.button("Logout (Genesys)"):
             st.session_state.api_client = None
             st.rerun()
 
     st.write("---")
     st.subheader(get_text(lang, "export_config"))
-    st.download_button(
-        label=get_text(lang, "export_config"),
-        data=get_all_configs_json(),
-        file_name=f"genesys_config_{datetime.now().strftime('%Y%m%d')}.json",
-        mime="application/json",
-        width='stretch'
-    )
+    st.download_button(label=get_text(lang, "export_config"), data=get_all_configs_json(), file_name=f"genesys_config_{datetime.now().strftime('%Y%m%d')}.json", mime="application/json")
     
     st.write("---")
     st.subheader(get_text(lang, "import_config"))
-    uploaded_file = st.file_uploader(get_text(lang, "import_config"), type=["json"])
-    if uploaded_file is not None:
-        if st.button(get_text(lang, "save"), key="import_btn"):
-            content = uploaded_file.getvalue().decode("utf-8")
-            if import_all_configs(content):
-                st.success(get_text(lang, "config_imported"))
-                # Clear dashboard cache so it reloads from file
-                if 'dashboard_config_loaded' in st.session_state:
-                    del st.session_state.dashboard_config_loaded
-            else:
-                st.error(get_text(lang, "config_import_error"))
-
-# --- HELPER: PLOTLY CHARTS ---
-def create_gauge_chart(value, title, height=250):
-    fig = go.Figure(go.Indicator(
-        mode = "gauge+number",
-        value = value,
-        title = {'text': title},
-        gauge = {
-            'axis': {'range': [0, 100]},
-            'bar': {'color': "#00AEC7"}, # Genesys Style Blue
-            'steps': [
-                {'range': [0, 50], 'color': "#ffebee"},
-                {'range': [50, 80], 'color': "#fff3e0"},
-                {'range': [80, 100], 'color': "#e8f5e9"}],
-        }
-    ))
-    fig.update_layout(height=height, margin=dict(l=20, r=20, t=50, b=20))
-    return fig
-
-def create_donut_chart(data_dict, title, height=300):
-    # Filter out zeros for cleaner chart
-    filtered_data = {k: v for k, v in data_dict.items() if v > 0}
-    if not filtered_data:
-        filtered_data = {"N/A": 1} # Placeholder
-        
-    df = pd.DataFrame(list(filtered_data.items()), columns=['Status', 'Count'])
-    
-    fig = px.pie(df, values='Count', names='Status', title=title, hole=0.6,
-                 color_discrete_sequence=px.colors.qualitative.Set2)
-    fig.update_layout(height=height, margin=dict(l=20, r=20, t=50, b=20))
-    return fig
-
+    up_file = st.file_uploader(get_text(lang, "import_config"), type=["json"])
+    if up_file and st.button(get_text(lang, "save"), key="import_btn"):
+        if import_all_configs(up_file.getvalue().decode("utf-8")):
+            st.success(get_text(lang, "config_imported"))
+            if 'dashboard_config_loaded' in st.session_state: del st.session_state.dashboard_config_loaded
+        else: st.error(get_text(lang, "config_import_error"))
 
 # --- MAIN LOGIC ---
-lang = st.session_state.language
-
 if not st.session_state.api_client:
-    c_logo, c_title = st.columns([1, 4])
-    with c_logo:
-        pass # Placeholder for logo if needed
-    with c_title:
-        st.title(get_text(lang, "title"))
+    st.title(get_text(lang, "title"))
     st.info(get_text(lang, "welcome"))
 else:
-    # --- PAGE: REPORTS ---
     if st.session_state.page == get_text(lang, "menu_reports"):
         st.title(get_text(lang, "menu_reports"))
-
-        # --- PRESET MANAGEMENT (NEW) ---
         presets = load_presets()
-        preset_names = [p['name'] for p in presets]
+        c_p1, c_p2, c_p3 = st.columns([2, 1, 1])
+        with c_p1:
+            sel_p = st.selectbox(get_text(lang, "select_view"), [get_text(lang, "no_view_selected")] + [p['name'] for p in presets], key="preset_selector")
         
-        c_pre1, c_pre2, c_pre3 = st.columns([2, 1, 1])
+        def_p = {}
+        if sel_p != get_text(lang, "no_view_selected"):
+            p = next((p for p in presets if p['name'] == sel_p), None)
+            if p:
+                def_p = p
+                for k in ["type", "names", "metrics", "granularity_label", "fill_gaps"]:
+                    if k in p: st.session_state[f"rep_{k[:3]}"] = p[k]
         
-        with c_pre1:
-            selected_preset_name = st.selectbox(
-                get_text(lang, "select_view"),
-                [get_text(lang, "no_view_selected")] + preset_names,
-                key="preset_selector"
-            )
-            
-        if selected_preset_name != get_text(lang, "no_view_selected"):
-            # Apply preset if selected
-            preset = next((p for p in presets if p['name'] == selected_preset_name), None)
-            if preset:
-                # Explicitly update session state keys to force widgets to sync
-                st.session_state.active_preset = preset
-                st.session_state.rep_type = preset.get("type", "report_agent")
-                st.session_state.rep_names = preset.get("names", [])
-                st.session_state.rep_metrics = preset.get("metrics", DEFAULT_METRICS)
-                st.session_state.rep_gran = preset.get("granularity_label", preset.get("granularity", "Toplam"))
-                st.session_state.rep_fill = preset.get("fill_gaps", False)
-
         with st.expander(get_text(lang, "save_view")):
-            c_sv1, c_sv2 = st.columns([3, 1], vertical_alignment="bottom")
-            new_preset_name = c_sv1.text_input(get_text(lang, "preset_name"), placeholder="Günlük Raporum...")
-            if c_sv2.button(get_text(lang, "save"), use_container_width=True, type="primary"):
-                if new_preset_name:
-                    # Collect current state from keys we'll define below
-                    new_preset = {
-                        "name": new_preset_name,
-                        "type": st.session_state.get("rep_type", "agent_report"),
-                        "names": st.session_state.get("rep_names", []),
-                        "metrics": st.session_state.get("rep_metrics", DEFAULT_METRICS),
-                        "granularity": gran_opt.get(st.session_state.get("rep_gran", get_text(lang, "total")), "P1D"),
-                        "granularity_label": st.session_state.get("rep_gran", get_text(lang, "total")),
-                        "fill_gaps": st.session_state.get("rep_fill", False)
-                    }
-                    # Update or Add
-                    presets = [p for p in presets if p['name'] != new_preset_name]
-                    presets.append(new_preset)
-                    save_presets(presets)
-                    st.success(get_text(lang, "view_saved"))
-                    st.rerun()
+            cs1, cs2 = st.columns([3, 1], vertical_alignment="bottom")
+            p_name = cs1.text_input(get_text(lang, "preset_name"))
+            if cs2.button(get_text(lang, "save"), use_container_width=True, type="primary") and p_name:
+                new_p = {"name": p_name, "type": st.session_state.get("rep_typ", "report_agent"), "names": st.session_state.get("rep_nam", []), "metrics": st.session_state.get("rep_met", DEFAULT_METRICS), "granularity_label": st.session_state.get("rep_gra", "Toplam"), "fill_gaps": st.session_state.get("rep_fil", False)}
+                presets = [p for p in presets if p['name'] != p_name] + [new_p]
+                save_presets(presets); st.success(get_text(lang, "view_saved")); st.rerun()
 
-        if selected_preset_name != get_text(lang, "no_view_selected"):
-            c_del1, c_del2 = st.columns([1, 3])
-            if c_del1.button(get_text(lang, "delete_view"), type="secondary", use_container_width=True):
-                presets = [p for p in presets if p['name'] != selected_preset_name]
-                save_presets(presets)
-                st.info(get_text(lang, "view_deleted"))
-                st.rerun()
-        
         st.write("---")
-        
-        # Determine base values for widgets (preset or session)
-        def_p = st.session_state.get("active_preset", {})
-        
-        c1, c2 = st.columns([1, 1])
+        c1, c2 = st.columns(2)
         with c1:
-            report_type_key = st.radio(
-                get_text(lang, "report_type"),
-                ["report_agent", "report_queue", "report_detailed"],
+            role = st.session_state.app_user['role']
+            if role == "Reports User":
+                rep_types = ["report_agent", "report_queue", "report_detailed", "interaction_search", "missed_interactions"]
+            else: # Admin, Manager
+                rep_types = ["report_agent", "report_queue", "report_detailed", "interaction_search", "chat_detail", "missed_interactions"]
+            
+            r_type = st.selectbox(
+                get_text(lang, "report_type"), 
+                rep_types, 
                 format_func=lambda x: get_text(lang, x),
-                horizontal=True,
-                key="rep_type",
-                index=["report_agent", "report_queue", "report_detailed"].index(def_p.get("type", "report_agent"))
-            )
-            report_type = "Agent" if report_type_key == "report_agent" else ("Workgroup" if report_type_key == "report_queue" else "Detailed")
-
+                key="rep_typ", index=rep_types.index(def_p.get("type", "report_agent")) if def_p.get("type", "report_agent") in rep_types else 0)
         with c2:
-            if report_type in ["Agent", "Detailed"]:
-                selected_names = st.multiselect(
-                    get_text(lang, "select_agents"), 
-                    list(st.session_state.users_map.keys()),
-                    key="rep_names",
-                    default=def_p.get("names", []) if def_p.get("type") in ["report_agent", "report_detailed"] else []
-                )
-                selected_ids = [st.session_state.users_map[name] for name in selected_names]
-            elif report_type == "Workgroup":
-                selected_names = st.multiselect(
-                    get_text(lang, "select_workgroups"), 
-                    list(st.session_state.queues_map.keys()),
-                    key="rep_names",
-                    default=def_p.get("names", []) if def_p.get("type") == "report_queue" else []
-                )
-                selected_ids = [st.session_state.queues_map[name] for name in selected_names]
+            is_agent = r_type in ["report_agent", "report_detailed"]
+            opts = list(st.session_state.users_map.keys()) if is_agent else list(st.session_state.queues_map.keys())
+            sel_names = st.multiselect(get_text(lang, "select_agents" if is_agent else "select_workgroups"), opts, key="rep_nam")
+            sel_ids = [(st.session_state.users_map if is_agent else st.session_state.queues_map)[n] for n in sel_names]
 
-        # 2. Row: Dates and Times (UTC+3)
         st.write("---")
-        c3, c4 = st.columns(2, vertical_alignment="bottom")
+        c3, c4 = st.columns(2)
         with c3:
-            d1, t1 = st.columns(2, vertical_alignment="bottom")
-            start_date = d1.date_input("Start Date / Başlangıç", datetime.today())
-            start_time = t1.time_input(get_text(lang, "start_time"), time(0, 0))
+            d1, t1 = st.columns(2); sd = d1.date_input("Start Date", datetime.today()); st_ = t1.time_input(get_text(lang, "start_time"), time(0, 0))
         with c4:
-            d2, t2 = st.columns(2, vertical_alignment="bottom")
-            end_date = d2.date_input("End Date / Bitiş", datetime.today())
-            end_time = t2.time_input(get_text(lang, "end_time"), time(23, 59))
-            
-        # Granularity and Gap Filling
-        g1, g2 = st.columns([1, 1], vertical_alignment="bottom")
-        gran_opt = {
-            get_text(lang, "total"): "P1D",
-            get_text(lang, "30min"): "PT30M",
-            get_text(lang, "1hour"): "PT1H"
-        }
+            d2, t2 = st.columns(2); ed = d2.date_input("End Date", datetime.today()); et = t2.time_input(get_text(lang, "end_time"), time(23, 59))
         
-        # Match label string from value
-        saved_gran = def_p.get("granularity", "P1D")
-        if saved_gran in gran_opt.values():
-            def_gran_label = list(gran_opt.keys())[list(gran_opt.values()).index(saved_gran)]
-        else:
-            def_gran_label = list(gran_opt.keys())[0]
-        selected_gran_label = g1.selectbox(
-            get_text(lang, "granularity"), 
-            list(gran_opt.keys()),
-            key="rep_gran",
-            index=list(gran_opt.keys()).index(def_gran_label)
-        )
-        granularity = gran_opt[selected_gran_label]
-        
-        do_fill_gaps = g2.checkbox(
-            get_text(lang, "fill_gaps"), 
-            value=def_p.get("fill_gaps", False),
-            key="rep_fill"
-        )
+        g1, g2 = st.columns(2)
+        gran_opt = {get_text(lang, "total"): "P1D", get_text(lang, "30min"): "PT30M", get_text(lang, "1hour"): "PT1H"}
+        sel_gran = g1.selectbox(get_text(lang, "granularity"), list(gran_opt.keys()), key="rep_gra")
+        do_fill = g2.checkbox(get_text(lang, "fill_gaps"), key="rep_fil")
 
-          # Metrics Selection
         st.write("---")
-        from src.lang import ALL_METRICS as ALL_M
         
-        # Determine default metrics based on report type
-        auto_def_metrics = ["nOffered", "nAnswered", "tAnswered", "tTalk", "tHandle"]
-            
-        def_metrics = def_p.get("metrics", auto_def_metrics)
-        # Ensure all selected metrics exist in the list
-        selection_options = ALL_M
-        def_metrics = [m for m in def_metrics if m in selection_options]
+        # Filter metrics based on user permissions
+        user_metrics = st.session_state.app_user.get('metrics', [])
+        selection_options = user_metrics if user_metrics and role != "Admin" else ALL_METRICS
         
-        selected_metrics = st.multiselect(
-            get_text(lang, "metrics"),
-            selection_options,
-            default=def_metrics,
-            format_func=lambda x: get_text(lang, x),
-            key="rep_metrics"
-        )
-
-        # 4. Action
-        if st.button(get_text(lang, "fetch_report"), type="primary", width='stretch'):
-            if not selected_metrics:
-                st.warning("Lütfen metrik seçiniz.")
+        if r_type not in ["interaction_search", "chat_detail", "missed_interactions"]:
+            # Use last used metrics as default if available, otherwise use standard defaults
+            if "last_metrics" in st.session_state and st.session_state.last_metrics:
+                auto_def_metrics = [m for m in st.session_state.last_metrics if m in selection_options]
             else:
+                auto_def_metrics = [m for m in ["nOffered", "nAnswered", "tAnswered", "tTalk", "tHandle"] if m in selection_options]
+            sel_mets = st.multiselect(get_text(lang, "metrics"), selection_options, default=auto_def_metrics, format_func=lambda x: get_text(lang, x), key="rep_met")
+        else:
+            sel_mets = []
+
+
+        if r_type == "chat_detail":
+            st.info("Bu rapor, webchat, whatsapp, message gibi yazılı etkileşimlerin detaylarını ve 'Participant Data' verilerini içerir.")
+            if st.button("Chat Verilerini Getir / Fetch Chat Data", type="primary", use_container_width=True):
+                 with st.spinner(get_text(lang, "fetching_data")):
+                     start_date = datetime.combine(sd, st_) - timedelta(hours=3)
+                     end_date = datetime.combine(ed, et) - timedelta(hours=3)
+                     
+                     api = GenesysAPI(st.session_state.api_client)
+                     # Fetch all, but we will filter for chats ideally or just process all with attributes
+                     # Interaction detail endpoint returns all types.
+                     raw_convs = api.get_conversation_details(start_date, end_date)
+                     # Process with attributes=True (Base structure)
+                     df = process_conversation_details(
+                         raw_convs, 
+                         st.session_state.users_info, 
+                         st.session_state.queues_map, 
+                         st.session_state.wrapup_map,
+                         include_attributes=True
+                     )
+                     
+                     if not df.empty:
+                         # Filter for Chat/Message types FIRST to reduce API calls
+                         chat_types = ['chat', 'message', 'webchat', 'whatsapp', 'facebook', 'twitter', 'line', 'telegram']
+                         df_chat = df[df['MediaType'].isin(chat_types)].copy()
+
+                         if not df_chat.empty:
+                             st.info(f"Detay veriler {len(df_chat)} kayıt için çekiliyor... (Bu işlem biraz sürebilir) / Fetching detailed attributes...")
+                             
+                             # Create a progress bar
+                             progress_bar = st.progress(0)
+                             total_chats = len(df_chat)
+                             
+                             # Prepare a list to collect updated attributes
+                             enrichment_data = []
+
+                             # Use the helper to fetch
+                             api_instance = GenesysAPI(st.session_state.api_client)
+
+                             for index, (idx, row) in enumerate(df_chat.iterrows()):
+                                 conv_id = row['Id']
+                                 # Update progress
+                                 progress_bar.progress((index + 1) / total_chats)
+                                 
+                                 try:
+                                     # ENRICHMENT: Call Standard Conversation API
+                                     # This is necessary because Analytics API often omits 'attributes' (Participant Data)
+                                     full_conv = api_instance._get(f"/api/v2/conversations/{conv_id}")
+                                     
+                                     attrs = {}
+                                     if full_conv and 'participants' in full_conv:
+                                         # Look for customer participant who usually holds the attributes
+                                         # Prioritize customer, then check others
+                                         found_attrs = False
+                                         for p in full_conv['participants']:
+                                             if p.get('purpose') == 'customer' and 'attributes' in p and p['attributes']:
+                                                 attrs = p['attributes']
+                                                 found_attrs = True
+                                                 break
+                                         
+                                         if not found_attrs:
+                                              for p in full_conv['participants']:
+                                                  if 'attributes' in p and p['attributes']:
+                                                      attrs = p['attributes']
+                                                      break
+                                     
+                                     # Append dict to list
+                                     enrichment_data.append(attrs)
+                                     
+                                 except Exception as e:
+                                     # If individual fetch fails
+                                     enrichment_data.append({})
+                             
+                             progress_bar.empty()
+                             
+                             # Merge attributes into the DataFrame
+                             # usage of 'at' for direct assignment
+                             for i, attrs in enumerate(enrichment_data):
+                                 original_index = df_chat.index[i]
+                                 for k, v in attrs.items():
+                                     # Determine content to set. If it's a date or number, pandas might complain if column is object type,
+                                     # but usually it handles it. 
+                                     # We cast to string if needed to be safe? No, let pandas handle types.
+                                     df_chat.at[original_index, k] = v
+                         
+                         if df_chat.empty and not df.empty:
+                             st.warning("Seçilen tarih aralığında hiç 'Chat/Mesaj' kaydı bulunamadı. (Sesli çağrılar hariç tutuldu)")
+                         elif not df_chat.empty:
+                             # Display
+                             st.dataframe(df_chat, use_container_width=True)
+                             st.download_button(get_text(lang, "download_excel"), data=to_excel(df_chat), file_name=f"chat_detail_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+                         else:
+                             st.warning(get_text(lang, "no_data"))
+                     else:
+                         st.warning(get_text(lang, "no_data"))
+
+        # --- MISSED INTERACTIONS REPORT ---
+        if r_type == "missed_interactions":
+            st.info("Bu rapor, seçilen tarih aralığındaki CEVAPLANMAYAN (Kaçan) sesli ve yazılı etkileşimleri listeler.")
+            
+            # Dynamic Column Selection (Reuse interaction cols)
+            from src.lang import INTERACTION_COLUMNS
+            default_cols = [c for c in INTERACTION_COLUMNS if c not in ["col_attributes", "col_media"]]
+             # Let user select
+            selected_cols_keys = st.multiselect("Sütunları Seçin / Select Columns", INTERACTION_COLUMNS, default=INTERACTION_COLUMNS, format_func=lambda x: get_text(lang, x))
+
+            if st.button("Kaçan Çağrıları Getir / Fetch Missed", type="primary", use_container_width=True):
+                 with st.spinner(get_text(lang, "fetching_data")):
+                     # Fetch data
+                     # We need to fetch conversation details
+                     # api = GenesysAPI(st.session_state.api_client) # already initialized above if needed, but let's re-init
+                     api = GenesysAPI(st.session_state.api_client)
+                     
+                     s_dt = datetime.combine(sd, st_) - timedelta(hours=3)
+                     e_dt = datetime.combine(ed, et) - timedelta(hours=3)
+                     
+                     # Get details
+                     raw_data = api.get_conversation_details(s_dt, e_dt)
+                     
+                     # DEBUG: Dump first 5 conversations to check attributes
+                     try:
+                         import json
+                         with open("debug_chat_dump.json", "w", encoding="utf-8") as f:
+                             json.dump(raw_data.get('conversations', [])[:5], f, indent=2, default=str)
+                     except: pass
+                     
+                     df = process_conversation_details(
+                         raw_data, 
+                         user_map=st.session_state.users_info, 
+                         queue_map=st.session_state.queues_map, 
+                         wrapup_map=st.session_state.wrapup_map,
+                         include_attributes=True
+                     )
+                     
+                     if not df.empty:
+                         # Filter for MISSED Only
+                         # Condition: ConnectionStatus is NOT "Cevaplandı" or "Ulaşıldı" or "Bağlandı"
+                         # OR strictly match "Kaçan/Cevapsız", "Ulaşılamadı", "Bağlanamadı"
+                         # STRICT REQUIREMENT: Only Inbound
+                         
+                         missed_statuses = ["Kaçan/Cevapsız", "Ulaşılamadı", "Bağlanamadı", "Missed", "Unreachable"]
+                         # Filter logic
+                         if "ConnectionStatus" in df.columns and "Direction" in df.columns:
+                             # Use isin for stricter matching if possible, or string contains for flexibility
+                             # And Filter for Inbound
+                             df_missed = df[
+                                 (df["ConnectionStatus"].isin(missed_statuses)) & 
+                                 (df["Direction"].astype(str).str.lower() == "inbound")
+                             ]
+                         else:
+                             df_missed = pd.DataFrame() # Should not happen
+
+                         if not df_missed.empty:
+                             # Rename columns
+                             col_map_internal = {
+                                 "Direction": "col_direction",
+                                 "Ani": "col_ani",
+                                 "Dnis": "col_dnis",
+                                 "Wrapup": "col_wrapup",
+                                 "MediaType": "col_media",
+                                 "Duration": "col_duration",
+                                 "DisconnectType": "col_disconnect",
+                                 "Alert": "col_alert",
+                                 "HoldCount": "col_hold_count",
+                                 "ConnectionStatus": "col_connection",
+                                 "Start": "start_time",
+                                 "End": "end_time",
+                                 "Agent": "col_agent",
+                                 "Username": "col_username",
+                                 "Queue": "col_workgroup"
+                             }
+                             
+                             final_cols = [k for k, v in col_map_internal.items() if v in selected_cols_keys]
+                             df_filtered = df_missed[final_cols]
+                             rename_final = {k: get_text(lang, col_map_internal[k]) for k in final_cols}
+                             
+                             final_df = df_filtered.rename(columns=rename_final)
+                             
+                             st.success(f"{len(final_df)} adet kaçan etkileşim bulundu.")
+                             st.dataframe(final_df, use_container_width=True)
+                             st.download_button(get_text(lang, "download_excel"), data=to_excel(final_df), file_name=f"missed_interactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+                         else:
+                             st.warning("Seçilen kriterlere uygun kaçan çağrı/etkileşim bulunamadı.")
+                     else:
+                         st.warning(get_text(lang, "no_data"))
+
+        # --- INTERACTION SEARCH ---
+        if r_type == "interaction_search":
+            st.info("Bu rapor, seçilen tarih aralığındaki çağrı, chat ve diğer etkileşimleri listeler. Çok uzun aralıklar seçmeyiniz.")
+            
+            # Dynamic Column Selection
+            from src.lang import INTERACTION_COLUMNS
+            default_cols = [c for c in INTERACTION_COLUMNS if c not in ["col_media", "col_wrapup"]] # Default subset
+            
+            # Allow user to customize columns if needed
+            selected_cols_keys = st.multiselect("Sütunları Seçin / Select Columns", INTERACTION_COLUMNS, default=INTERACTION_COLUMNS, format_func=lambda x: get_text(lang, x))
+            
+            if st.button("Etkileşimleri Getir / Fetch Interactions", type="primary", use_container_width=True):
+                 with st.spinner(get_text(lang, "fetching_data")):
+                     start_date = datetime.combine(sd, st_) - timedelta(hours=3)
+                     end_date = datetime.combine(ed, et) - timedelta(hours=3)
+                     # Fetch data
+                     api = GenesysAPI(st.session_state.api_client)
+                     raw_convs = api.get_conversation_details(start_date, end_date)
+                     
+                     # Process with Wrapup Map
+                     df = process_conversation_details(raw_convs, st.session_state.users_info, st.session_state.queues_map, st.session_state.wrapup_map)
+                     
+                     if not df.empty:
+                         # Rename columns first to internal keys then to display names
+                         col_map_internal = {
+                             "Direction": "col_direction",
+                             "Ani": "col_ani",
+                             "Dnis": "col_dnis",
+                             "Wrapup": "col_wrapup",
+                             "MediaType": "col_media",
+                             "Duration": "col_duration",
+                             "DisconnectType": "col_disconnect",
+                             "Alert": "col_alert",
+                             "HoldCount": "col_hold_count",
+                             "ConnectionStatus": "col_connection",
+                             "Start": "start_time",
+                             "End": "end_time",
+                             "Agent": "col_agent",
+                             "Username": "col_username",
+                             "Queue": "col_workgroup"
+                         }
+                         
+                         # Filter columns based on selection
+                         final_cols = [k for k, v in col_map_internal.items() if v in selected_cols_keys]
+                         df_filtered = df[final_cols]
+                         
+                         # Rename to Display Names
+                         rename_final = {k: get_text(lang, col_map_internal[k]) for k in final_cols}
+                         
+                         df_filtered = apply_duration_formatting(df_filtered.copy())
+                         final_df = df_filtered.rename(columns=rename_final)
+                         st.dataframe(final_df, use_container_width=True)
+                         st.download_button(get_text(lang, "download_excel"), data=to_excel(final_df), file_name=f"interactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+                     else:
+                         st.warning(get_text(lang, "no_data"))
+
+        # --- STANDARD REPORTS ---
+        elif r_type not in ["chat_detail", "missed_interactions"] and st.button(get_text(lang, "fetch_report"), type="primary", use_container_width=True):
+            if not sel_mets: st.warning("Lütfen metrik seçiniz.")
+            else:
+                # Auto-save last used metrics
+                st.session_state.last_metrics = sel_mets
                 with st.spinner(get_text(lang, "fetching_data")):
-                    gen_api = GenesysAPI(st.session_state.api_client)
-                    start_dt_local = datetime.combine(start_date, start_time)
-                    end_dt_local = datetime.combine(end_date, end_time)
-                    start_dt_utc = start_dt_local - timedelta(hours=3)
-                    end_dt_utc = end_dt_local - timedelta(hours=3)
+                    api = GenesysAPI(st.session_state.api_client)
+                    s_dt, e_dt = datetime.combine(sd, st_) - timedelta(hours=3), datetime.combine(ed, et) - timedelta(hours=3)
+                    r_kind = "Agent" if r_type == "report_agent" else ("Workgroup" if r_type == "report_queue" else "Detailed")
+                    g_by = ['userId'] if r_kind == "Agent" else (['queueId'] if r_kind == "Workgroup" else ['userId', 'queueId'])
+                    f_type = 'user' if r_kind in ["Agent", "Detailed"] else 'queue'
                     
-                    group_by = ['userId'] if report_type == "Agent" else (['queueId'] if report_type == "Workgroup" else ['userId', 'queueId'])
-                    filter_type = 'user' if report_type in ["Agent", "Detailed"] else 'queue'
+                    resp = api.get_analytics_conversations_aggregate(s_dt, e_dt, granularity=gran_opt[sel_gran], group_by=g_by, filter_type=f_type, filter_ids=sel_ids or None, metrics=sel_mets)
+                    q_lookup = {v: k for k, v in st.session_state.queues_map.items()}
+                    df = process_analytics_response(resp, st.session_state.users_info if is_agent else q_lookup, r_kind.lower(), queue_map=q_lookup)
                     
-                    # Check if we have call metrics selected
-                    call_metrics_selected = [m for m in selected_metrics if not m.startswith("t") or m in ["tTalk", "tAcw", "tHandle", "tHeld", "tWait", "tAcd", "tAlert", "tAnswered", "tAbandon", "tOutbound"]]
-                    
-                    api_response = None
-                    if call_metrics_selected:
-                        api_response = gen_api.get_analytics_conversations_aggregate(
-                            start_dt_utc, end_dt_utc, granularity=granularity,
-                            group_by=group_by, filter_type=filter_type, 
-                            filter_ids=selected_ids if selected_ids else None, metrics=selected_metrics
-                        )
-
-                    if api_response and "error" in api_response:
-                        st.error(f"API Error: {api_response['error']}")
-                    else:
-                        # Create queue lookup map (ID -> Name)
-                        queue_lookup = {v: k for k, v in st.session_state.queues_map.items()}
-
-                        if report_type in ["Agent", "Detailed"]:
-                            lookup_map = st.session_state.users_info
-                        else:
-                            lookup_map = queue_lookup
-                            
-                        df = process_analytics_response(api_response, lookup_map, report_type.lower(), queue_map=queue_lookup)
-                    
-                    # If df is empty but it's an agent-based report, we should still create a base df for users
-                    # If df is empty but it's an agent-based report, we should still create a base df for users
-                    if df.empty and report_type in ["Agent", "Detailed"]:
+                    if df.empty and is_agent:
                         agent_data = []
-                        target_uids = selected_ids if selected_ids else list(st.session_state.users_info.keys())
-                        for uid in target_uids:
-                            uinfo = st.session_state.users_info.get(uid, {})
-                            raw_user = uinfo.get('username', "")
-                            row = {
-                                "Name": uinfo.get('name', uid),
-                                "Username": raw_user.split('@')[0] if raw_user else "",
-                                "Id": uid
-                            }
-                            if report_type == "Detailed":
-                                row["WorkgroupName"] = "-"
-                                row["AgentName"] = row["Name"]
-                                row["Id"] = f"{uid}|-"
+                        for uid in (sel_ids or st.session_state.users_info.keys()):
+                            u = st.session_state.users_info.get(uid, {})
+                            row = {"Name": u.get('name', uid), "Username": u.get('username', "").split('@')[0], "Id": uid}
+                            if r_kind == "Detailed": row.update({"WorkgroupName": "-", "AgentName": row["Name"], "Id": f"{uid}|-"})
                             agent_data.append(row)
                         df = pd.DataFrame(agent_data)
                     
-                    # --- FETCH PRESENCE DATA IF REQUESTED ---
-                    presence_keys = ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "col_staffed_time"]
-                    detail_keys = ["col_login", "col_logout"]
-                    
-                    user_ids_to_query = selected_ids if selected_ids else list(st.session_state.users_info.keys())
-                    
-                    # Merge status durations
-                    if any(m in selected_metrics for m in presence_keys) and report_type in ["Agent", "Detailed"]:
-                        presence_resp = gen_api.get_user_aggregates(start_dt_utc, end_dt_utc, user_ids_to_query)
-                        from src.processor import process_user_aggregates
-                        presence_map = process_user_aggregates(presence_resp, st.session_state.get('presence_map'))
-                        
-                        if presence_map:
-                            for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime"]:
-                                col_name = pk if pk != "StaffedTime" else "col_staffed_time"
-                                if not df.empty:
-                                    uid_col = "Id"
-                                    df[col_name] = df[uid_col].apply(lambda x: presence_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0))
-
-                    # Merge Login/Logout details
-                    if any(m in selected_metrics for m in detail_keys) and report_type in ["Agent", "Detailed"]:
-                        details_resp = gen_api.get_user_status_details(start_dt_utc, end_dt_utc, user_ids_to_query)
-                        from src.processor import process_user_details
-                        details_map = process_user_details(details_resp)
-                        
-                        if details_map:
-                            if not df.empty:
-                                if "col_login" in selected_metrics:
-                                    df["col_login"] = df["Id"].apply(lambda x: details_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
-                                if "col_logout" in selected_metrics:
-                                    df["col_logout"] = df["Id"].apply(lambda x: details_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
-
                     if not df.empty:
-                        if do_fill_gaps and granularity != "P1D":
-                            df = fill_interval_gaps(df, start_dt_local, end_dt_local, granularity)
-                            
-                        # Final column filtering and renaming
-                        if report_type == "Detailed":
-                            base_cols = ["AgentName", "Username", "WorkgroupName"]
-                        elif report_type in ["Agent", "Productivity"]:
-                            base_cols = ["Name", "Username"]
-                        else:
-                            base_cols = ["Name"]
+                        p_keys = ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "col_staffed_time", "nNotResponding"]
+                        if any(m in sel_mets for m in p_keys) and is_agent:
+                            p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
+                            for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime", "nNotResponding"]:
+                                df[pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")] = df["Id"].apply(lambda x: p_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0))
+                        
+                        if any(m in sel_mets for m in ["col_login", "col_logout"]) and is_agent:
+                            d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())))
+                            if "col_login" in sel_mets: df["col_login"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
+                            if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
 
-                        if "Interval" in df.columns: base_cols = ["Interval"] + base_cols
+                        if do_fill and gran_opt[sel_gran] != "P1D": df = fill_interval_gaps(df, datetime.combine(sd, st_), datetime.combine(ed, et), gran_opt[sel_gran])
                         
-                        # Prepare list of metrics to include (both from call and presence)
-                        all_disp_metrics = selected_metrics + (["AvgHandle"] if "AvgHandle" in df.columns else [])
-                        cols_to_keep = [c for c in base_cols if c in df.columns] + [m for m in all_disp_metrics if m in df.columns]
+                        base = (["AgentName", "Username", "WorkgroupName"] if r_kind == "Detailed" else (["Name", "Username"] if is_agent else ["Name"]))
+                        if "Interval" in df.columns: base = ["Interval"] + base
+                        for sm in sel_mets:
+                            if sm not in df.columns: df[sm] = 0
+                        # Avoid duplicates if AvgHandle is already in sel_mets
+                        mets_to_show = [m for m in sel_mets if m in df.columns]
+                        if "AvgHandle" in df.columns and "AvgHandle" not in mets_to_show:
+                            mets_to_show.append("AvgHandle")
+                        final_df = df[[c for c in base if c in df.columns] + mets_to_show]
                         
-                        df_final = df[cols_to_keep].copy()
-                        
-                        # Fix: Ensure ALL selected metrics exist in df_final even if they were missing from API
-                        for sm in selected_metrics:
-                            if sm not in df_final.columns:
-                                df_final[sm] = 0
-                                
-                        # Re-calculate cols_to_keep to include newly added zeros
-                        cols_to_keep = [c for c in base_cols if c in df_final.columns] + [m for m in all_disp_metrics if m in df_final.columns]
-                        df_final = df_final[cols_to_keep]
-                        
-                        # Filter out rows with no data if requested (implicitly yes based on user feedback)
-                        # We check if all selected metrics are 0 or Null
-                        # metric_cols_in_df = [m for m in selected_metrics if m in df_final.columns]
-                        # if metric_cols_in_df:
-                        #     # Replace NaN with 0 for checking
-                        #     df_check = df_final[metric_cols_in_df].fillna(0)
-                        #     # Keep row if ANY metric is non-zero (or non-empty for strings like Login/Logout if we considered them, but usually they come with numeric presence)
-                        #     # Actually, Login/Logout are strings. presence columns are numbers.
-                        #     # If report is Productivity, we surely want to hide if everything is 0/NA.
-                        #      
-                        #     # Simple logic: fail if all numerics are 0 AND all strings are N/A or empty
-                        #     def has_data(row):
-                        #         for col in metric_cols_in_df:
-                        #             val = row[col]
-                        #             if isinstance(val, (int, float)) and val != 0: return True
-                        #             if isinstance(val, str) and val not in ["", "N/A", "0"]: return True
-                        #         return False
-                        #         
-                        #     # df_final = df_final[df_final.apply(has_data, axis=1)]
-                        #     pass
-                        
-                        rename_map = {
-                            "Interval": get_text(lang, "col_interval"),
-                            "AgentName": get_text(lang, "col_agent"),
-                            "Username": get_text(lang, "col_username"),
-                            "WorkgroupName": get_text(lang, "col_workgroup"),
-                            "Name": get_text(lang, "col_agent") if report_type == 'Agent' else get_text(lang, "col_workgroup"),
-                            "AvgHandle": get_text(lang, "col_avg_handle"),
-                            "col_staffed_time": get_text(lang, "col_staffed_time"),
-                            "col_login": get_text(lang, "col_login"),
-                            "col_logout": get_text(lang, "col_logout")
-                        }
-                        for m in selected_metrics: 
-                            if m not in rename_map:
-                                rename_map[m] = get_text(lang, m)
-                                
-                        st.dataframe(df_final.rename(columns=rename_map), width='stretch')
-                        st.download_button(get_text(lang, "download_excel"), data=to_excel(df_final.rename(columns=rename_map)), 
-                                           file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-                    else:
-                        st.warning(get_text(lang, "no_data"))
+                        # Apply duration formatting
+                        final_df = apply_duration_formatting(final_df)
 
-    # --- PAGE: DASHBOARD (LIVE) ---
-    else:
-        # Load Config Once
+                        rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout")}
+                        rename.update({m: get_text(lang, m) for m in sel_mets if m not in rename})
+                        st.dataframe(final_df.rename(columns=rename), use_container_width=True)
+                        st.download_button(get_text(lang, "download_excel"), data=to_excel(final_df.rename(columns=rename)), file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+                    else: st.warning(get_text(lang, "no_data"))
+
+    elif st.session_state.page == "Kullanıcı Yönetimi" and role == "Admin":
+        st.title("👤 Kullanıcı Yönetimi")
+        
+        with st.expander("➕ Yeni Kullanıcı Ekle", expanded=True):
+            # Auto password generator
+            col_gen1, col_gen2 = st.columns([3, 1])
+            with col_gen2:
+                if st.button("🔐 Şifre Oluştur", key="gen_pw_btn"):
+                    st.session_state.generated_password = generate_password(12)
+            
+            generated_pw = st.session_state.get("generated_password", "")
+            if generated_pw:
+                col_gen1.success(f"Oluşturulan Şifre: **{generated_pw}**")
+            
+            with st.form("add_user_form"):
+                new_un = st.text_input("Kullanıcı Adı")
+                new_pw = st.text_input("Şifre", type="password", value=generated_pw, help="Otomatik şifre oluşturmak için yukarıdaki butonu kullanın")
+                new_role = st.selectbox("Rol", ["Admin", "Manager", "Reports User", "Dashboard User"])
+                
+                from src.lang import ALL_METRICS
+                new_mets = st.multiselect("İzinli Metrikler (Boş bırakılırsa hepsi seçilir)", ALL_METRICS, format_func=lambda x: get_text(lang, x))
+                
+                if st.form_submit_button("Ekle", use_container_width=True):
+                    if new_un and new_pw:
+                        success, msg = auth_manager.add_user(new_un, new_pw, new_role, new_mets)
+                        if success: 
+                            st.session_state.generated_password = ""  # Clear after use
+                            st.success(msg)
+                            st.rerun()
+                        else: st.error(msg)
+                    else: st.warning("Ad ve şifre gereklidir.")
+        
+        st.write("---")
+        st.subheader("Mevcut Kullanıcılar")
+        all_users = auth_manager.get_all_users()
+        for uname, udata in all_users.items():
+            col1, col2, col3, col4 = st.columns([2, 2, 4, 1])
+            col1.write(f"**{uname}**")
+            col2.write(f"Rol: {udata['role']}")
+            col3.write(f"Metrikler: {', '.join(udata['metrics']) if udata['metrics'] else 'Hepsi'}")
+            if uname != "admin": # Don't delete self
+                if col4.button("Sil", key=f"del_user_{uname}"):
+                    auth_manager.delete_user(uname)
+                    st.rerun()
+            st.write("---")
+
+    else: # --- DASHBOARD ---
         if 'dashboard_config_loaded' not in st.session_state:
             config = load_dashboard_config()
-            st.session_state.dashboard_layout = config.get("layout", 1)
-            loaded_cards = config.get("cards", [])
-            if not loaded_cards:
-                 loaded_cards = [{"id": 0, "title": "", "queues": [], "size": "medium"}]
-            st.session_state.dashboard_cards = loaded_cards
+            st.session_state.dashboard_layout, st.session_state.dashboard_cards = config.get("layout", 1), config.get("cards", [{"id": 0, "title": "", "queues": [], "size": "medium"}])
             st.session_state.dashboard_config_loaded = True
-
+        
         st.title(get_text(lang, "menu_dashboard"))
-
-        # Top Control Bar
-        c_ctrl1, c_ctrl2, c_ctrl3 = st.columns([1, 2, 1])
+        c_c1, c_c2, c_c3 = st.columns([1, 2, 1])
+        if c_c1.button(get_text(lang, "add_group"), use_container_width=True):
+            st.session_state.dashboard_cards.append({"id": max([c['id'] for c in st.session_state.dashboard_cards], default=-1)+1, "title": "", "queues": [], "size": "medium", "live_metrics": ["Waiting", "Interacting", "On Queue"], "daily_metrics": ["Offered", "Answered", "Abandoned", "Answer Rate"]})
+            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards); st.rerun()
         
-        with c_ctrl1:
-             if st.button(get_text(lang, "add_group"), width='stretch'):
-                new_id = max([c['id'] for c in st.session_state.dashboard_cards], default=-1) + 1
-                st.session_state.dashboard_cards.append({"id": new_id, "title": "", "queues": [], "size": "medium"})
-                save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-        
-        with c_ctrl2:
-            sub_c1, sub_c2 = st.columns([2, 3])
-            with sub_c1:
-                selected_layout = st.radio("Layout", [1, 2, 3], 
-                                           format_func=lambda x: f"Grid: {x}", 
-                                           index=[1, 2, 3].index(st.session_state.dashboard_layout),
-                                           horizontal=True, label_visibility="collapsed")
-                
-                if selected_layout != st.session_state.dashboard_layout:
-                    st.session_state.dashboard_layout = selected_layout
-                    save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-                    st.rerun()
+        with c_c2:
+            sc1, sc2 = st.columns([2, 3])
+            lo = sc1.radio("Layout", [1, 2, 3], format_func=lambda x: f"Grid: {x}", index=st.session_state.dashboard_layout-1, horizontal=True, label_visibility="collapsed")
+            if lo != st.session_state.dashboard_layout:
+                st.session_state.dashboard_layout = lo; save_dashboard_config(lo, st.session_state.dashboard_cards); st.rerun()
+            m_opts = ["Live", "Yesterday", "Date"]
+            if 'dashboard_mode' not in st.session_state: st.session_state.dashboard_mode = "Live"
+            st.session_state.dashboard_mode = sc2.radio("Mode", m_opts, format_func=lambda x: get_text(lang, f"mode_{x.lower()}"), index=m_opts.index(st.session_state.dashboard_mode), horizontal=True, label_visibility="collapsed")
 
-            with sub_c2:
-                mode_opts = ["Live", "Yesterday", "Date"]
-                mode_labels = {
-                    "Live": get_text(lang, "mode_live"),
-                    "Yesterday": get_text(lang, "mode_yesterday"),
-                    "Date": get_text(lang, "mode_date")
-                }
-                
-                if 'dashboard_mode' not in st.session_state:
-                    st.session_state.dashboard_mode = "Live"
-                    
-                selected_mode = st.radio("Mode", mode_opts, 
-                                         format_func=lambda x: mode_labels[x],
-                                         index=mode_opts.index(st.session_state.dashboard_mode),
-                                         horizontal=True, label_visibility="collapsed", key="mode_selector")
-                
-                st.session_state.dashboard_mode = selected_mode
+        if c_c3:
+            if st.session_state.dashboard_mode == "Date": st.session_state.dashboard_date = st.date_input("Date", datetime.today(), label_visibility="collapsed")
+            elif st.session_state.dashboard_mode == "Live": auto_ref = st.toggle(get_text(lang, "auto_refresh"), value=True)
+            if st.session_state.dashboard_mode == "Live" and auto_ref: st_autorefresh(interval=10000, key="data_refresh")
 
-        with c_ctrl3:
-             if st.session_state.dashboard_mode == "Date":
-                 sel_date = st.date_input("Date", datetime.today(), label_visibility="collapsed")
-                 st.session_state.dashboard_date = sel_date
-             elif st.session_state.dashboard_mode == "Live":
-                 auto_refresh = st.toggle(get_text(lang, "auto_refresh"), value=True)
-             else:
-                 st.write("")
+        # Available metric options
+        LIVE_METRIC_OPTIONS = ["Waiting", "Interacting", "On Queue", "Available", "Busy", "Away", "Break", "Meal", "Meeting", "Training"]
+        DAILY_METRIC_OPTIONS = ["Offered", "Answered", "Abandoned", "Answer Rate", "Service Level", "Avg Handle Time", "Avg Wait Time"]
 
-        st.write("---")
-
-        # 1. PRE-FETCH DATA
-        all_selected_queues = set()
-        for card in st.session_state.dashboard_cards:
-            for q_name in card.get('queues', []):
-                if q_name in st.session_state.queues_map:
-                    all_selected_queues.add(st.session_state.queues_map[q_name])
-
-        # Auto Refresh Trigger (Moved up)
-        is_live = (st.session_state.dashboard_mode == "Live")
-        if is_live and auto_refresh:
-            st_autorefresh(interval=10000, key="data_refresh")
-
-        obs_data_map = {}
-        daily_data_map = {}
-        gen_api = GenesysAPI(st.session_state.api_client)
-        
-        if all_selected_queues:
-            q_ids = list(all_selected_queues)
-            id_map = {v: k for k, v in st.session_state.queues_map.items() if v in q_ids}
-            
-            try:
-                # Determine Interval
-                query_interval = None
-                if is_live:
-                     now_local = datetime.now()
-                     start_local = datetime.combine(now_local.date(), time(0, 0))
-                     start_utc = start_local - timedelta(hours=3)
-                     end_utc = datetime.now(timezone.utc)
-                     query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                
-                elif st.session_state.dashboard_mode == "Yesterday":
-                    now_local = datetime.now()
-                    yest_local = now_local - timedelta(days=1)
-                    start_local = datetime.combine(yest_local.date(), time(0, 0))
-                    end_local = datetime.combine(yest_local.date(), time(23, 59, 59))
-                    start_utc = start_local - timedelta(hours=3)
-                    end_utc = end_local - timedelta(hours=3)
-                    query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                    
-                elif st.session_state.dashboard_mode == "Date":
-                    sel_date = st.session_state.get('dashboard_date', datetime.today())
-                    start_local = datetime.combine(sel_date, time(0,0))
-                    end_local = datetime.combine(sel_date, time(23,59,59))
-                    start_utc = start_local - timedelta(hours=3)
-                    end_utc = end_local - timedelta(hours=3)
-                    query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-
-                if is_live:
-                    obs_response = gen_api.get_queue_observations(list(id_map.keys()))
-                    # Pass the presence map to resolve UUIDs to status names
-                    p_map = st.session_state.get('presence_map', {})
-                    obs_data_list = process_observations(obs_response, id_map, presence_map=p_map)
-                    obs_data_map = {item['Queue']: item for item in obs_data_list}
-                
-                # Cache daily stats for 60 seconds to reduce API calls
-                cache_key = f"daily_cache_{st.session_state.dashboard_mode}_{query_interval}"
-                cache_time_key = f"{cache_key}_time"
-                
-                current_time = pytime.time()
-                if cache_key not in st.session_state or (current_time - st.session_state.get(cache_time_key, 0)) > 60:
-                    daily_response = gen_api.get_queue_daily_stats(list(id_map.keys()), interval=query_interval)
-                    daily_data_map = process_daily_stats(daily_response, id_map)
-                    st.session_state[cache_key] = daily_data_map
-                    st.session_state[cache_time_key] = current_time
-                else:
-                    daily_data_map = st.session_state[cache_key]
-                
-            except Exception as e:
-                pass
-
-        # 2. RENDER LAYOUT & CARDS
-        grid_cols = st.columns(st.session_state.dashboard_layout)
-        cards_to_remove = []
-
+        grid = st.columns(st.session_state.dashboard_layout)
+        to_del = []
         for idx, card in enumerate(st.session_state.dashboard_cards):
-            col_index = idx % st.session_state.dashboard_layout
-            with grid_cols[col_index]:
+            with grid[idx % st.session_state.dashboard_layout]:
                 with st.container(border=True):
-                    # --- Header Bar ---
-                    disp_title = card['title'] if card['title'] else f"Grup #{card['id']+1}"
-                    st.markdown(f"### {disp_title}")
-                    
-                    # --- Settings Expander ---
-                    with st.expander(f"⚙️ {get_text(lang, 'add_group').replace('➕ ', '')} / Ayarlar", expanded=False):
-                        new_title = st.text_input(get_text(lang, "group_title_placeholder"), value=card['title'], key=f"title_{card['id']}")
-                        if new_title != card.get('title'):
-                            card['title'] = new_title
-                            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-                            st.rerun()
+                    st.markdown(f"### {card['title'] or f'Grup #{card['id']+1}'}")
+                    with st.expander(f"⚙️ Settings", expanded=False):
+                        card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
+                        card['queues'] = st.multiselect("Queues", list(st.session_state.queues_map.keys()), default=card.get('queues', []), key=f"q_{card['id']}")
+                        card['size'] = st.selectbox("Size", ["small", "medium", "large"], index=["small", "medium", "large"].index(card.get('size', 'medium')), key=f"s_{card['id']}")
                         
-                        new_queues = st.multiselect(get_text(lang, "select_queues_for_group"), 
-                                                    list(st.session_state.queues_map.keys()), 
-                                                    default=card.get('queues', []),
-                                                    key=f"q_{card['id']}")
-                        if new_queues != card.get('queues'):
-                            card['queues'] = new_queues
-                            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-                            st.rerun()
+                        st.write("---")
+                        st.caption("📡 Canlı Metrikler")
+                        card['live_metrics'] = st.multiselect("Live Metrics", LIVE_METRIC_OPTIONS, default=card.get('live_metrics', ["Waiting", "Interacting", "On Queue"]), key=f"lm_{card['id']}")
                         
-                        size_opts = {get_text(lang, "size_small"): "small", 
-                                     get_text(lang, "size_medium"): "medium", 
-                                     get_text(lang, "size_large"): "large"}
-                        curr_size = card.get('size', 'medium')
-                        curr_label = list(size_opts.keys())[list(size_opts.values()).index(curr_size)] if curr_size in size_opts.values() else get_text(lang, "size_medium")
+                        st.caption("📊 Günlük Metrikler")
+                        card['daily_metrics'] = st.multiselect("Daily Metrics", DAILY_METRIC_OPTIONS, default=card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"]), key=f"dm_{card['id']}")
                         
-                        new_size_label = st.selectbox(get_text(lang, "card_size"), list(size_opts.keys()), 
-                                                      index=list(size_opts.keys()).index(curr_label),
-                                                      key=f"size_{card['id']}")
-                        new_size = size_opts[new_size_label]
-                        if new_size != card.get('size'):
-                            card['size'] = new_size
-                            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-                            st.rerun()
-                            
-                        st.write("")
-                        if st.button(get_text(lang, "delete_group"), key=f"del_{card['id']}"):
-                            cards_to_remove.append(idx)
+                        if st.button("Delete", key=f"d_{card['id']}"): to_del.append(idx)
+                        save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
                     
-                    # --- CONTENT RENDERING ---
-                    if not card.get('queues'):
-                        st.info("Kuyruk seçiniz / Select queues")
-                        continue
-
-                    card_items_live = [obs_data_map.get(q_name) for q_name in card['queues'] if obs_data_map.get(q_name)] if is_live else []
-                    card_items_daily = [daily_data_map.get(q_name) for q_name in card['queues'] if daily_data_map.get(q_name)]
+                    if not card.get('queues'): st.info("Select queues"); continue
                     
-                    total_waiting = sum(d['Waiting'] for d in card_items_live) if card_items_live else 0
-                    total_interacting = sum(d['Interacting'] for d in card_items_live) if card_items_live else 0
-                    num_queues = len(card_items_live) if card_items_live else 1
-                    
-                    # Kuyrukta Agent = OnQueueIdle + OnQueueInteracting (toplam kuyrukta olan)
-                    total_on_queue_idle = sum(d.get('OnQueueIdle', 0) for d in card_items_live) if card_items_live else 0
-                    total_on_queue_interacting = sum(d.get('OnQueueInteracting', 0) for d in card_items_live) if card_items_live else 0
-                    total_on_queue_raw = total_on_queue_idle + total_on_queue_interacting
-                    on_queue_agents = round(total_on_queue_raw / num_queues) if num_queues > 0 else 0
-                    
-                    # Agent = OnQueueIdle (kuyrukta ve çağrıda olmayan - hazır agentlar)
-                    available_agents = round(total_on_queue_idle / num_queues) if num_queues > 0 else 0
-
-                    num_selected = len(card['queues']) if card['queues'] else 1
-                    
-                    # Görüşmede: Görüşmesi 0'dan fazla olan kuyrukları dikkate alarak ortalama al
-                    interacting_list = [d['Interacting'] for d in card_items_live if d['Interacting'] > 0]
-                    status_interacting_val = round(sum(interacting_list) / len(interacting_list)) if interacting_list else 0
-
-                    # Müsait olan agent sayısı (Presence based: Available) - Seçili kuyruk sayısına böl
-                    total_available_presence = sum(d['Presences'].get('Available', 0) for d in card_items_live) if card_items_live else 0
-                    available_presence_val = round(total_available_presence / num_selected) if num_selected > 0 else 0
-                    
-                    # On Queue (Kuyruktaki Agent) - Seçili kuyruk sayısına böl
-                    total_on_queue_presence = sum(d['Presences'].get('On Queue', 0) for d in card_items_live) if card_items_live else 0
-                    on_queue_presence_val = round(total_on_queue_presence / num_selected) if num_selected > 0 else 0
-                    
-                    avg_sl_live = sum(d['ServiceLevel'] for d in card_items_live) / len(card_items_live) if card_items_live else 0
-                    
-                    total_offered = sum(d['Offered'] for d in card_items_daily) if card_items_daily else 0
-                    total_answered = sum(d['Answered'] for d in card_items_daily) if card_items_daily else 0
-                    total_abandoned = sum(d['Abandoned'] for d in card_items_daily) if card_items_daily else 0
-                    total_sl_num = sum(d.get('SL_Numerator', 0) for d in card_items_daily) if card_items_daily else 0
-                    total_sl_den = sum(d.get('SL_Denominator', 0) for d in card_items_daily) if card_items_daily else 0
-                    
-                    answer_rate = (total_answered / total_offered * 100) if total_offered > 0 else 0
-                    daily_sl = (total_sl_num / total_sl_den * 100) if total_sl_den > 0 else 0
-                    
-                    c_size = card.get('size', 'medium')
-                    h_gauge = 180 if c_size == 'small' else (250 if c_size == 'medium' else 300)
-                    gauge_value = daily_sl if daily_sl > 0 or total_offered > 0 else (avg_sl_live if is_live else 0)
-                    gauge_key = f"g_gage_{card['id']}_{idx}"
-
-                    if is_live:
-                        st.caption(f"🔵 {get_text(lang, 'live_stat')}")
-                        m_cols = st.columns(5) 
-                        m_cols[0].metric(get_text(lang, "waiting"), total_waiting)
-                        m_cols[1].metric(get_text(lang, "interacting"), status_interacting_val)
-                        m_cols[2].metric(get_text(lang, "agent"), on_queue_presence_val)
-                        m_cols[3].metric(get_text(lang, "on_queue_agents"), on_queue_presence_val)
-                        m_cols[4].metric(get_text(lang, "available_agents"), available_presence_val)
-                        st.write("")
+                    # Determine date range based on mode
+                    if st.session_state.dashboard_mode == "Live":
+                        # Use cached live data
+                        obs_map, daily_map, _ = data_manager.get_data(card['queues'])
+                        items_live = [obs_map.get(q) for q in card['queues'] if obs_map.get(q)]
+                        items_daily = [daily_map.get(q) for q in card['queues'] if daily_map.get(q)]
                     else:
-                        st.info(get_text(lang, "no_live_data"))
-
-                    st.divider()
-
-                    if c_size == 'small':
+                        # Fetch historical data via API
+                        items_live = []  # No live data for historical
+                        
+                        if st.session_state.dashboard_mode == "Yesterday":
+                            target_date = datetime.today() - timedelta(days=1)
+                        else:  # Date mode
+                            target_date = datetime.combine(st.session_state.get('dashboard_date', datetime.today()), time(0, 0))
+                        
+                        # Calculate date range (full day in UTC)
+                        start_dt = datetime.combine(target_date, time(0, 0)) - timedelta(hours=3)
+                        end_dt = datetime.combine(target_date, time(23, 59, 59)) - timedelta(hours=3)
+                        
+                        # Fetch aggregate data for selected queues
+                        queue_ids = [st.session_state.queues_map.get(q) for q in card['queues'] if st.session_state.queues_map.get(q)]
+                        
+                        items_daily = []
+                        if queue_ids:
+                            try:
+                                api = GenesysAPI(st.session_state.api_client)
+                                # Use Genesys standard aggregate query
+                                interval = f"{start_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                                resp = api.get_queue_daily_stats(queue_ids, interval=interval)
+                                
+                                if resp and resp.get('results'):
+                                    id_map = {v: k for k, v in st.session_state.queues_map.items()}
+                                    from src.processor import process_daily_stats
+                                    daily_data = process_daily_stats(resp, id_map)
+                                    items_daily = [daily_data.get(q) for q in card['queues'] if daily_data.get(q)]
+                            except Exception as e:
+                                st.warning(f"Veri çekilemedi: {e}")
+                    
+                    # Calculate aggregates
+                    n_q = len(items_live) or 1
+                    n_s = len(card['queues']) or 1
+                    off = sum(d['Offered'] for d in items_daily)
+                    ans = sum(d['Answered'] for d in items_daily)
+                    abn = sum(d['Abandoned'] for d in items_daily)
+                    s_n = sum(d.get('SL_Numerator', 0) for d in items_daily)
+                    s_d = sum(d.get('SL_Denominator', 0) for d in items_daily)
+                    sl = (s_n / s_d * 100) if s_d > 0 else 0
+                    avg_handle = sum(d.get('AvgHandle', 0) for d in items_daily) / len(items_daily) if items_daily else 0
+                    avg_wait = sum(d.get('AvgWait', 0) for d in items_daily) / len(items_daily) if items_daily else 0
+                    
+                    # Live metrics mapping
+                    live_values = {
+                        "Waiting": sum(d['Waiting'] for d in items_live) if items_live else 0,
+                        "Interacting": round(sum(d['Interacting'] for d in items_live)/n_q) if items_live else 0,
+                        "On Queue": round(sum(d['Presences'].get('On Queue', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Available": round(sum(d['Presences'].get('Available', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Busy": round(sum(d['Presences'].get('Busy', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Away": round(sum(d['Presences'].get('Away', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Break": round(sum(d['Presences'].get('Break', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Meal": round(sum(d['Presences'].get('Meal', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Meeting": round(sum(d['Presences'].get('Meeting', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Training": round(sum(d['Presences'].get('Training', 0) for d in items_live)/n_s) if items_live else 0,
+                    }
+                    
+                    live_labels = {"Waiting": get_text(lang, "waiting"), "Interacting": get_text(lang, "interacting"), "On Queue": get_text(lang, "on_queue_agents"), "Available": get_text(lang, "available_agents"), "Busy": "Meşgul", "Away": "Uzakta", "Break": "Mola", "Meal": "Yemek", "Meeting": "Toplantı", "Training": "Eğitim"}
+                    
+                    # Daily metrics mapping
+                    daily_values = {
+                        "Offered": off,
+                        "Answered": ans,
+                        "Abandoned": abn,
+                        "Answer Rate": f"%{(ans/off*100) if off>0 else 0:.1f}",
+                        "Service Level": f"%{sl:.1f}",
+                        "Avg Handle Time": f"{avg_handle/60:.1f}m" if avg_handle else "0",
+                        "Avg Wait Time": f"{avg_wait:.0f}s" if avg_wait else "0",
+                    }
+                    
+                    daily_labels = {"Offered": get_text(lang, "offered"), "Answered": get_text(lang, "answered"), "Abandoned": get_text(lang, "abandoned"), "Answer Rate": get_text(lang, "answer_rate"), "Service Level": get_text(lang, "avg_service_level"), "Avg Handle Time": "Ort. İşlem", "Avg Wait Time": "Ort. Bekleme"}
+                    
+                    if st.session_state.dashboard_mode == "Live":
+                        # Show selected live metrics
+                        sel_live = card.get('live_metrics', ["Waiting", "Interacting", "On Queue"])
+                        if sel_live:
+                            m = st.columns(min(len(sel_live), 5))
+                            for i, metric in enumerate(sel_live[:5]):
+                                m[i].metric(live_labels.get(metric, metric), live_values.get(metric, 0))
+                        
+                        # Show daily summary below live (Today's stats)
+                        st.divider()
+                        st.caption(f"📅 Bugünün Özeti")
+                        sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
+                        if sel_daily:
+                            dm = st.columns(min(len(sel_daily), 4))
+                            for i, metric in enumerate(sel_daily[:4]):
+                                dm[i].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
+                        
+                        # Always show gauge for Service Level at the bottom
+                        gauge_size = 180 if card['size'] == 'small' else (200 if card['size'] == 'medium' else 250)
+                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), use_container_width=True, key=f"g_{card['id']}")
+                    
+                    else:
+                        # Historical mode (Yesterday/Date) - show daily stats with gauge
+                        sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
+                        
+                        # Show daily metrics first for ALL sizes
                         st.caption(f"📅 {get_text(lang, 'daily_stat')}")
-                        d_cols = st.columns(4)
-                        d_cols[0].metric(get_text(lang, "offered"), total_offered)
-                        d_cols[1].metric(get_text(lang, "answered"), total_answered)
-                        d_cols[2].metric(get_text(lang, "abandoned"), total_abandoned)
-                        d_cols[3].metric(get_text(lang, "answer_rate"), f"%{answer_rate:.1f}")
-                        st.plotly_chart(create_gauge_chart(gauge_value, get_text(lang, "avg_service_level"), height=h_gauge), width='stretch', key=gauge_key)
-                    else:
-                        k1, k2 = st.columns([1, 1])
-                        with k1:
-                            st.caption(f"📅 {get_text(lang, 'daily_stat')}")
-                            dm1, dm2 = st.columns(2)
-                            dm1.metric(get_text(lang, "offered"), total_offered)
-                            dm1.metric(get_text(lang, "answered"), total_answered)
-                            dm2.metric(get_text(lang, "abandoned"), total_abandoned)
-                            dm2.metric(get_text(lang, "answer_rate"), f"%{answer_rate:.1f}")
-                        with k2:
-                            st.plotly_chart(create_gauge_chart(gauge_value, get_text(lang, "avg_service_level"), height=h_gauge), width='stretch', key=gauge_key)
+                        dm = st.columns(min(len(sel_daily), 4))
+                        for i, metric in enumerate(sel_daily[:4]):
+                            dm[i].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
+                        
+                        # Then show gauge
+                        gauge_size = 180 if card['size'] == 'small' else (250 if card['size'] == 'medium' else 300)
+                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), use_container_width=True, key=f"g_{card['id']}")
 
-        # Handle Card Deletion after render
-        if cards_to_remove:
-            for index in sorted(cards_to_remove, reverse=True):
-                del st.session_state.dashboard_cards[index]
-            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-            st.rerun()
+        if to_del:
+            for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]
+            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards); st.rerun()
