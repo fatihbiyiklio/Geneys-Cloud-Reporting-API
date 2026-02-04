@@ -25,10 +25,16 @@ def process_daily_stats(response, lookup_map):
     for result in response['results']:
         group = result.get('group', {})
         queue_id = group.get('queueId')
+        media_type = group.get('mediaType', 'unknown').lower()
         q_name = lookup_map.get(queue_id, queue_id)
         
         if q_name not in stats:
-            stats[q_name] = {"Offered": 0, "Answered": 0, "Abandoned": 0, "SL_Numerator": 0, "SL_Denominator": 0}
+            stats[q_name] = {
+                "Offered": {"Total": 0}, 
+                "Answered": {"Total": 0}, 
+                "Abandoned": {"Total": 0}, 
+                "SL_Numerator": 0, "SL_Denominator": 0
+            }
             
         data_buckets = result.get('data', [])
         for d in data_buckets:
@@ -36,19 +42,40 @@ def process_daily_stats(response, lookup_map):
             for m_obj in metrics:
                 m = m_obj.get('metric')
                 s = m_obj.get('stats', {})
+                count = s.get('count', 0)
                 
                 # Use tAnswered count for answered calls
                 if m == "tAnswered":
-                    stats[q_name]["Answered"] += s.get('count', 0)
+                    stats[q_name]["Answered"][media_type] = stats[q_name]["Answered"].get(media_type, 0) + count
+                    stats[q_name]["Answered"]["Total"] += count
                 # Use tAbandon count for abandoned calls
                 elif m == "tAbandon":
-                    stats[q_name]["Abandoned"] += s.get('count', 0)
+                    stats[q_name]["Abandoned"][media_type] = stats[q_name]["Abandoned"].get(media_type, 0) + count
+                    stats[q_name]["Abandoned"]["Total"] += count
                 elif m == "oServiceLevel":
                     stats[q_name]["SL_Numerator"] += s.get('numerator', 0)
                     stats[q_name]["SL_Denominator"] += s.get('denominator', 0)
         
         # Calculate Offered as Answered + Abandoned (matches Genesys workgroup view)
-        stats[q_name]["Offered"] = stats[q_name]["Answered"] + stats[q_name]["Abandoned"]
+        # We need to sum up processed Answered/Abandoned for this specific media type iteration
+        # Note: Since we are iterating rows, we accumulate Total in real-time.
+        # But for 'Offered', we can compute it at the end or incrementally.
+        # Let's compute Offered incrementally for the media_type
+        
+        ans_m = stats[q_name]["Answered"].get(media_type, 0)
+        abn_m = stats[q_name]["Abandoned"].get(media_type, 0)
+        
+        # Re-calculating Offered for this media type based on what we just added? 
+        # Actually, since results are separate rows per media type, we can just add to offered here.
+        # Wait, the loop runs once per result row (one queue+media combo).
+        # So inside this loop, we processed ALL metrics for that combo.
+        
+        # Correct approach:
+        offered_val = stats[q_name]["Answered"].get(media_type, 0) + stats[q_name]["Abandoned"].get(media_type, 0)
+        stats[q_name]["Offered"][media_type] = offered_val
+        
+        # Re-sum Total Offered (easier than tracking increments)
+        stats[q_name]["Offered"]["Total"] = sum(v for k,v in stats[q_name]["Offered"].items() if k != "Total")
     
     return stats
 
@@ -208,9 +235,19 @@ def fill_interval_gaps(df, start_dt_local, end_dt_local, granularity):
     return df
 
 def process_observations(resp, id_map, presence_map=None):
-    data_map = {k: {"Queue": v, "Waiting": 0, "Interacting": 0, "ServiceLevel": 0, "Members": 0, "OnQueue": 0, 
-                    "OnQueueIdle": 0, "OnQueueInteracting": 0, "ActiveUsers": 0,
-                    "Presences": {"Available": 0, "Busy": 0, "Away": 0, "Offline": 0, "On Queue": 0}} 
+    # Initialize with dictionaries for breakdown, plus 'Total' for easy access
+    data_map = {k: {
+                    "Queue": v, 
+                    "Waiting": {"Total": 0}, 
+                    "Interacting": {"Total": 0}, 
+                    "ServiceLevel": 0, 
+                    "Members": 0, 
+                    "OnQueue": 0, 
+                    "OnQueueIdle": 0, 
+                    "OnQueueInteracting": 0, 
+                    "ActiveUsers": 0,
+                    "Presences": {"Available": 0, "Busy": 0, "Away": 0, "Offline": 0, "On Queue": 0}
+                } 
                 for k, v in id_map.items()}
 
     if not resp or 'results' not in resp:
@@ -218,6 +255,8 @@ def process_observations(resp, id_map, presence_map=None):
 
     for result in resp['results']:
         queue_id = result.get('group', {}).get("queueId")
+        media_type = result.get('group', {}).get("mediaType", "unknown").lower()
+        
         if queue_id in data_map:
             row = data_map[queue_id]
             data_points = result.get('data', [])
@@ -227,19 +266,25 @@ def process_observations(resp, id_map, presence_map=None):
                 val = dp.get('stats', {}).get('count', 0)
                 qualifier = dp.get('qualifier', "")
                 
-                if m == "oWaiting": row["Waiting"] += val
-                elif m == "oInteracting": row["Interacting"] += val
+                if m == "oWaiting": 
+                    row["Waiting"][media_type] = row["Waiting"].get(media_type, 0) + val
+                    row["Waiting"]["Total"] += val
+                elif m == "oInteracting": 
+                    row["Interacting"][media_type] = row["Interacting"].get(media_type, 0) + val
+                    row["Interacting"]["Total"] += val
                 elif m == "oServiceLevel": sl_values.append(val)
                 elif m == "oMemberUsers": row["Members"] = max(row["Members"], val)
                 elif m == "oActiveUsers": row["ActiveUsers"] = max(row["ActiveUsers"], val)
                 elif m == "oOnQueueUsers":
+                    # OnQueue metrics usually don't have mediaType in the same way, but let's check
                     if qualifier.upper() == "IDLE": row["OnQueueIdle"] += val
                     elif qualifier.upper() == "INTERACTING": row["OnQueueInteracting"] += val
                     else: row["OnQueue"] = max(row["OnQueue"], val)
                 elif m == "oUserPresences":
                     # Map UUID to System Presence if map provided
                     if presence_map and qualifier in presence_map:
-                        mapped_qualifier = presence_map[qualifier]
+                        p_info = presence_map[qualifier]
+                        mapped_qualifier = p_info['systemPresence'] if isinstance(p_info, dict) else p_info
                     else:
                         mapped_qualifier = qualifier
                         
@@ -251,6 +296,7 @@ def process_observations(resp, id_map, presence_map=None):
                     elif "on queue" in q_lower or "onqueue" in q_lower: row["Presences"]["On Queue"] += val
             
             if sl_values:
+                # Weighted average could be better but simple avg for now
                 row["ServiceLevel"] = round((sum(sl_values) / len(sl_values)) * 100, 1)
 
     return list(data_map.values())
@@ -281,7 +327,8 @@ def process_user_aggregates(resp, presence_map=None):
                 
                 # Map qualifier to standard name
                 if presence_map and qualifier in presence_map:
-                    mapped = presence_map[qualifier].lower()
+                    p_info = presence_map[qualifier]
+                    mapped = (p_info['label'] if isinstance(p_info, dict) else p_info).lower()
                 else:
                     mapped = qualifier.lower()
                 

@@ -1,14 +1,18 @@
 .venv/
 venv/
+# Python
 __pycache__/
-*.pyc
-.app.pid
-.secret.key
-credentials.enc
-credentials.json
-.DS_Store
+*.py[cod]
+*$py.class
+venv/
 .env
+
+# Secrets & Config
+credentials.enc
+.secret.key
 .session.enc
+.streamlit/secrets.toml
 users.json
+dashboard_config.json
 presets.json
 json

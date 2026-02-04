@@ -11,12 +11,12 @@ class GenesysAPI:
         }
 
     def _get(self, path, params=None):
-        response = requests.get(f"{self.api_host}{path}", headers=self.headers, params=params)
+        response = requests.get(f"{self.api_host}{path}", headers=self.headers, params=params, timeout=10)
         response.raise_for_status()
         return response.json()
 
     def _post(self, path, data):
-        response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data)
+        response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
         response.raise_for_status()
         return response.json()
     
@@ -261,7 +261,7 @@ class GenesysAPI:
             predicates = [{"type": "dimension", "dimension": "queueId", "value": qid} for qid in chunk]
             query = {
                 "interval": interval,
-                "groupBy": ["queueId"],
+                "groupBy": ["queueId", "mediaType"],
                 "metrics": ["nOffered", "tAnswered", "tAbandon", "oServiceLevel"],
                 "filter": {"type": "or", "predicates": predicates}
             }
@@ -378,7 +378,10 @@ class GenesysAPI:
                         if not label:
                             label = p.get('systemPresence', '')
                             
-                        definitions[p['id']] = label
+                        definitions[p['id']] = {
+                            'label': label,
+                            'systemPresence': p.get('systemPresence', 'OFFLINE')
+                        }
                     if not data.get('nextUri'):
                         break
                     page_number += 1
@@ -470,3 +473,63 @@ class GenesysAPI:
             curr = curr_end
             
         return {"userDetails": combined_details}
+
+    def get_queue_members(self, queue_id):
+        """Fetches members of a queue with their presence and routing status."""
+        members = []
+        try:
+            page_number = 1
+            while True:
+                # Expansion is not needed here as we use Bulk Analytics for status
+                params = {
+                    "pageNumber": page_number, 
+                    "pageSize": 100
+                }
+                data = self._get(f"/api/v2/routing/queues/{queue_id}/users", params=params)
+                
+                if 'entities' in data:
+                    members.extend(data['entities'])
+                    if not data.get('nextUri'):
+                        break
+                    page_number += 1
+                else:
+                    break
+        except Exception as e:
+            print(f"Error fetching queue members for {queue_id}: {e}")
+        return members
+    def get_users_status_scan(self, ignored_user_ids=None):
+        """
+        Scans for ALL users and their statuses using standard User List API.
+        Verified: GET /api/v2/users?expand=presence,routingStatus provides REAL-TIME data.
+        Analytics Details Query was found to be stale/latent.
+        """
+        presence_map = {}
+        routing_map = {}
+        
+        page_number = 1
+        while True:
+            try:
+                # Expand presence and routingStatus in the list request
+                data = self._get(f"/api/v2/users?pageSize=100&pageNumber={page_number}&expand=presence,routingStatus")
+                
+                if 'entities' in data:
+                    for user in data['entities']:
+                        uid = user.get('id')
+                        # Extract expanded data directly
+                        if 'presence' in user:
+                            presence_map[uid] = user['presence']
+                        if 'routingStatus' in user:
+                            routing_map[uid] = user['routingStatus']
+                            
+                    if not data['entities'] or not data.get('nextUri'):
+                        break
+                    page_number += 1
+                else:
+                    break
+                    
+                if page_number > 20: break # Safety break
+            except Exception as e:
+                print(f"API: Error in user scan: {e}")
+                break
+                
+        return {"presence": presence_map, "routing": routing_map}

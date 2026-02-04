@@ -87,7 +87,7 @@ STRINGS = {
         "login_agents": "Login Agent",
         "idle_agents": "Boşta Agent",
         "agent": "On Queue",
-        "on_queue_agents": "Agent Total",
+        "on_queue_agents": "Kuyrukta (On Queue)",
         "available": "Uygun (Available)",
         "busy": "Meşgul (Busy)",
         "away": "Uzakta/Mola (Away)",

@@ -39,8 +39,8 @@ def _monitor_sessions():
             pass
         pytime.sleep(5)
 
-if not any(t.name == "SessionMonitor" for t in threading.enumerate()):
-    threading.Thread(target=_monitor_sessions, name="SessionMonitor", daemon=True).start()
+# if not any(t.name == "SessionMonitor" for t in threading.enumerate()):
+#     threading.Thread(target=_monitor_sessions, name="SessionMonitor", daemon=True).start()
 
 # --- IMPORTS & PATHS ---
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -50,6 +50,25 @@ from src.api import GenesysAPI
 from src.processor import process_analytics_response, to_excel, fill_interval_gaps, process_observations, process_daily_stats, process_user_aggregates, process_user_details, process_conversation_details, apply_duration_formatting
 
 # --- CONFIGURATION ---
+
+def format_status_time(presence_ts, routing_ts):
+    """Calculates duration since the most recent status change in HH:MM:SS format."""
+    try:
+        times = []
+        if presence_ts: times.append(datetime.fromisoformat(presence_ts.replace('Z', '+00:00')))
+        if routing_ts: times.append(datetime.fromisoformat(routing_ts.replace('Z', '+00:00')))
+        if not times: return "00:00:00"
+        start_time = max(times)
+        diff = datetime.now(timezone.utc) - start_time
+        seconds = int(diff.total_seconds())
+        if seconds < 0: seconds = 0
+        
+        hrs = seconds // 3600
+        mins = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    except: return "00:00:00"
+
 st.set_page_config(page_title="Genesys Cloud Reporting", layout="wide")
 
 CREDENTIALS_FILE = "credentials.enc"
@@ -62,6 +81,8 @@ st.markdown("""
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     html, body, [data-testid="stAppViewContainer"] { font-family: 'Inter', sans-serif !important; background-color: #ffffff !important; }
     [data-testid="stVerticalBlockBorderWrapper"] { background-color: #ffffff !important; border: 1px solid #eef2f6 !important; border-radius: 12px !important; padding: 1.5rem !important; margin-bottom: 1.5rem !important; }
+    [data-testid="stHorizontalBlock"] { gap: 4px !important; }
+    [data-testid="stColumn"] { min-width: 0 !important; padding: 0 !important; }
     [data-testid="stMetricContainer"] { background-color: #f8fafb !important; border: 1px solid #f1f5f9 !important; padding: 1rem 0.5rem !important; border-radius: 10px !important; text-align: center; }
     [data-testid="stMetricContainer"]:hover { background-color: #f1f5f9 !important; }
     [data-testid="stMetricLabel"] { color: #64748b !important; font-size: 0.75rem !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -187,6 +208,27 @@ def get_data_manager():
 
 data_manager = get_data_manager()
 
+def refresh_data_manager_queues():
+    """Calculates optimized agent_queues_map and starts/updates DataManager."""
+    if not st.session_state.get('api_client') or not st.session_state.get('queues_map'):
+        return
+        
+    agent_queues_map = {}
+    if 'dashboard_cards' in st.session_state:
+        # Create a normalized map for easier lookup (stripped names)
+        norm_map = {k.strip(): v for k, v in st.session_state.queues_map.items()}
+        for card in st.session_state.dashboard_cards:
+            if card.get('queues'):
+                q_name = card['queues'][0].strip()
+                q_id = norm_map.get(q_name)
+                if q_id:
+                    agent_queues_map[q_name] = q_id
+                else:
+                    print(f"DataManager: Could not find ID for queue name '{q_name}'")
+    
+    data_manager.update_api_client(st.session_state.api_client, st.session_state.get('presence_map'))
+    data_manager.start(st.session_state.queues_map, agent_queues_map or None)
+
 def create_gauge_chart(value, title, height=250):
     fig = go.Figure(go.Indicator(
         mode = "gauge+number", value = value, title = {'text': title},
@@ -210,6 +252,12 @@ if 'language' not in st.session_state: st.session_state.language = "TR"
 if 'app_user' not in st.session_state: st.session_state.app_user = None
 if 'wrapup_map' not in st.session_state: st.session_state.wrapup_map = {}
 
+# Load Dashboard Config early for DataManager optimization
+if 'dashboard_config_loaded' not in st.session_state:
+    config = load_dashboard_config()
+    st.session_state.dashboard_layout, st.session_state.dashboard_cards = config.get("layout", 1), config.get("cards", [{"id": 0, "title": "", "queues": [], "size": "medium"}])
+    st.session_state.dashboard_config_loaded = True
+
 # --- APP LOGIN ---
 if not st.session_state.app_user:
     # Try Auto-Login from Encrypted Session File
@@ -227,7 +275,7 @@ if not st.session_state.app_user:
             u_pass = st.text_input("Şifre / Password", type="password")
             remember_me = st.checkbox("Beni Hatırla / Remember Me")
             
-            if st.form_submit_button("Giriş / Login", use_container_width=True):
+            if st.form_submit_button("Giriş / Login", width='stretch'):
                 user_data = auth_manager.authenticate(u_name, u_pass)
                 if user_data:
                     # Exclude password hash from session state and file
@@ -262,15 +310,18 @@ if not st.session_state.api_client and saved_creds:
             st.session_state.queues_map = {q['name']: q['id'] for q in api.get_queues()}
             st.session_state.wrapup_map = api.get_wrapup_codes()
             st.session_state.presence_map = api.get_presence_definitions()
-            data_manager.update_api_client(client, st.session_state.presence_map)
-            data_manager.start(st.session_state.queues_map)
+            refresh_data_manager_queues()
+
+# Ensure DataManager is active even on hot-reload
+if st.session_state.get('api_client') and st.session_state.get('queues_map'):
+    refresh_data_manager_queues()
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.session_state.language = st.selectbox("Dil / Language", ["TR", "EN"])
     lang = st.session_state.language
     st.write(f"Hoş geldiniz, **{st.session_state.app_user['username']}** ({st.session_state.app_user['role']})")
-    if st.button("Çıkış Yap / Logout App", type="secondary", use_container_width=True):
+    if st.button("Çıkış Yap / Logout App", type="secondary", width='stretch'):
         st.session_state.app_user = None
         delete_app_session()
         st.rerun()
@@ -347,28 +398,36 @@ if not st.session_state.api_client:
 else:
     if st.session_state.page == get_text(lang, "menu_reports"):
         st.title(get_text(lang, "menu_reports"))
-        presets = load_presets()
-        c_p1, c_p2, c_p3 = st.columns([2, 1, 1])
-        with c_p1:
-            sel_p = st.selectbox(get_text(lang, "select_view"), [get_text(lang, "no_view_selected")] + [p['name'] for p in presets], key="preset_selector")
-        
-        def_p = {}
-        if sel_p != get_text(lang, "no_view_selected"):
-            p = next((p for p in presets if p['name'] == sel_p), None)
-            if p:
-                def_p = p
-                for k in ["type", "names", "metrics", "granularity_label", "fill_gaps"]:
-                    if k in p: st.session_state[f"rep_{k[:3]}"] = p[k]
-        
-        with st.expander(get_text(lang, "save_view")):
-            cs1, cs2 = st.columns([3, 1], vertical_alignment="bottom")
-            p_name = cs1.text_input(get_text(lang, "preset_name"))
-            if cs2.button(get_text(lang, "save"), use_container_width=True, type="primary") and p_name:
-                new_p = {"name": p_name, "type": st.session_state.get("rep_typ", "report_agent"), "names": st.session_state.get("rep_nam", []), "metrics": st.session_state.get("rep_met", DEFAULT_METRICS), "granularity_label": st.session_state.get("rep_gra", "Toplam"), "fill_gaps": st.session_state.get("rep_fil", False)}
-                presets = [p for p in presets if p['name'] != p_name] + [new_p]
-                save_presets(presets); st.success(get_text(lang, "view_saved")); st.rerun()
+        # --- SAVED VIEWS (Compact) ---
+        with st.expander("📂 Kayıtlı Raporlar / Saved Views", expanded=False):
+            presets = load_presets()
+            # Single row layout for better alignment
+            # Using vertical_alignment="bottom" (Streamlit 1.35+) to align button with inputs
+            c_p1, c_p2, c_p3 = st.columns([3, 2, 1], gap="small", vertical_alignment="bottom")
+            
+            with c_p1:
+                sel_p = st.selectbox(get_text(lang, "select_view"), [get_text(lang, "no_view_selected")] + [p['name'] for p in presets], key="preset_selector")
+            
+            def_p = {}
+            if sel_p != get_text(lang, "no_view_selected"):
+                p = next((p for p in presets if p['name'] == sel_p), None)
+                if p:
+                    def_p = p
+                    for k in ["type", "names", "metrics", "granularity_label", "fill_gaps"]:
+                        if k in p: st.session_state[f"rep_{k[:3]}"] = p[k]
+            
+            with c_p2:
+                p_name_save = st.text_input(get_text(lang, "preset_name"), placeholder="Yeni Görünüm İsmi / New View Name")
+                
+            with c_p3:
+                if st.button("💾 Kaydet / Save", key="btn_save_view", width='stretch') and p_name_save:
+                    new_p = {"name": p_name_save, "type": st.session_state.get("rep_typ", "report_agent"), "names": st.session_state.get("rep_nam", []), "metrics": st.session_state.get("rep_met", DEFAULT_METRICS), "granularity_label": st.session_state.get("rep_gra", "Toplam"), "fill_gaps": st.session_state.get("rep_fil", False)}
+                    presets = [p for p in presets if p['name'] != p_name_save] + [new_p]
+                    save_presets(presets); st.success(get_text(lang, "view_saved")); st.rerun()
 
-        st.write("---")
+        st.divider()
+
+        # --- PRIMARY FILTERS (Always Visible) ---
         c1, c2 = st.columns(2)
         with c1:
             role = st.session_state.app_user['role']
@@ -383,55 +442,54 @@ else:
                 format_func=lambda x: get_text(lang, x),
                 key="rep_typ", index=rep_types.index(def_p.get("type", "report_agent")) if def_p.get("type", "report_agent") in rep_types else 0)
         with c2:
-            is_agent = r_type == "report_agent" # Removed report_detailed to make it queue-based
+            is_agent = r_type == "report_agent" 
             opts = list(st.session_state.users_map.keys()) if is_agent else list(st.session_state.queues_map.keys())
             sel_names = st.multiselect(get_text(lang, "select_agents" if is_agent else "select_workgroups"), opts, key="rep_nam")
             sel_ids = [(st.session_state.users_map if is_agent else st.session_state.queues_map)[n] for n in sel_names]
 
-        st.write("---")
-        c3, c4 = st.columns(2)
-        with c3:
-            d1, t1 = st.columns(2); sd = d1.date_input("Start Date", datetime.today()); st_ = t1.time_input(get_text(lang, "start_time"), time(0, 0))
-        with c4:
-            d2, t2 = st.columns(2); ed = d2.date_input("End Date", datetime.today()); et = t2.time_input(get_text(lang, "end_time"), time(23, 59))
+        # Date & Time Selection (One Row)
+        c_d1, c_d2, c_d3, c_d4 = st.columns(4)
+        sd = c_d1.date_input("Start Date", datetime.today())
+        st_ = c_d2.time_input(get_text(lang, "start_time"), time(0, 0))
+        ed = c_d3.date_input("End Date", datetime.today())
+        et = c_d4.time_input(get_text(lang, "end_time"), time(23, 59))
         
-        g1, g2 = st.columns(2)
-        gran_opt = {get_text(lang, "total"): "P1D", get_text(lang, "30min"): "PT30M", get_text(lang, "1hour"): "PT1H"}
-        sel_gran = g1.selectbox(get_text(lang, "granularity"), list(gran_opt.keys()), key="rep_gra")
-        do_fill = g2.checkbox(get_text(lang, "fill_gaps"), key="rep_fil")
-        
-        # Media Type Filter
-        MEDIA_TYPE_OPTIONS = ["voice", "chat", "email", "callback", "message"]
-        MEDIA_TYPE_LABELS = {"voice": "Sesli / Voice", "chat": "Chat", "email": "E-posta / Email", "callback": "Geri Arama / Callback", "message": "Mesaj / Message"}
-        sel_media_types = st.multiselect(
-            get_text(lang, "media_type") if "media_type" in STRINGS.get(lang, {}) else "Medya Tipi / Media Type",
-            MEDIA_TYPE_OPTIONS,
-            default=[],
-            format_func=lambda x: MEDIA_TYPE_LABELS.get(x, x),
-            key="rep_media",
-            help="Boş bırakılırsa tüm medya tipleri dahil edilir / Leave empty to include all media types"
-        )
+        # --- ADVANCED FILTERS (Collapsible) ---
+        with st.expander("⚙️ Rapor Ayarları & Filtreler / Advanced Filters", expanded=False):
+            g1, g2 = st.columns(2)
+            gran_opt = {get_text(lang, "total"): "P1D", get_text(lang, "30min"): "PT30M", get_text(lang, "1hour"): "PT1H"}
+            sel_gran = g1.selectbox(get_text(lang, "granularity"), list(gran_opt.keys()), key="rep_gra")
+            do_fill = g2.checkbox(get_text(lang, "fill_gaps"), key="rep_fil")
+            
+            # Media Type Filter
+            MEDIA_TYPE_OPTIONS = ["voice", "chat", "email", "callback", "message"]
+            MEDIA_TYPE_LABELS = {"voice": "Sesli / Voice", "chat": "Chat", "email": "E-posta / Email", "callback": "Geri Arama / Callback", "message": "Mesaj / Message"}
+            sel_media_types = st.multiselect(
+                get_text(lang, "media_type") if "media_type" in STRINGS.get(lang, {}) else "Medya Tipi / Media Type",
+                MEDIA_TYPE_OPTIONS,
+                default=[],
+                format_func=lambda x: MEDIA_TYPE_LABELS.get(x, x),
+                key="rep_media",
+                help="Boş bırakılırsa tüm medya tipleri dahil edilir / Leave empty to include all media types"
+            )
 
-        st.write("---")
-        
-        # Filter metrics based on user permissions
-        user_metrics = st.session_state.app_user.get('metrics', [])
-        selection_options = user_metrics if user_metrics and role != "Admin" else ALL_METRICS
-        
-        if r_type not in ["interaction_search", "chat_detail", "missed_interactions"]:
-            # Use last used metrics as default if available, otherwise use standard defaults
-            if "last_metrics" in st.session_state and st.session_state.last_metrics:
-                auto_def_metrics = [m for m in st.session_state.last_metrics if m in selection_options]
+            # Metrics Selection
+            user_metrics = st.session_state.app_user.get('metrics', [])
+            selection_options = user_metrics if user_metrics and role != "Admin" else ALL_METRICS
+            
+            if r_type not in ["interaction_search", "chat_detail", "missed_interactions"]:
+                if "last_metrics" in st.session_state and st.session_state.last_metrics:
+                    auto_def_metrics = [m for m in st.session_state.last_metrics if m in selection_options]
+                else:
+                    auto_def_metrics = [m for m in ["nOffered", "nAnswered", "tAnswered", "tTalk", "tHandle"] if m in selection_options]
+                sel_mets = st.multiselect(get_text(lang, "metrics"), selection_options, default=auto_def_metrics, format_func=lambda x: get_text(lang, x), key="rep_met")
             else:
-                auto_def_metrics = [m for m in ["nOffered", "nAnswered", "tAnswered", "tTalk", "tHandle"] if m in selection_options]
-            sel_mets = st.multiselect(get_text(lang, "metrics"), selection_options, default=auto_def_metrics, format_func=lambda x: get_text(lang, x), key="rep_met")
-        else:
-            sel_mets = []
+                sel_mets = []
 
 
         if r_type == "chat_detail":
             st.info("Bu rapor, webchat, whatsapp, message gibi yazılı etkileşimlerin detaylarını ve 'Participant Data' verilerini içerir.")
-            if st.button("Chat Verilerini Getir / Fetch Chat Data", type="primary", use_container_width=True):
+            if st.button("Chat Verilerini Getir / Fetch Chat Data", type="primary", width='stretch'):
                  with st.spinner(get_text(lang, "fetching_data")):
                      start_date = datetime.combine(sd, st_) - timedelta(hours=3)
                      end_date = datetime.combine(ed, et) - timedelta(hours=3)
@@ -517,7 +575,7 @@ else:
                              st.warning("Seçilen tarih aralığında hiç 'Chat/Mesaj' kaydı bulunamadı. (Sesli çağrılar hariç tutuldu)")
                          elif not df_chat.empty:
                              # Display
-                             st.dataframe(df_chat, use_container_width=True)
+                             st.dataframe(df_chat, width='stretch')
                              st.download_button(get_text(lang, "download_excel"), data=to_excel(df_chat), file_name=f"chat_detail_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
                          else:
                              st.warning(get_text(lang, "no_data"))
@@ -534,7 +592,7 @@ else:
              # Let user select
             selected_cols_keys = st.multiselect("Sütunları Seçin / Select Columns", INTERACTION_COLUMNS, default=INTERACTION_COLUMNS, format_func=lambda x: get_text(lang, x))
 
-            if st.button("Kaçan Çağrıları Getir / Fetch Missed", type="primary", use_container_width=True):
+            if st.button("Kaçan Çağrıları Getir / Fetch Missed", type="primary", width='stretch'):
                  with st.spinner(get_text(lang, "fetching_data")):
                      # Fetch data
                      # We need to fetch conversation details
@@ -607,7 +665,7 @@ else:
                              final_df = df_filtered.rename(columns=rename_final)
                              
                              st.success(f"{len(final_df)} adet kaçan etkileşim bulundu.")
-                             st.dataframe(final_df, use_container_width=True)
+                             st.dataframe(final_df, width='stretch')
                              st.download_button(get_text(lang, "download_excel"), data=to_excel(final_df), file_name=f"missed_interactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
                          else:
                              st.warning("Seçilen kriterlere uygun kaçan çağrı/etkileşim bulunamadı.")
@@ -625,7 +683,7 @@ else:
             # Allow user to customize columns if needed
             selected_cols_keys = st.multiselect("Sütunları Seçin / Select Columns", INTERACTION_COLUMNS, default=INTERACTION_COLUMNS, format_func=lambda x: get_text(lang, x))
             
-            if st.button("Etkileşimleri Getir / Fetch Interactions", type="primary", use_container_width=True):
+            if st.button("Etkileşimleri Getir / Fetch Interactions", type="primary", width='stretch'):
                  with st.spinner(get_text(lang, "fetching_data")):
                      start_date = datetime.combine(sd, st_) - timedelta(hours=3)
                      end_date = datetime.combine(ed, et) - timedelta(hours=3)
@@ -665,13 +723,13 @@ else:
                          
                          df_filtered = apply_duration_formatting(df_filtered.copy())
                          final_df = df_filtered.rename(columns=rename_final)
-                         st.dataframe(final_df, use_container_width=True)
+                         st.dataframe(final_df, width='stretch')
                          st.download_button(get_text(lang, "download_excel"), data=to_excel(final_df), file_name=f"interactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
                      else:
                          st.warning(get_text(lang, "no_data"))
 
         # --- STANDARD REPORTS ---
-        elif r_type not in ["chat_detail", "missed_interactions"] and st.button(get_text(lang, "fetch_report"), type="primary", use_container_width=True):
+        elif r_type not in ["chat_detail", "missed_interactions"] and st.button(get_text(lang, "fetch_report"), type="primary", width='stretch'):
             if not sel_mets: st.warning("Lütfen metrik seçiniz.")
             else:
                 # Auto-save last used metrics
@@ -728,7 +786,7 @@ else:
 
                         rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout")}
                         rename.update({m: get_text(lang, m) for m in sel_mets if m not in rename})
-                        st.dataframe(final_df.rename(columns=rename), use_container_width=True)
+                        st.dataframe(final_df.rename(columns=rename), width='stretch')
                         st.download_button(get_text(lang, "download_excel"), data=to_excel(final_df.rename(columns=rename)), file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
                     else: st.warning(get_text(lang, "no_data"))
 
@@ -754,7 +812,7 @@ else:
                 from src.lang import ALL_METRICS
                 new_mets = st.multiselect("İzinli Metrikler (Boş bırakılırsa hepsi seçilir)", ALL_METRICS, format_func=lambda x: get_text(lang, x))
                 
-                if st.form_submit_button("Ekle", use_container_width=True):
+                if st.form_submit_button("Ekle", width='stretch'):
                     if new_un and new_pw:
                         success, msg = auth_manager.add_user(new_un, new_pw, new_role, new_mets)
                         if success: 
@@ -779,16 +837,14 @@ else:
             st.write("---")
 
     else: # --- DASHBOARD ---
-        if 'dashboard_config_loaded' not in st.session_state:
-            config = load_dashboard_config()
-            st.session_state.dashboard_layout, st.session_state.dashboard_cards = config.get("layout", 1), config.get("cards", [{"id": 0, "title": "", "queues": [], "size": "medium"}])
-            st.session_state.dashboard_config_loaded = True
-        
+        # (Config already loaded at top level)
         st.title(get_text(lang, "menu_dashboard"))
         c_c1, c_c2, c_c3 = st.columns([1, 2, 1])
-        if c_c1.button(get_text(lang, "add_group"), use_container_width=True):
+        if c_c1.button(get_text(lang, "add_group"), width='stretch'):
             st.session_state.dashboard_cards.append({"id": max([c['id'] for c in st.session_state.dashboard_cards], default=-1)+1, "title": "", "queues": [], "size": "medium", "live_metrics": ["Waiting", "Interacting", "On Queue"], "daily_metrics": ["Offered", "Answered", "Abandoned", "Answer Rate"]})
-            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards); st.rerun()
+            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
+            refresh_data_manager_queues()
+            st.rerun()
         
         with c_c2:
             sc1, sc2 = st.columns([2, 3])
@@ -801,14 +857,68 @@ else:
 
         if c_c3:
             if st.session_state.dashboard_mode == "Date": st.session_state.dashboard_date = st.date_input("Date", datetime.today(), label_visibility="collapsed")
-            elif st.session_state.dashboard_mode == "Live": auto_ref = st.toggle(get_text(lang, "auto_refresh"), value=True)
-            if st.session_state.dashboard_mode == "Live" and auto_ref: st_autorefresh(interval=10000, key="data_refresh")
+            elif st.session_state.dashboard_mode == "Live": 
+                c_auto, c_time, c_spacer, c_panel = st.columns([1, 1, 1, 1])
+                auto_ref = c_auto.toggle(get_text(lang, "auto_refresh"), value=True)
+                # Toggle moved to far right
+                show_panel = c_panel.toggle("👤 Agent Panel", value=st.session_state.get('show_agent_panel', False), key='toggle_agent_panel')
+                st.session_state.show_agent_panel = show_panel
+                
+                # Show Last Update Time
+                if data_manager.last_update_time > 0:
+                    last_upd = datetime.fromtimestamp(data_manager.last_update_time).strftime('%H:%M:%S')
+                    c_time.caption(f"Last Update:\n{last_upd}")
+                
+            if st.session_state.dashboard_mode == "Live":
+                # Ensure DataManager is running
+                if st.session_state.queues_map:
+                    # OPTIMIZATION: Separate full queues (metrics) and primary queues (agent list)
+                    # Use only the first queue of each card for agent fetching to reduce load
+                    id_to_qname = {v: k for k, v in st.session_state.queues_map.items()}
+                    agent_queues_map = {}
+                    for card in st.session_state.dashboard_cards:
+                        if card.get('queues'):
+                            q_name = card['queues'][0]
+                            q_id = st.session_state.queues_map.get(q_name)
+                            if q_id: agent_queues_map[q_name] = q_id
+                    
+                    data_manager.start(st.session_state.queues_map, agent_queues_map)
+                
+                if auto_ref: st_autorefresh(interval=10000, key="data_refresh")
 
         # Available metric options
-        LIVE_METRIC_OPTIONS = ["Waiting", "Interacting", "On Queue", "Available", "Busy", "Away", "Break", "Meal", "Meeting", "Training"]
+        # Available metric options
+        LIVE_METRIC_OPTIONS = ["Waiting", "Interacting", "Idle Agent", "On Queue", "Available", "Busy", "Away", "Break", "Meal", "Meeting", "Training"]
         DAILY_METRIC_OPTIONS = ["Offered", "Answered", "Abandoned", "Answer Rate", "Service Level", "Avg Handle Time", "Avg Wait Time"]
 
-        grid = st.columns(st.session_state.dashboard_layout)
+        # Define labels for consistent usage in Settings and Display
+        live_labels = {
+            "Waiting": get_text(lang, "waiting"), 
+            "Interacting": get_text(lang, "interacting"), 
+            "Idle Agent": "Boşta (Idle)",
+            "On Queue": get_text(lang, "on_queue_agents"), 
+            "Available": get_text(lang, "available_agents"), 
+            "Busy": "Meşgul", "Away": "Uzakta", "Break": "Mola", 
+            "Meal": "Yemek", "Meeting": "Toplantı", "Training": "Eğitim"
+        }
+        
+        daily_labels = {
+            "Offered": get_text(lang, "offered"), 
+            "Answered": get_text(lang, "answered"), 
+            "Abandoned": get_text(lang, "abandoned"), 
+            "Answer Rate": get_text(lang, "answer_rate"), 
+            "Service Level": get_text(lang, "avg_service_level"), 
+            "Avg Handle Time": "Ort. İşlem", 
+            "Avg Wait Time": "Ort. Bekleme"
+        }
+
+        if st.session_state.get('show_agent_panel', False):
+            main_c, side_c = st.columns([3, 1])
+        else:
+            main_c = st.container()
+            side_c = None
+
+        grid = main_c.columns(st.session_state.dashboard_layout)
         to_del = []
         for idx, card in enumerate(st.session_state.dashboard_cards):
             with grid[idx % st.session_state.dashboard_layout]:
@@ -817,14 +927,14 @@ else:
                     with st.expander(f"⚙️ Settings", expanded=False):
                         card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
                         card['queues'] = st.multiselect("Queues", list(st.session_state.queues_map.keys()), default=card.get('queues', []), key=f"q_{card['id']}")
-                        card['size'] = st.selectbox("Size", ["small", "medium", "large"], index=["small", "medium", "large"].index(card.get('size', 'medium')), key=f"s_{card['id']}")
+                        card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
                         
                         st.write("---")
                         st.caption("📡 Canlı Metrikler")
-                        card['live_metrics'] = st.multiselect("Live Metrics", LIVE_METRIC_OPTIONS, default=card.get('live_metrics', ["Waiting", "Interacting", "On Queue"]), key=f"lm_{card['id']}")
+                        card['live_metrics'] = st.multiselect("Live Metrics", LIVE_METRIC_OPTIONS, default=card.get('live_metrics', ["Waiting", "Interacting", "On Queue"]), format_func=lambda x: live_labels.get(x, x), key=f"lm_{card['id']}")
                         
                         st.caption("📊 Günlük Metrikler")
-                        card['daily_metrics'] = st.multiselect("Daily Metrics", DAILY_METRIC_OPTIONS, default=card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"]), key=f"dm_{card['id']}")
+                        card['daily_metrics'] = st.multiselect("Daily Metrics", DAILY_METRIC_OPTIONS, default=card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"]), format_func=lambda x: daily_labels.get(x, x), key=f"dm_{card['id']}")
                         
                         if st.button("Delete", key=f"d_{card['id']}"): to_del.append(idx)
                         save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
@@ -872,9 +982,23 @@ else:
                     # Calculate aggregates
                     n_q = len(items_live) or 1
                     n_s = len(card['queues']) or 1
-                    off = sum(d['Offered'] for d in items_daily)
-                    ans = sum(d['Answered'] for d in items_daily)
-                    abn = sum(d['Abandoned'] for d in items_daily)
+                    
+                    # Live Metric Helper: Sum based on selected media types
+                    selected_media = card.get('media_types', [])
+                    
+                    def get_media_sum(item, metric_key):
+                        # If metric is NOT dict (old data or non-media metric), return it directly
+                        val = item.get(metric_key, 0)
+                        if not isinstance(val, dict): return val
+                        
+                        # If dict, filter by selected media types
+                        if not selected_media: return val.get('Total', 0)
+                        
+                        return sum(val.get(m, 0) for m in selected_media)
+
+                    off = sum(get_media_sum(d, 'Offered') for d in items_daily)
+                    ans = sum(get_media_sum(d, 'Answered') for d in items_daily)
+                    abn = sum(get_media_sum(d, 'Abandoned') for d in items_daily)
                     s_n = sum(d.get('SL_Numerator', 0) for d in items_daily)
                     s_d = sum(d.get('SL_Denominator', 0) for d in items_daily)
                     sl = (s_n / s_d * 100) if s_d > 0 else 0
@@ -883,8 +1007,9 @@ else:
                     
                     # Live metrics mapping
                     live_values = {
-                        "Waiting": sum(d['Waiting'] for d in items_live) if items_live else 0,
-                        "Interacting": round(sum(d['Interacting'] for d in items_live)/n_q) if items_live else 0,
+                        "Waiting": sum(get_media_sum(d, 'Waiting') for d in items_live) if items_live else 0,
+                        "Interacting": round(sum(get_media_sum(d, 'Interacting') for d in items_live)/n_q) if items_live else 0,
+                        "Idle Agent": sum(d.get('OnQueueIdle', 0) for d in items_live) if items_live else 0,
                         "On Queue": round(sum(d['Presences'].get('On Queue', 0) for d in items_live)/n_s) if items_live else 0,
                         "Available": round(sum(d['Presences'].get('Available', 0) for d in items_live)/n_s) if items_live else 0,
                         "Busy": round(sum(d['Presences'].get('Busy', 0) for d in items_live)/n_s) if items_live else 0,
@@ -894,8 +1019,6 @@ else:
                         "Meeting": round(sum(d['Presences'].get('Meeting', 0) for d in items_live)/n_s) if items_live else 0,
                         "Training": round(sum(d['Presences'].get('Training', 0) for d in items_live)/n_s) if items_live else 0,
                     }
-                    
-                    live_labels = {"Waiting": get_text(lang, "waiting"), "Interacting": get_text(lang, "interacting"), "On Queue": get_text(lang, "on_queue_agents"), "Available": get_text(lang, "available_agents"), "Busy": "Meşgul", "Away": "Uzakta", "Break": "Mola", "Meal": "Yemek", "Meeting": "Toplantı", "Training": "Eğitim"}
                     
                     # Daily metrics mapping
                     daily_values = {
@@ -908,28 +1031,33 @@ else:
                         "Avg Wait Time": f"{avg_wait:.0f}s" if avg_wait else "0",
                     }
                     
-                    daily_labels = {"Offered": get_text(lang, "offered"), "Answered": get_text(lang, "answered"), "Abandoned": get_text(lang, "abandoned"), "Answer Rate": get_text(lang, "answer_rate"), "Service Level": get_text(lang, "avg_service_level"), "Avg Handle Time": "Ort. İşlem", "Avg Wait Time": "Ort. Bekleme"}
-                    
                     if st.session_state.dashboard_mode == "Live":
-                        # Show selected live metrics
+                        # Show selected live metrics (Responsive Grid)
                         sel_live = card.get('live_metrics', ["Waiting", "Interacting", "On Queue"])
                         if sel_live:
-                            m = st.columns(min(len(sel_live), 5))
-                            for i, metric in enumerate(sel_live[:5]):
-                                m[i].metric(live_labels.get(metric, metric), live_values.get(metric, 0))
+                            # Use 5 columns per row
+                            cols_per_row = 5
+                            for i in range(0, len(sel_live), cols_per_row):
+                                batch = sel_live[i:i+cols_per_row]
+                                cols = st.columns(cols_per_row)
+                                for j, metric in enumerate(batch):
+                                    cols[j].metric(live_labels.get(metric, metric), live_values.get(metric, 0))
                         
                         # Show daily summary below live (Today's stats)
                         st.divider()
                         st.caption(f"📅 Bugünün Özeti")
                         sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
                         if sel_daily:
-                            dm = st.columns(min(len(sel_daily), 4))
-                            for i, metric in enumerate(sel_daily[:4]):
-                                dm[i].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
+                            cols_per_row = 5
+                            for i in range(0, len(sel_daily), cols_per_row):
+                                batch = sel_daily[i:i+cols_per_row]
+                                cols = st.columns(cols_per_row)
+                                for j, metric in enumerate(batch):
+                                    cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
                         
                         # Always show gauge for Service Level at the bottom
                         gauge_size = 180 if card['size'] == 'small' else (200 if card['size'] == 'medium' else 250)
-                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), use_container_width=True, key=f"g_{card['id']}")
+                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), width='stretch', key=f"g_{card['id']}")
                     
                     else:
                         # Historical mode (Yesterday/Date) - show daily stats with gauge
@@ -937,14 +1065,241 @@ else:
                         
                         # Show daily metrics first for ALL sizes
                         st.caption(f"📅 {get_text(lang, 'daily_stat')}")
-                        dm = st.columns(min(len(sel_daily), 4))
-                        for i, metric in enumerate(sel_daily[:4]):
-                            dm[i].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
+                        if sel_daily:
+                            cols_per_row = 5
+                            for i in range(0, len(sel_daily), cols_per_row):
+                                batch = sel_daily[i:i+cols_per_row]
+                                cols = st.columns(cols_per_row)
+                                for j, metric in enumerate(batch):
+                                    cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
                         
                         # Then show gauge
                         gauge_size = 180 if card['size'] == 'small' else (250 if card['size'] == 'medium' else 300)
-                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), use_container_width=True, key=f"g_{card['id']}")
+                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), width='stretch', key=f"g_{card['id']}")
 
         if to_del:
             for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]
-            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards); st.rerun()
+            save_dashboard_config(st.session_state.dashboard_layout, st.session_state.dashboard_cards)
+            refresh_data_manager_queues()
+            st.rerun()
+
+        # --- SIDE PANEL LOGIC ---
+        if st.session_state.get('show_agent_panel', False) and side_c:
+            with side_c:
+                # --- Compact CSS for Agent List and Filters ---
+                st.markdown("""
+                    <style>
+                        /* Target the sidebar vertical blocks to reduce gap */
+                        [data-testid="stSidebarUserContent"] .stVerticalBlock {
+                            gap: 0.5rem !important;
+                        }
+                        .agent-card {
+                            padding: 6px 10px !important;
+                            margin-bottom: 6px !important;
+                            border-radius: 8px !important;
+                            border: 1px solid #f1f5f9 !important;
+                            background: #ffffff;
+                            display: flex;
+                            align-items: center;
+                            gap: 10px;
+                        }
+                        .status-dot {
+                            width: 12px;
+                            height: 12px;
+                            border-radius: 50%;
+                            display: inline-block;
+                            flex-shrink: 0;
+                        }
+                        .agent-name {
+                            font-size: 1.1rem !important;
+                            font-weight: 600 !important;
+                            color: #1e293b;
+                            margin: 0 !important;
+                            line-height: 1.2;
+                        }
+                        .agent-status {
+                            font-size: 1.0rem !important;
+                            color: #64748b;
+                            margin: 0 !important;
+                            line-height: 1.2;
+                        }
+                        .aktif-sayisi {
+                            font-size: 0.85rem;
+                            color: #64748b;
+                            margin-top: -5px !important;
+                            margin-bottom: 5px !important;
+                        }
+                    </style>
+                """, unsafe_allow_html=True)
+
+                # Filter Text Input
+                sc1, sc2 = st.columns([4, 1])
+                search_term = sc1.text_input("🔍 Agent Ara", "", label_visibility="collapsed", placeholder="Agent Ara...").lower()
+                if sc2.button("🔄", help="Hemen Yenile"):
+                    data_manager._fetch_all_data()
+                    st.rerun()
+                
+                # Card/Group Filter
+                group_options = ["Hepsi (All)"] + [card['title'] or f"Grup #{idx+1}" for idx, card in enumerate(st.session_state.dashboard_cards)]
+                selected_group = st.selectbox("📌 Grup Filtresi", group_options, index=0)
+                
+                # Collect queues from selected group or all active cards
+                all_queues = set()
+                if selected_group == "Hepsi (All)":
+                    for card in st.session_state.dashboard_cards:
+                        if card.get('queues'): all_queues.update(card['queues'])
+                else:
+                    for card in st.session_state.dashboard_cards:
+                        if (card['title'] or f"Grup #{st.session_state.dashboard_cards.index(card)+1}") == selected_group:
+                            if card.get('queues'): all_queues.update(card['queues'])
+                            break
+                
+                if not all_queues:
+                    st.info("Kart seçilmedi.")
+                elif st.session_state.dashboard_mode != "Live":
+                    st.warning("Agent detayları sadece CANLI modda görünür.")
+                else:
+                    # DEBUG INFO (Visible if empty or for technical check)
+                    with st.expander("🛠 Debug Info", expanded=False):
+                        st.write(f"Total Queues in System: {len(st.session_state.queues_map)}")
+                        st.write(f"Monitored Agent Queues: {len(data_manager.agent_queues_map)}")
+                        if data_manager.agent_queues_map:
+                            st.json(data_manager.agent_queues_map)
+                        st.write(f"Membership Cache (Queue -> Count):")
+                        for q_id_log, mem_list in data_manager.queue_members_cache.items():
+                            st.write(f"- {q_id_log}: {len(mem_list)} members")
+                        
+                        st.write(f"Agent Detail Cache Size: {len(data_manager.agent_details_cache)}")
+                        st.write(f"Last Background Update: {datetime.fromtimestamp(data_manager.last_update_time).strftime('%H:%M:%S') if data_manager.last_update_time else 'Never'}")
+                        
+                        if st.button("Force Global Fetch"):
+                            print("DEBUG: Force Fetch Triggered")
+                            data_manager._fetch_all_data()
+                            print(f"DEBUG: Cache after fetch: {len(data_manager.queue_members_cache)} queues")
+                            st.rerun()
+                        
+                        if st.button("Clear Cache & Retry"):
+                            data_manager.queue_members_cache = {}
+                            data_manager.agent_details_cache = {}
+                            data_manager.last_member_refresh = 0
+                            st.rerun()
+
+                    # Get cached details from DataManager
+                    agent_data = data_manager.get_agent_details(all_queues)
+                    
+                    if not agent_data:
+                        st.info("Veri bekleniyor...")
+                    else:
+                        # Flatten, Deduplicate and Filter Offline
+                        unique_members = {}
+                        for q_name, members in agent_data.items():
+                            for m in members:
+                                mid = m['id']
+                                user_obj = m.get('user', {})
+                                presence = user_obj.get('presence', {}).get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
+                                
+                                # Temporarily show everyone for debug
+                                # if presence == "OFFLINE": continue
+                                
+                                if mid not in unique_members:
+                                    unique_members[mid] = m
+                        
+                        # Apply Search Filter
+                        filtered_mems = []
+                        for m in unique_members.values():
+                            name = m.get('user', {}).get('name', 'Unknown')
+                            if search_term in name.lower():
+                                filtered_mems.append(m)
+                        
+                        # Define Sorting Priority
+                        # on queu, Available, Meal, break, busy,meeting,training ve offline
+                        def get_sort_score(m):
+                            # Extract presence and routing status from the agent object
+                            user_obj = m.get('user', {})
+                            presence_obj = user_obj.get('presence', {})
+                            p = presence_obj.get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
+                            routing_obj = m.get('routingStatus', {})
+                            rs = routing_obj.get('status', 'OFF_QUEUE').upper()
+                            
+                            # CRITICAL FIX: Offline users must ALWAYS act as offline, regardless of routing status
+                            if p == 'OFFLINE':
+                                return 99
+
+                            # Routing statuses essentially map to "On Queue" priority
+                            if rs in ['INTERACTING', 'COMMUNICATING', 'IDLE', 'NOT_RESPONDING']:
+                                return 0 # Highest priority for agents actively on queue or interacting
+                            
+                            p_map = {
+                                "ON QUEUE": 0, # Should be covered by routing status, but as a fallback
+                                "ON_QUEUE": 0,
+                                "AVAILABLE": 1,
+                                "MEAL": 2,
+                                "BREAK": 3,
+                                "BUSY": 4,
+                                "MEETING": 5,
+                                "TRAINING": 6,
+                                "OFFLINE": 99
+                            }
+                            # Check partial matches for unexpected system presences
+                            for key, score in p_map.items():
+                                if key in p: return score
+                            
+                            return 10 # Default for other statuses
+                            
+                        # Sort members
+                        all_members = list(filtered_mems) # Use filtered_mems here
+                        all_members.sort(key=get_sort_score)
+
+                        st.markdown(f'<p class="aktif-sayisi">Aktif: {len(all_members)}</p>', unsafe_allow_html=True)
+                        
+                        for m in all_members:
+                            user_obj = m.get('user', {})
+                            name = user_obj.get('name', 'Unknown')
+                            # Parse status
+                            presence_obj = user_obj.get('presence', {})
+                            presence = presence_obj.get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
+                            routing_obj = m.get('routingStatus', {})
+                            routing = routing_obj.get('status', 'OFF_QUEUE').upper()
+                            
+                            # Duration
+                            duration_str = format_status_time(presence_obj.get('modifiedDate'), routing_obj.get('startTime'))
+                            
+                            # Compact Status Mapping
+                            dot_color = "#94a3b8" # gray
+                            # Use Label if available, else capitalize system presence
+                            label = presence_obj.get('presenceDefinition', {}).get('label')
+                            status_text = label if label else presence.replace("_", " ").capitalize()
+                            
+                            if presence in ["AVAILABLE", "ON QUEUE"]:
+                                if routing in ["IDLE", "OFF_QUEUE"]: 
+                                    dot_color = "#22c55e" # green
+                                    status_text = "Hazır" if presence == "AVAILABLE" else "Kuyrukta"
+                                elif routing in ["INTERACTING", "COMMUNICATING"]:
+                                    dot_color = "#3b82f6" # blue
+                                    status_text = "Görüşmede"
+                                elif routing == "NOT_RESPONDING":
+                                    dot_color = "#ef4444" # red
+                                    status_text = "Cevapsız"
+                                else:
+                                    dot_color = "#22c55e"
+                            elif presence == "BUSY":
+                                dot_color = "#ef4444"
+                                if not label: status_text = "Meşgul"
+                            elif presence in ["AWAY", "BREAK", "MEAL"]:
+                                dot_color = "#f59e0b" # orange
+                            elif presence == "MEETING":
+                                dot_color = "#ef4444"
+                                if not label: status_text = "Toplantı"
+                            
+                            display_status = f"{status_text} - {duration_str}" if duration_str else status_text
+                            
+                            # Render compact HTML
+                            st.markdown(f"""
+                                <div class="agent-card">
+                                    <span class="status-dot" style="background-color: {dot_color};"></span>
+                                    <div>
+                                        <p class="agent-name">{name}</p>
+                                        <p class="agent-status">{display_status}</p>
+                                    </div>
+                                </div>
+                            """, unsafe_allow_html=True)
