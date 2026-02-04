@@ -383,7 +383,7 @@ else:
                 format_func=lambda x: get_text(lang, x),
                 key="rep_typ", index=rep_types.index(def_p.get("type", "report_agent")) if def_p.get("type", "report_agent") in rep_types else 0)
         with c2:
-            is_agent = r_type in ["report_agent", "report_detailed"]
+            is_agent = r_type == "report_agent" # Removed report_detailed to make it queue-based
             opts = list(st.session_state.users_map.keys()) if is_agent else list(st.session_state.queues_map.keys())
             sel_names = st.multiselect(get_text(lang, "select_agents" if is_agent else "select_workgroups"), opts, key="rep_nam")
             sel_ids = [(st.session_state.users_map if is_agent else st.session_state.queues_map)[n] for n in sel_names]
@@ -399,6 +399,18 @@ else:
         gran_opt = {get_text(lang, "total"): "P1D", get_text(lang, "30min"): "PT30M", get_text(lang, "1hour"): "PT1H"}
         sel_gran = g1.selectbox(get_text(lang, "granularity"), list(gran_opt.keys()), key="rep_gra")
         do_fill = g2.checkbox(get_text(lang, "fill_gaps"), key="rep_fil")
+        
+        # Media Type Filter
+        MEDIA_TYPE_OPTIONS = ["voice", "chat", "email", "callback", "message"]
+        MEDIA_TYPE_LABELS = {"voice": "Sesli / Voice", "chat": "Chat", "email": "E-posta / Email", "callback": "Geri Arama / Callback", "message": "Mesaj / Message"}
+        sel_media_types = st.multiselect(
+            get_text(lang, "media_type") if "media_type" in STRINGS.get(lang, {}) else "Medya Tipi / Media Type",
+            MEDIA_TYPE_OPTIONS,
+            default=[],
+            format_func=lambda x: MEDIA_TYPE_LABELS.get(x, x),
+            key="rep_media",
+            help="Boş bırakılırsa tüm medya tipleri dahil edilir / Leave empty to include all media types"
+        )
 
         st.write("---")
         
@@ -669,11 +681,14 @@ else:
                     s_dt, e_dt = datetime.combine(sd, st_) - timedelta(hours=3), datetime.combine(ed, et) - timedelta(hours=3)
                     r_kind = "Agent" if r_type == "report_agent" else ("Workgroup" if r_type == "report_queue" else "Detailed")
                     g_by = ['userId'] if r_kind == "Agent" else (['queueId'] if r_kind == "Workgroup" else ['userId', 'queueId'])
-                    f_type = 'user' if r_kind in ["Agent", "Detailed"] else 'queue'
+                    f_type = 'user' if r_kind == "Agent" else 'queue'
                     
-                    resp = api.get_analytics_conversations_aggregate(s_dt, e_dt, granularity=gran_opt[sel_gran], group_by=g_by, filter_type=f_type, filter_ids=sel_ids or None, metrics=sel_mets)
+                    resp = api.get_analytics_conversations_aggregate(s_dt, e_dt, granularity=gran_opt[sel_gran], group_by=g_by, filter_type=f_type, filter_ids=sel_ids or None, metrics=sel_mets, media_types=sel_media_types or None)
                     q_lookup = {v: k for k, v in st.session_state.queues_map.items()}
-                    df = process_analytics_response(resp, st.session_state.users_info if is_agent else q_lookup, r_kind.lower(), queue_map=q_lookup)
+                    
+                    # For detailed report, we still need users_info for userId lookup, even though filter is queue
+                    lookup_map = st.session_state.users_info if r_kind in ["Agent", "Detailed"] else q_lookup
+                    df = process_analytics_response(resp, lookup_map, r_kind.lower(), queue_map=q_lookup)
                     
                     if df.empty and is_agent:
                         agent_data = []

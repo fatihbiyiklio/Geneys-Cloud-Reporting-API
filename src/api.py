@@ -127,12 +127,29 @@ class GenesysAPI:
             print(f"Error fetching wrap-up codes: {e}")
         return codes
 
-    def get_analytics_conversations_aggregate(self, start_date, end_date, granularity="P1D", group_by=None, filter_type=None, filter_ids=None, metrics=None):
+    def get_analytics_conversations_aggregate(self, start_date, end_date, granularity="P1D", group_by=None, filter_type=None, filter_ids=None, metrics=None, media_types=None):
         dimension = "userId" if filter_type == 'user' else "queueId"
         operator = "matches"
         predicates = [{"type": "dimension", "dimension": dimension, "operator": operator, "value": fid} for fid in (filter_ids or [])]
         
-        filter_clause = {"type": "or", "predicates": predicates} if predicates else None
+        # Build filter with entity dimension (user or queue)
+        entity_filter = {"type": "or", "predicates": predicates} if predicates else None
+        
+        # Build media type filter if provided
+        media_filter = None
+        if media_types:
+            media_predicates = [{"type": "dimension", "dimension": "mediaType", "operator": "matches", "value": mt} for mt in media_types]
+            media_filter = {"type": "or", "predicates": media_predicates}
+        
+        # Combine filters with AND if both exist
+        if entity_filter and media_filter:
+            filter_clause = {"type": "and", "clauses": [entity_filter, media_filter]}
+        elif entity_filter:
+            filter_clause = entity_filter
+        elif media_filter:
+            filter_clause = media_filter
+        else:
+            filter_clause = None
 
         # Helper to convert UI metrics to API metrics
         def convert_metrics(input_mets, is_queue):

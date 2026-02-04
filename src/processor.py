@@ -143,16 +143,13 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         if report_type in ['user', 'agent', 'detailed', 'productivity']:
             # nOffered fix: Use nAlert as fallback, and ensure it's at least nAnswered
             if "nOffered" not in df.columns: df["nOffered"] = 0
-            if "nAlert" in df.columns:
-                df["nOffered"] = df.apply(lambda x: x["nAlert"] if x["nOffered"] == 0 else x["nOffered"], axis=1)
             
-            if "nAnswered" in df.columns:
-                df["nOffered"] = df[["nOffered", "nAnswered"]].max(axis=1)
+
         
         if "tHandle" in df.columns and "CountHandle" in df.columns:
             df["AvgHandle"] = df.apply(lambda x: x["tHandle"] / x["CountHandle"] if x["CountHandle"] > 0 else 0, axis=1).round(2)
 
-        helper_cols = ["nAlert", "ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle"]
+        helper_cols = ["ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 
