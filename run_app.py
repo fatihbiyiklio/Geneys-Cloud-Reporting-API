@@ -51,11 +51,25 @@ if __name__ == "__main__":
     check_single_instance()
     app_path = resolve_path("app.py")
     
+    import socket
+    
+    def is_port_in_use(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(('localhost', port)) == 0
+
     # Launch Streamlit in a loop for auto-restart
     print("🚀 Starting Genesys Reporting App...")
     
     while True:
         try:
+            # Prevent Port Hopping: Ensure 8501 is free before starting
+            # Streamlit defaults to next port if busy, which we don't want.
+            retries = 10
+            while is_port_in_use(8501) and retries > 0:
+                print(f"⚠️ Port 8501 is busy. Waiting for cleanup... ({retries})")
+                time.sleep(1)
+                retries -= 1
+            
             # subprocess.call returns the exit code
             # We use sys.executable to ensure we use the same Python interpreter
             cmd = [sys.executable, "-m", "streamlit", "run", app_path, 
