@@ -48,27 +48,32 @@ def check_single_instance():
         print(f"Warning: PID file error: {e}")
 
 if __name__ == "__main__":
-    check_single_instance()
-    app_path = resolve_path("app.py")
+    import psutil
     
-    import socket
-    
-    def is_port_in_use(port):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            return s.connect_ex(('localhost', port)) == 0
+    def kill_proc_on_port(port):
+        """Finds and kills any process using the specified port."""
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                for conns in proc.connections(kind='inet'):
+                    if conns.laddr.port == port:
+                        print(f"🔪 Killing process {proc.info['name']} (PID: {proc.info['pid']}) on port {port}...")
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                        return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return False
 
     # Launch Streamlit in a loop for auto-restart
     print("🚀 Starting Genesys Reporting App...")
     
     while True:
         try:
-            # Prevent Port Hopping: Ensure 8501 is free before starting
-            # Streamlit defaults to next port if busy, which we don't want.
-            retries = 10
-            while is_port_in_use(8501) and retries > 0:
-                print(f"⚠️ Port 8501 is busy. Waiting for cleanup... ({retries})")
-                time.sleep(1)
-                retries -= 1
+            # Force Kill: Ensure 8501 is free before starting
+            kill_proc_on_port(8501)
             
             # subprocess.call returns the exit code
             # We use sys.executable to ensure we use the same Python interpreter
