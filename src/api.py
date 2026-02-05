@@ -11,14 +11,28 @@ class GenesysAPI:
         }
 
     def _get(self, path, params=None):
-        response = requests.get(f"{self.api_host}{path}", headers=self.headers, params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = requests.get(f"{self.api_host}{path}", headers=self.headers, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 401:
+                print("⚠️ Token expired (401). Should trigger re-auth here.")
+                # For now, we rely on the app restart or future re-auth logic
+                # Ideally: self.refresh_token() and retry
+                raise e 
+            raise e
 
     def _post(self, path, data):
-        response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 401:
+                 print("⚠️ Token expired (401) on POST.")
+                 raise e
+            raise e
     
     # ... (other methods remain unchanged) ...
 

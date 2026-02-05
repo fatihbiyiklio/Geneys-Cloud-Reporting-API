@@ -252,6 +252,23 @@ if 'language' not in st.session_state: st.session_state.language = "TR"
 if 'app_user' not in st.session_state: st.session_state.app_user = None
 if 'wrapup_map' not in st.session_state: st.session_state.wrapup_map = {}
 
+def init_session_state():
+    if 'page' not in st.session_state: st.session_state.page = "Dashboard"
+    if 'show_agent_panel' not in st.session_state: st.session_state.show_agent_panel = False
+    if 'logged_in' not in st.session_state: st.session_state.logged_in = False
+    if 'last_console_log_count' not in st.session_state: st.session_state.last_console_log_count = 0 # Track logged errors
+
+def log_to_console(message, level='error'):
+    """Injects JavaScript to log to browser console."""
+    js_code = f"""
+    <script>
+        console.{level}("☁️ GenesysApp: {message}");
+    </script>
+    """
+    st.markdown(js_code, unsafe_allow_html=True)
+
+init_session_state()
+
 # Load Dashboard Config early for DataManager optimization
 if 'dashboard_config_loaded' not in st.session_state:
     config = load_dashboard_config()
@@ -390,6 +407,20 @@ with st.sidebar:
             st.success(get_text(lang, "config_imported"))
             if 'dashboard_config_loaded' in st.session_state: del st.session_state.dashboard_config_loaded
         else: st.error(get_text(lang, "config_import_error"))
+
+    # --- ERROR CONSOLE SYNC ---
+    # Check DataManager for new errors and log them to browser
+    if st.session_state.get('data_manager'): # Use .get() for safety
+        dm = st.session_state.data_manager
+        with dm.lock:
+            current_log_count = len(dm.error_log)
+            if current_log_count > st.session_state.last_console_log_count:
+                # Log new errors
+                for i in range(st.session_state.last_console_log_count, current_log_count):
+                    log_to_console(dm.error_log[i])
+                
+                # Update tracker
+                st.session_state.last_console_log_count = current_log_count
 
 # --- MAIN LOGIC ---
 if not st.session_state.api_client:
@@ -953,6 +984,18 @@ else:
                         card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
                         
                         st.write("---")
+                        c_adm1, c_adm2 = st.columns(2)
+                        with c_adm1:
+                            if st.button("🔄 Restart Engine", key=f"rst_{card['id']}", help="Restarts the application process"):
+                                log_to_console("Restarting application...", level="warn")
+                                pytime.sleep(1)
+                                os._exit(1) # Exit code 1 triggers restart in run_app.py
+                        with c_adm2:
+                            if st.button("🛑 Stop App", key=f"stp_{card['id']}", help="Terminates the application"):
+                                log_to_console("Stopping application...", level="error")
+                                pytime.sleep(1)
+                                os._exit(0) # Exit code 0 triggers break in run_app.py
+                        
                         st.caption("📡 Canlı Metrikler")
                         card['live_metrics'] = st.multiselect("Live Metrics", LIVE_METRIC_OPTIONS, default=card.get('live_metrics', ["Waiting", "Interacting", "On Queue"]), format_func=lambda x: live_labels.get(x, x), key=f"lm_{card['id']}")
                         

@@ -61,11 +61,22 @@ class DataManager:
         self.stop_event.set()
         if self.thread:
             self.thread.join()
+        
+    def _log_error(self, message):
+        with self.lock:
+            self.error_log.append(f"{datetime.now().strftime('%H:%M:%S')} - {message}")
+            # Keep log size manageable
+            if len(self.error_log) > 50:
+                self.error_log.pop(0)
 
     def update_api_client(self, api_client, presence_map=None):
-        self.api = GenesysAPI(api_client)
-        if presence_map:
-            self.presence_map = presence_map
+        try:
+            self.api = GenesysAPI(api_client)
+            if presence_map:
+                self.presence_map = presence_map
+        except Exception as e:
+            self._log_error(f"API Client Update Error: {str(e)}")
+            print(f"Error updating API client: {e}")
 
     def _update_loop(self):
         while not self.stop_event.is_set():
@@ -73,7 +84,9 @@ class DataManager:
                 try:
                     self._fetch_all_data()
                 except Exception as e:
-                    print(f"DataManager Error: {e}")
+                    self._log_error(f"Global Update Error: {str(e)}")
+                    print(f"Global Update Error: {e}")
+                    time.sleep(30) # Wait bit longer on error
             
             # Wait for 10 seconds before next update
             time.sleep(10)
@@ -127,6 +140,7 @@ class DataManager:
                     # Record even if empty to prevent infinite retry
                     new_cache[q_id] = processed
                 except Exception as e:
+                    self._log_error(f"Error fetching members for {q_id}: {str(e)}")
                     print(f"DataManager: Error fetching members for {q_id}: {e}")
             self.queue_members_cache = new_cache
             self.last_member_refresh = current_time
@@ -165,7 +179,8 @@ class DataManager:
 
                     status_map[u_id] = {'presence': final_pres, 'routingStatus': final_rout}
             except Exception as e:
-                print(f"DataManager: Error fetching bulk status: {e}")
+                self._log_error(f"User Scan Error: {str(e)}")
+                print(f"Error updating users: {e}")
             
         # Reconstruct detail cache
         temp_cache = {}

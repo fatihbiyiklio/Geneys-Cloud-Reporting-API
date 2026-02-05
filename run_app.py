@@ -51,16 +51,33 @@ if __name__ == "__main__":
     check_single_instance()
     app_path = resolve_path("app.py")
     
-    # Simulate: streamlit run app.py
-    sys.argv = [
-        "streamlit",
-        "run",
-        app_path,
-        "--server.port=8501",
-        "--server.address=localhost",
-        "--server.headless=true",
-        "--global.developmentMode=false",
-    ]
+    # Launch Streamlit in a loop for auto-restart
+    print("🚀 Starting Genesys Reporting App...")
     
-    # Launch Streamlit
-    sys.exit(stcli.main())
+    while True:
+        try:
+            # subprocess.call returns the exit code
+            # We use sys.executable to ensure we use the same Python interpreter
+            cmd = [sys.executable, "-m", "streamlit", "run", app_path, 
+                  "--server.port=8501", "--server.address=localhost", 
+                  "--server.headless=true", "--global.developmentMode=false"]
+            
+            # Using stcli directly in same process allows simple pyinstaller build but harder restart
+            # Switching to subprocess for robust isolation and restart capability
+            import subprocess
+            exit_code = subprocess.call(cmd)
+            
+            if exit_code == 0:
+                print("🛑 Application stopped gracefully (Exit Code 0).")
+                break
+            else:
+                print(f"⚠️ Application exited with code {exit_code}. Restarting in 1 second...")
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n👋 Manual interruption. Exiting...")
+            break
+        except Exception as e:
+            print(f"❌ Fatal Error in wrapper: {e}")
+            time.sleep(5)
+            
+    sys.exit(0)
