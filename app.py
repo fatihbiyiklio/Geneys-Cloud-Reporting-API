@@ -943,7 +943,8 @@ else:
                 c_height = 500 if c_size == 'small' else (650 if c_size == 'medium' else 800)
                 
                 with st.container(height=c_height, border=True):
-                    st.markdown(f"### {card['title'] or f'Grup #{card["id"]+1}'}")
+                    card_title = card['title'] if card['title'] else f"Grup #{card['id']+1}"
+                    st.markdown(f"### {card_title}")
                     with st.expander(f"⚙️ Settings", expanded=False):
                         card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
                         card['size'] = st.selectbox("Size", ["small", "medium", "large"], index=["small", "medium", "large"].index(card.get('size', 'medium')), key=f"sz_{card['id']}")
