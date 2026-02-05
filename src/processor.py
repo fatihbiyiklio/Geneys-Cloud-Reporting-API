@@ -246,7 +246,7 @@ def process_observations(resp, id_map, presence_map=None):
                     "OnQueueIdle": 0, 
                     "OnQueueInteracting": 0, 
                     "ActiveUsers": 0,
-                    "Presences": {"Available": 0, "Busy": 0, "Away": 0, "Offline": 0, "On Queue": 0}
+                    "Presences": {"Available": 0, "Busy": 0, "Away": 0, "Offline": 0, "On Queue": 0, "Meal": 0, "Break": 0, "Meeting": 0, "Training": 0}
                 } 
                 for k, v in id_map.items()}
 
@@ -290,8 +290,12 @@ def process_observations(resp, id_map, presence_map=None):
                         
                     q_lower = mapped_qualifier.lower()
                     if "available" in q_lower: row["Presences"]["Available"] += val
-                    elif "busy" in q_lower or "meeting" in q_lower or "do not disturb" in q_lower: row["Presences"]["Busy"] += val
-                    elif "away" in q_lower or "break" in q_lower or "meal" in q_lower: row["Presences"]["Away"] += val
+                    elif "break" in q_lower: row["Presences"]["Break"] += val
+                    elif "meal" in q_lower: row["Presences"]["Meal"] += val
+                    elif "meeting" in q_lower: row["Presences"]["Meeting"] += val
+                    elif "training" in q_lower: row["Presences"]["Training"] += val
+                    elif "busy" in q_lower or "do not disturb" in q_lower: row["Presences"]["Busy"] += val
+                    elif "away" in q_lower: row["Presences"]["Away"] += val
                     elif "offline" in q_lower: row["Presences"]["Offline"] += val
                     elif "on queue" in q_lower or "onqueue" in q_lower: row["Presences"]["On Queue"] += val
             

@@ -104,20 +104,19 @@ class DataManager:
         # 3. Agent Details (Live Status) - SELECTIVE OPTIMIZATION
         current_time = time.time()
         
-        # Refresh membership cache every 30 mins, or every 1 min if incomplete/empty
-        has_empty_cache = any(len(self.queue_members_cache.get(q_id, [])) == 0 for q_id in agent_q_ids)
+        # Refresh membership cache every 30 mins (1800s)
+        # Only retry quickly (60s) if we are strictly missing data for a queue
         missing_some = any(q_id not in self.queue_members_cache for q_id in agent_q_ids)
-        refresh_threshold = 60 if (missing_some or has_empty_cache) else 1800
+        refresh_threshold = 60 if missing_some else 1800
         
         if (current_time - self.last_member_refresh > refresh_threshold) and agent_q_ids:
             new_cache = self.queue_members_cache.copy()
             for q_id in agent_q_ids:
                 try:
-                    time.sleep(0.1) 
+                    # Removed artificial sleep to prevent stalling
                     mems = self.api.get_queue_members(q_id)
-                    print(f"DataManager: Queue {q_id} has {len(mems)} members")
-                    if mems:
-                        print(f"DataManager: First member type/keys for {q_id}: {type(mems[0])} - {mems[0].keys()}")
+                    # Removed verbose logging
+                    
                     processed = []
                     for m in mems:
                         u = m.get('user', {})

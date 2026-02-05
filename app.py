@@ -234,7 +234,7 @@ def create_gauge_chart(value, title, height=250):
         mode = "gauge+number", value = value, title = {'text': title},
         gauge = {'axis': {'range': [0, 100]}, 'bar': {'color': "#00AEC7"},
                  'steps': [{'range': [0, 50], 'color': "#ffebee"}, {'range': [50, 80], 'color': "#fff3e0"}, {'range': [80, 100], 'color': "#e8f5e9"}]}))
-    fig.update_layout(height=height, margin=dict(l=20, r=20, t=50, b=20))
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=50, b=10), autosize=True)
     return fig
 
 def create_donut_chart(data_dict, title, height=300):
@@ -830,10 +830,25 @@ else:
             col1.write(f"**{uname}**")
             col2.write(f"Rol: {udata['role']}")
             col3.write(f"Metrikler: {', '.join(udata['metrics']) if udata['metrics'] else 'Hepsi'}")
-            if uname != "admin": # Don't delete self
-                if col4.button("Sil", key=f"del_user_{uname}"):
-                    auth_manager.delete_user(uname)
-                    st.rerun()
+            
+            # Action Buttons Column
+            with col4:
+                if uname != "admin": # Don't delete self
+                    if st.button("🗑️", key=f"del_user_{uname}", help="Kullanıcıyı Sil"):
+                        auth_manager.delete_user(uname)
+                        st.rerun()
+            
+            # Password Reset Section
+            with st.expander(f"🔑 Şifre Sıfırla: {uname}"):
+                with st.form(key=f"reset_pw_form_{uname}"):
+                    new_reset_pw = st.text_input("Yeni Şifre", type="password", key=f"new_pw_{uname}")
+                    if st.form_submit_button("Güncelle"):
+                        if new_reset_pw:
+                            success, msg = auth_manager.reset_password(uname, new_reset_pw)
+                            if success: st.success(msg)
+                            else: st.error(msg)
+                        else:
+                            st.warning("Lütfen yeni şifre girin.")
             st.write("---")
 
     else: # --- DASHBOARD ---
@@ -848,7 +863,7 @@ else:
         
         with c_c2:
             sc1, sc2 = st.columns([2, 3])
-            lo = sc1.radio("Layout", [1, 2, 3], format_func=lambda x: f"Grid: {x}", index=st.session_state.dashboard_layout-1, horizontal=True, label_visibility="collapsed")
+            lo = sc1.radio("Layout", [1, 2, 3, 4], format_func=lambda x: f"Grid: {x}", index=min(st.session_state.dashboard_layout-1, 3), horizontal=True, label_visibility="collapsed")
             if lo != st.session_state.dashboard_layout:
                 st.session_state.dashboard_layout = lo; save_dashboard_config(lo, st.session_state.dashboard_cards); st.rerun()
             m_opts = ["Live", "Yesterday", "Date"]
@@ -878,9 +893,9 @@ else:
                     agent_queues_map = {}
                     for card in st.session_state.dashboard_cards:
                         if card.get('queues'):
-                            q_name = card['queues'][0]
-                            q_id = st.session_state.queues_map.get(q_name)
-                            if q_id: agent_queues_map[q_name] = q_id
+                            for q_name in card['queues']: # Monitor ALL selected queues
+                                q_id = st.session_state.queues_map.get(q_name)
+                                if q_id: agent_queues_map[q_name] = q_id
                     
                     data_manager.start(st.session_state.queues_map, agent_queues_map)
                 
@@ -922,10 +937,17 @@ else:
         to_del = []
         for idx, card in enumerate(st.session_state.dashboard_cards):
             with grid[idx % st.session_state.dashboard_layout]:
-                with st.container(border=True):
+                # Determine Container Height based on size
+                c_size = card.get('size', 'medium')
+                # Base heights: Small=500, Medium=650, Large=800 (Adjusted for content)
+                c_height = 500 if c_size == 'small' else (650 if c_size == 'medium' else 800)
+                
+                with st.container(height=c_height, border=True):
                     st.markdown(f"### {card['title'] or f'Grup #{card['id']+1}'}")
                     with st.expander(f"⚙️ Settings", expanded=False):
                         card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
+                        card['size'] = st.selectbox("Size", ["small", "medium", "large"], index=["small", "medium", "large"].index(card.get('size', 'medium')), key=f"sz_{card['id']}")
+                        card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Live Status (Donut)", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
                         card['queues'] = st.multiselect("Queues", list(st.session_state.queues_map.keys()), default=card.get('queues', []), key=f"q_{card['id']}")
                         card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
                         
@@ -1006,18 +1028,68 @@ else:
                     avg_wait = sum(d.get('AvgWait', 0) for d in items_daily) / len(items_daily) if items_daily else 0
                     
                     # Live metrics mapping
+                    # Live metrics mapping
+                    
+                    # 1. Fetch Agent Details for selected queues involved in this card
+                    card_agent_data = data_manager.get_agent_details(card['queues'])
+                    
+                    # 2. Flatten and Deduplicate Agents
+                    unique_agents = {}
+                    for q_agents in card_agent_data.values():
+                        for agent in q_agents:
+                            unique_agents[agent['id']] = agent
+                            
+                    # 3. Calculate Counts from Unique Agents
+                    cnt_interacting = 0
+                    cnt_idle = 0
+                    cnt_on_queue = 0
+                    cnt_available = 0
+                    cnt_busy = 0
+                    cnt_away = 0
+                    cnt_break = 0
+                    cnt_meal = 0
+                    cnt_meeting = 0
+                    cnt_training = 0
+                    
+                    for m in unique_agents.values():
+                        user_obj = m.get('user', {})
+                        presence = user_obj.get('presence', {}).get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
+                        routing = m.get('routingStatus', {}).get('status', 'OFF_QUEUE').upper()
+                        
+                        # Logic must match the status text logic we fixed earlier
+                        if presence == 'AVAILABLE':
+                            cnt_available += 1
+                        elif presence in ['ON_QUEUE', 'ON QUEUE']:
+                            # On Queue Logic
+                            if routing in ['INTERACTING', 'COMMUNICATING']:
+                                cnt_interacting += 1
+                                cnt_on_queue += 1 # Technically on queue
+                            elif routing == 'IDLE':
+                                cnt_idle += 1 # Ready
+                                cnt_on_queue += 1
+                            elif routing == 'NOT_RESPONDING':
+                                cnt_on_queue += 1 
+                            else:
+                                cnt_on_queue += 1
+                        elif presence == "BUSY": cnt_busy += 1
+                        elif presence == "AWAY": cnt_away += 1
+                        elif presence == "BREAK": cnt_break += 1
+                        elif presence == "MEAL": cnt_meal += 1
+                        elif presence == "MEETING": cnt_meeting += 1
+                        elif presence == "TRAINING": cnt_training += 1
+
                     live_values = {
                         "Waiting": sum(get_media_sum(d, 'Waiting') for d in items_live) if items_live else 0,
-                        "Interacting": round(sum(get_media_sum(d, 'Interacting') for d in items_live)/n_q) if items_live else 0,
-                        "Idle Agent": sum(d.get('OnQueueIdle', 0) for d in items_live) if items_live else 0,
-                        "On Queue": round(sum(d['Presences'].get('On Queue', 0) for d in items_live)/n_s) if items_live else 0,
-                        "Available": round(sum(d['Presences'].get('Available', 0) for d in items_live)/n_s) if items_live else 0,
-                        "Busy": round(sum(d['Presences'].get('Busy', 0) for d in items_live)/n_s) if items_live else 0,
-                        "Away": round(sum(d['Presences'].get('Away', 0) for d in items_live)/n_s) if items_live else 0,
-                        "Break": round(sum(d['Presences'].get('Break', 0) for d in items_live)/n_s) if items_live else 0,
-                        "Meal": round(sum(d['Presences'].get('Meal', 0) for d in items_live)/n_s) if items_live else 0,
-                        "Meeting": round(sum(d['Presences'].get('Meeting', 0) for d in items_live)/n_s) if items_live else 0,
-                        "Training": round(sum(d['Presences'].get('Training', 0) for d in items_live)/n_s) if items_live else 0,
+                        "Interacting": cnt_interacting,
+                        "Idle Agent": cnt_idle,
+                        "On Queue": cnt_on_queue,
+                        "Available": cnt_available,
+                        "Busy": cnt_busy,
+                        "Away": cnt_away,
+                        "Break": cnt_break,
+                        "Meal": cnt_meal,
+                        "Meeting": cnt_meeting,
+                        "Training": cnt_training,
                     }
                     
                     # Daily metrics mapping
@@ -1044,7 +1116,7 @@ else:
                                     cols[j].metric(live_labels.get(metric, metric), live_values.get(metric, 0))
                         
                         # Show daily summary below live (Today's stats)
-                        st.divider()
+                        # Show daily summary below live (Today's stats)
                         st.caption(f"📅 Bugünün Özeti")
                         sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
                         if sel_daily:
@@ -1055,9 +1127,32 @@ else:
                                 for j, metric in enumerate(batch):
                                     cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
                         
-                        # Always show gauge for Service Level at the bottom
-                        gauge_size = 180 if card['size'] == 'small' else (200 if card['size'] == 'medium' else 250)
-                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), width='stretch', key=f"g_{card['id']}")
+                        # Render selected visuals
+                        visuals = card.get('visual_metrics', ["Service Level"])
+                        # Dynamic Height: Smaller if multiple visuals to fit side-by-side without overflowing vertically if wrapped (though we will use cols)
+                        # Actually if side-by-side, we can keep reasonable height but maybe separate row if too many?
+                        # For now, put them all in one row.
+                        base_h = 130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190)
+                        # If multiple, potentially reduce slightly or keep same? User said "too big".
+                        # Let's trust the reduced base_h.
+                        
+                        panel_key_suffix = "open" if st.session_state.get('show_agent_panel', False) else "closed"
+
+                        if visuals:
+                            cols = st.columns(len(visuals))
+                            for idx, vis in enumerate(visuals):
+                                with cols[idx]:
+                                    if vis == "Service Level":
+                                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
+                                    elif vis == "Live Status (Donut)":
+                                        donut_data = {"Waiting": live_values.get("Waiting", 0), "Interacting": live_values.get("Interacting", 0), "On Queue": live_values.get("On Queue", 0)}
+                                        st.plotly_chart(create_donut_chart(donut_data, "Live Status", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"d_live_{card['id']}_{panel_key_suffix}")
+                                    elif vis == "Answer Rate":
+                                        ar_val = float(daily_values.get("Answer Rate", "0").replace('%', ''))
+                                        st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
+                                    elif vis == "Abandon Rate":
+                                        ab_val = float(daily_values.get("Abandon Rate", "0").replace('%', ''))
+                                        st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
                     
                     else:
                         # Historical mode (Yesterday/Date) - show daily stats with gauge
@@ -1073,9 +1168,26 @@ else:
                                 for j, metric in enumerate(batch):
                                     cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
                         
-                        # Then show gauge
-                        gauge_size = 180 if card['size'] == 'small' else (250 if card['size'] == 'medium' else 300)
-                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), gauge_size), width='stretch', key=f"g_{card['id']}")
+                        # Render selected visuals
+                        visuals = card.get('visual_metrics', ["Service Level"])
+                        base_h = 130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190)
+                        panel_key_suffix = "open" if st.session_state.get('show_agent_panel', False) else "closed"
+
+                        if visuals:
+                            cols = st.columns(len(visuals))
+                            for idx, vis in enumerate(visuals):
+                                with cols[idx]:
+                                    if vis == "Service Level":
+                                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
+                                    elif vis == "Live Status (Donut)": 
+                                        donut_data = {"Answered": daily_values.get("Answered", 0), "Abandoned": daily_values.get("Abandoned", 0)}
+                                        st.plotly_chart(create_donut_chart(donut_data, "Daily Status", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"d_hist_{card['id']}_{panel_key_suffix}")
+                                    elif vis == "Answer Rate":
+                                        ar_val = float(daily_values.get("Answer Rate", "0").replace('%', ''))
+                                        st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
+                                    elif vis == "Abandon Rate":
+                                        ab_val = float(daily_values.get("Abandon Rate", "0").replace('%', ''))
+                                        st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
 
         if to_del:
             for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]
@@ -1212,40 +1324,49 @@ else:
                                 filtered_mems.append(m)
                         
                         # Define Sorting Priority
-                        # on queu, Available, Meal, break, busy,meeting,training ve offline
+                        # Custom Order: Break, Meal, On Queue, Available
                         def get_sort_score(m):
-                            # Extract presence and routing status from the agent object
                             user_obj = m.get('user', {})
                             presence_obj = user_obj.get('presence', {})
                             p = presence_obj.get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
                             routing_obj = m.get('routingStatus', {})
                             rs = routing_obj.get('status', 'OFF_QUEUE').upper()
                             
-                            # CRITICAL FIX: Offline users must ALWAYS act as offline, regardless of routing status
-                            if p == 'OFFLINE':
-                                return 99
+                            # Calculate Duration (Secondary Sort - Descending)
+                            # We want longest duration first, so we use negative total seconds
+                            start_str = routing_obj.get('startTime') # Routing time has precedence for On Queue
+                            if not start_str or rs == 'OFF_QUEUE': # Use presence time if not on queue routing
+                                start_str = presence_obj.get('modifiedDate')
+                            
+                            try:
+                                if start_str:
+                                    # Normalize Z to +00:00 for fromisoformat (Python 3.11+ handles Z, but safe bet)
+                                    start_str = start_str.replace("Z", "+00:00")
+                                    start_dt = datetime.fromisoformat(start_str)
+                                    # Duration in seconds (larger is longer)
+                                    duration_sec = (datetime.now(timezone.utc) - start_dt).total_seconds()
+                                    neg_duration = -duration_sec
+                                else:
+                                    neg_duration = 0
+                            except:
+                                neg_duration = 0
 
-                            # Routing statuses essentially map to "On Queue" priority
-                            if rs in ['INTERACTING', 'COMMUNICATING', 'IDLE', 'NOT_RESPONDING']:
-                                return 0 # Highest priority for agents actively on queue or interacting
+                            # Priority Scores (Lower is higher in list)
+                            score = 10 # Default
                             
-                            p_map = {
-                                "ON QUEUE": 0, # Should be covered by routing status, but as a fallback
-                                "ON_QUEUE": 0,
-                                "AVAILABLE": 1,
-                                "MEAL": 2,
-                                "BREAK": 3,
-                                "BUSY": 4,
-                                "MEETING": 5,
-                                "TRAINING": 6,
-                                "OFFLINE": 99
-                            }
-                            # Check partial matches for unexpected system presences
-                            for key, score in p_map.items():
-                                if key in p: return score
+                            if p == 'OFFLINE': score = 99
+                            elif p == 'BREAK': score = 1
+                            elif p == 'MEAL': score = 2
+                            # On Queue Logic (includes Interacting, Idle, Not Responding)
+                            elif p in ['ON_QUEUE', 'ON QUEUE'] or rs in ['INTERACTING', 'COMMUNICATING', 'IDLE', 'NOT_RESPONDING']:
+                                score = 3
+                            elif p == 'AVAILABLE': score = 4
+                            elif p == 'BUSY': score = 5
+                            elif p == 'MEETING': score = 6
+                            elif p == 'TRAINING': score = 7
                             
-                            return 10 # Default for other statuses
-                            
+                            return (score, neg_duration)
+
                         # Sort members
                         all_members = list(filtered_mems) # Use filtered_mems here
                         all_members.sort(key=get_sort_score)
@@ -1270,18 +1391,28 @@ else:
                             label = presence_obj.get('presenceDefinition', {}).get('label')
                             status_text = label if label else presence.replace("_", " ").capitalize()
                             
-                            if presence in ["AVAILABLE", "ON QUEUE"]:
-                                if routing in ["IDLE", "OFF_QUEUE"]: 
-                                    dot_color = "#22c55e" # green
-                                    status_text = "Hazır" if presence == "AVAILABLE" else "Kuyrukta"
-                                elif routing in ["INTERACTING", "COMMUNICATING"]:
-                                    dot_color = "#3b82f6" # blue
-                                    status_text = "Görüşmede"
-                                elif routing == "NOT_RESPONDING":
-                                    dot_color = "#ef4444" # red
-                                    status_text = "Cevapsız"
-                                else:
-                                    dot_color = "#22c55e"
+                            # Genesys Standard Logic (Prioritize Routing)
+                            # 1. Routing Status takes precedence (Interacting, Idle)
+                            # 2. Presence is fallback (Available, Break, etc.)
+                            
+                            if routing in ["INTERACTING", "COMMUNICATING"]:
+                                dot_color = "#3b82f6" # blue
+                                status_text = "Görüşmede"
+                            elif routing == "IDLE":
+                                dot_color = "#22c55e" # green
+                                status_text = "On Queue" # User requested "On Queue"
+                            elif routing == "NOT_RESPONDING":
+                                dot_color = "#ef4444" # red
+                                status_text = "Cevapsız"
+                                
+                            elif presence == "AVAILABLE":
+                                dot_color = "#22c55e" # green
+                                status_text = "Müsait"
+                            elif presence in ["ON_QUEUE", "ON QUEUE"]:
+                                # Fallback if routing didn't catch it (e.g. transitioning)
+                                dot_color = "#22c55e" # green
+                                status_text = "On Queue"
+                                
                             elif presence == "BUSY":
                                 dot_color = "#ef4444"
                                 if not label: status_text = "Meşgul"

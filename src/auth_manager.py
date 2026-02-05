@@ -56,6 +56,14 @@ class AuthManager:
         self._save_users(self.users)
         return True, "User added successfully"
 
+    def reset_password(self, username, new_password):
+        if username not in self.users:
+            return False, "User not found"
+        
+        self.users[username]["password"] = self._hash_password(new_password)
+        self._save_users(self.users)
+        return True, "Password updated successfully"
+
     def delete_user(self, username):
         if username == "admin":
             return False, "Cannot delete default admin"
