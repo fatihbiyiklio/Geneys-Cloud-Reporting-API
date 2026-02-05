@@ -943,11 +943,11 @@ else:
                 c_height = 500 if c_size == 'small' else (650 if c_size == 'medium' else 800)
                 
                 with st.container(height=c_height, border=True):
-                    st.markdown(f"### {card['title'] or f'Grup #{card['id']+1}'}")
+                    st.markdown(f"### {card['title'] or f'Grup #{card["id"]+1}'}")
                     with st.expander(f"⚙️ Settings", expanded=False):
                         card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
                         card['size'] = st.selectbox("Size", ["small", "medium", "large"], index=["small", "medium", "large"].index(card.get('size', 'medium')), key=f"sz_{card['id']}")
-                        card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Live Status (Donut)", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
+                        card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
                         card['queues'] = st.multiselect("Queues", list(st.session_state.queues_map.keys()), default=card.get('queues', []), key=f"q_{card['id']}")
                         card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
                         
@@ -1144,9 +1144,6 @@ else:
                                 with cols[idx]:
                                     if vis == "Service Level":
                                         st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
-                                    elif vis == "Live Status (Donut)":
-                                        donut_data = {"Waiting": live_values.get("Waiting", 0), "Interacting": live_values.get("Interacting", 0), "On Queue": live_values.get("On Queue", 0)}
-                                        st.plotly_chart(create_donut_chart(donut_data, "Live Status", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"d_live_{card['id']}_{panel_key_suffix}")
                                     elif vis == "Answer Rate":
                                         ar_val = float(daily_values.get("Answer Rate", "0").replace('%', ''))
                                         st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
@@ -1179,9 +1176,6 @@ else:
                                 with cols[idx]:
                                     if vis == "Service Level":
                                         st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
-                                    elif vis == "Live Status (Donut)": 
-                                        donut_data = {"Answered": daily_values.get("Answered", 0), "Abandoned": daily_values.get("Abandoned", 0)}
-                                        st.plotly_chart(create_donut_chart(donut_data, "Daily Status", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"d_hist_{card['id']}_{panel_key_suffix}")
                                     elif vis == "Answer Rate":
                                         ar_val = float(daily_values.get("Answer Rate", "0").replace('%', ''))
                                         st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")

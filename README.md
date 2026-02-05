@@ -53,6 +53,40 @@ GitHub Actions üzerinden her sürüm için otomatik olarak **Linux** bin ve **W
 
 ---
 
-## 🔒 Güvenlik
+## � Uygulama Akışı
+Aşağıdaki diyagram, uygulamanın veri akışını ve bileşenler arasındaki ilişkiyi göstermektedir.
+
+```mermaid
+graph TD
+    User([Kullanıcı / Admin]) -->|Erişim| App[App.py (Streamlit UI)]
+    
+    subgraph "🔐 Kimlik Doğrulama"
+        App -->|Login| Auth[AuthManager]
+        Auth -->|Doğrulama| EncCreds[(Credentials.enc)]
+        Auth -.->|Başarılı| Session[Session State]
+    end
+    
+    subgraph "⚙️ Veri Yönetimi (Backend)"
+        App -->|Başlatır| DM[DataManager]
+        DM -->|Arka Plan Thread| UpdateLoop[Update Loop]
+        UpdateLoop -->|API İsteği| API{Genesys Cloud API}
+        API -->|JSON Yanıt| Cache[(Local Memory Cache)]
+    end
+    
+    subgraph "📊 Görselleştirme"
+        App -->|Veri Okur| Cache
+        App -->|Render| Dashboard[Canlı Dashboard]
+        App -->|Render| Report[Raporlama Paneli]
+        Dashboard -->|Gösterir| Metrics[Anlık Kuyruk/Agent Verisi]
+    end
+
+    style App fill:#f9f,stroke:#333,stroke-width:2px
+    style API fill:#bbf,stroke:#333,stroke-width:2px
+    style Cache fill:#dfd,stroke:#333,stroke-width:2px
+```
+
+---
+
+## �🔒 Güvenlik
 Uygulama, ilk girişte bir `.secret.key` dosyası oluşturur. `credentials.enc` dosyası bu anahtar ile şifrelenir. 
 > **Önemli:** Eğer sunucu değiştirirseniz veya dosyaları taşırsanız, her iki dosyayı da birlikte taşımanız gerekir.
