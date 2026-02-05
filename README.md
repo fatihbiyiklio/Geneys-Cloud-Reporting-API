@@ -58,11 +58,11 @@ Aşağıdaki diyagram, uygulamanın veri akışını ve bileşenler arasındaki 
 
 ```mermaid
 graph TD
-    User([Kullanıcı / Admin]) -->|Erişim| App[App.py (Streamlit UI)]
+    User([Kullanıcı / Admin]) -->|Erişim| App["App.py (Streamlit UI)"]
     
     subgraph "🔐 Kimlik Doğrulama"
         App -->|Login| Auth[AuthManager]
-        Auth -->|Doğrulama| EncCreds[(Credentials.enc)]
+        Auth -->|Doğrulama| EncCreds[("Credentials.enc")]
         Auth -.->|Başarılı| Session[Session State]
     end
     
@@ -70,7 +70,7 @@ graph TD
         App -->|Başlatır| DM[DataManager]
         DM -->|Arka Plan Thread| UpdateLoop[Update Loop]
         UpdateLoop -->|API İsteği| API{Genesys Cloud API}
-        API -->|JSON Yanıt| Cache[(Local Memory Cache)]
+        API -->|JSON Yanıt| Cache[("Local Memory Cache")]
     end
     
     subgraph "📊 Görselleştirme"
