@@ -79,7 +79,7 @@ def process_daily_stats(response, lookup_map):
     
     return stats
 
-def process_analytics_response(response, lookup_map, report_type, queue_map=None):
+def process_analytics_response(response, lookup_map, report_type, queue_map=None, utc_offset=3):
     """Processes dictionary-based analytics response into DataFrame."""
     data = []
     if not response or 'results' not in response:
@@ -116,7 +116,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 try:
                     start_str = raw_interval.split('/')[0].replace('Z', '')
                     dt_utc = datetime.fromisoformat(start_str)
-                    dt_local = dt_utc + timedelta(hours=3)
+                    dt_local = dt_utc + timedelta(hours=utc_offset)
                     row["Interval"] = dt_local.strftime("%Y-%m-%d %H:%M")
                 except:
                     row["Interval"] = raw_interval
@@ -380,7 +380,7 @@ def process_user_aggregates(resp, presence_map=None):
         results[user_id] = user_data
     return results
 
-def process_user_details(resp):
+def process_user_details(resp, utc_offset=3):
     """Processes user details to find first login and last logout of the period."""
     results = {}
     if not resp or 'userDetails' not in resp:
@@ -406,7 +406,7 @@ def process_user_details(resp):
                 if not utc_str: return "N/A"
                 try:
                     dt = datetime.fromisoformat(utc_str.replace('Z', ''))
-                    dt_local = dt + timedelta(hours=3)
+                    dt_local = dt + timedelta(hours=utc_offset)
                     return dt_local.strftime("%H:%M:%S")
                 except:
                     return "N/A"
@@ -420,7 +420,7 @@ def process_user_details(resp):
             
     return results
 
-def process_conversation_details(response, user_map=None, queue_map=None, wrapup_map=None, include_attributes=False):
+def process_conversation_details(response, user_map=None, queue_map=None, wrapup_map=None, include_attributes=False, utc_offset=3):
     """Flattens conversation detail JSON into a DataFrame."""
     rows = []
     if not response or 'conversations' not in response:
@@ -430,7 +430,7 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
         if not iso_str: return ""
         try:
             dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
-            return (dt + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+            return (dt + timedelta(hours=utc_offset)).strftime("%Y-%m-%d %H:%M:%S")
         except: return iso_str
 
     def sec_to_hms(seconds):
@@ -675,4 +675,63 @@ def to_excel(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Report')
+    return output.getvalue()
+
+def to_csv(df):
+    from io import StringIO
+    output = StringIO()
+    df.to_csv(output, index=False)
+    return output.getvalue().encode("utf-8")
+
+def to_parquet(df):
+    from io import BytesIO
+    output = BytesIO()
+    df.to_parquet(output, index=False)
+    return output.getvalue()
+
+def to_pdf(df, title="Report"):
+    from io import BytesIO
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import os
+
+    # Try to load a font that supports Turkish characters
+    font_name = "Helvetica"
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:\\\\Windows\\\\Fonts\\\\arial.ttf",
+        "C:\\\\Windows\\\\Fonts\\\\segoeui.ttf",
+    ]
+    for fp in font_paths:
+        if os.path.exists(fp):
+            try:
+                pdfmetrics.registerFont(TTFont("UnicodeFont", fp))
+                font_name = "UnicodeFont"
+                break
+            except Exception:
+                pass
+
+    output = BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=landscape(letter))
+    styles = getSampleStyleSheet()
+    styles["Heading2"].fontName = font_name
+    elements = [Paragraph(title, styles['Heading2']), Spacer(1, 12)]
+
+    data = [list(df.columns)] + df.values.tolist()
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), font_name),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f5f9")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e2e8f0")),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+    ]))
+    elements.append(table)
+    doc.build(elements)
     return output.getvalue()

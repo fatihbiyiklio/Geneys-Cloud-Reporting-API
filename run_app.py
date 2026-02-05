@@ -49,6 +49,8 @@ def check_single_instance():
 
 if __name__ == "__main__":
     import psutil
+
+    app_path = resolve_path("app.py")
     
     def kill_proc_on_port(port):
         """Finds and kills any process using the specified port."""

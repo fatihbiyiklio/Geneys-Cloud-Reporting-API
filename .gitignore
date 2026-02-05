@@ -11,6 +11,13 @@ venv/
 credentials.enc
 .secret.key
 .session.enc
+logs/
+orgs/
+.app.pid
+*.pid
+*.log
+.genesys_logged_out
+.dm_disabled
 .streamlit/secrets.toml
 users.json
 dashboard_config.json

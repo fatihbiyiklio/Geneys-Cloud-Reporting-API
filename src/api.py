@@ -1,5 +1,5 @@
-import requests
 from datetime import datetime, timezone, timedelta
+from src.monitor import monitor
 
 class GenesysAPI:
     def __init__(self, auth_data):
@@ -11,27 +11,37 @@ class GenesysAPI:
         }
 
     def _get(self, path, params=None):
+        import requests
+        monitor.log_api_call(path)
         try:
             response = requests.get(f"{self.api_host}{path}", headers=self.headers, params=params, timeout=10)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
+            monitor.log_error("API_GET", f"HTTP {response.status_code} on {path}", str(e))
             if response.status_code == 401:
                 print("⚠️ Token expired (401). Should trigger re-auth here.")
-                # For now, we rely on the app restart or future re-auth logic
-                # Ideally: self.refresh_token() and retry
                 raise e 
+            raise e
+        except Exception as e:
+            monitor.log_error("API_GET", f"System Error on {path}", str(e))
             raise e
 
     def _post(self, path, data):
+        import requests
+        monitor.log_api_call(path)
         try:
             response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
+            monitor.log_error("API_POST", f"HTTP {response.status_code} on {path}", str(e))
             if response.status_code == 401:
                  print("⚠️ Token expired (401) on POST.")
                  raise e
+            raise e
+        except Exception as e:
+            monitor.log_error("API_POST", f"System Error on {path}", str(e))
             raise e
     
     # ... (other methods remain unchanged) ...
@@ -511,7 +521,7 @@ class GenesysAPI:
         except Exception as e:
             print(f"Error fetching queue members for {queue_id}: {e}")
         return members
-    def get_users_status_scan(self, ignored_user_ids=None):
+    def get_users_status_scan(self, target_user_ids=None, ignored_user_ids=None):
         """
         Scans for ALL users and their statuses using standard User List API.
         Verified: GET /api/v2/users?expand=presence,routingStatus provides REAL-TIME data.
@@ -519,6 +529,8 @@ class GenesysAPI:
         """
         presence_map = {}
         routing_map = {}
+        target_user_ids = set(target_user_ids or [])
+        remaining = set(target_user_ids)
         
         page_number = 1
         while True:
@@ -529,13 +541,19 @@ class GenesysAPI:
                 if 'entities' in data:
                     for user in data['entities']:
                         uid = user.get('id')
+                        if target_user_ids and uid not in target_user_ids:
+                            continue
                         # Extract expanded data directly
                         if 'presence' in user:
                             presence_map[uid] = user['presence']
                         if 'routingStatus' in user:
                             routing_map[uid] = user['routingStatus']
+                        if target_user_ids and uid in remaining:
+                            remaining.discard(uid)
                             
                     if not data['entities'] or not data.get('nextUri'):
+                        break
+                    if target_user_ids and not remaining:
                         break
                     page_number += 1
                 else:

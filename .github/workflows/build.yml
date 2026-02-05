@@ -15,7 +15,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-20.04, windows-latest]
 
     steps:
     - uses: actions/checkout@v4
@@ -39,27 +39,64 @@ jobs:
           --collect-all streamlit `
           --collect-all streamlit_autorefresh `
           --collect-all cryptography `
+          --collect-all pyarrow `
+          --collect-all reportlab `
           --add-data "app.py;." `
           --add-data "src;src" `
-          --add-data "dashboard_config.json;." `
-          --add-data "presets.json;." `
           run_app.py
 
     - name: Build with PyInstaller (Linux)
-      if: matrix.os == 'ubuntu-latest'
+      if: matrix.os == 'ubuntu-20.04'
       run: |
         pyinstaller --onefile --name "applinux" \
           --collect-all streamlit \
           --collect-all streamlit_autorefresh \
           --collect-all cryptography \
+          --collect-all pyarrow \
+          --collect-all reportlab \
           --add-data "app.py:." \
           --add-data "src:src" \
-          --add-data "dashboard_config.json:." \
-          --add-data "presets.json:." \
           run_app.py
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: GenesysReporting-${{ matrix.os }}
+        path: dist/
+
+  build-debian:
+    name: Build for Debian (bookworm)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install system deps
+      run: |
+        apt-get update
+        apt-get install -y python3 python3-pip python3-venv git build-essential libglib2.0-0 libgl1 fontconfig
+
+    - name: Install dependencies
+      run: |
+        python3 -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Build with PyInstaller (Debian)
+      run: |
+        pyinstaller --onefile --name "appdebian" \
+          --collect-all streamlit \
+          --collect-all streamlit_autorefresh \
+          --collect-all cryptography \
+          --collect-all pyarrow \
+          --collect-all reportlab \
+          --add-data "app.py:." \
+          --add-data "src:src" \
+          run_app.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: GenesysReporting-debian
         path: dist/
