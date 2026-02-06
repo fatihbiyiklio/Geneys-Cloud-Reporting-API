@@ -6,11 +6,13 @@ import plotly.express as px
 from datetime import datetime, timedelta, time, timezone
 import sys
 import os
+import shutil
 import logging
 import atexit
 import json
 import time as pytime
 import threading
+import uuid
 import signal
 import traceback
 from streamlit_autorefresh import st_autorefresh
@@ -75,6 +77,7 @@ from src.processor import process_analytics_response, to_excel, to_csv, to_parqu
 API_CALLS_LOG_PATH = os.path.join("logs", "api_calls.jsonl")
 API_CALLS_LOG_TAIL_LINES = 50000
 API_CALLS_LOG_TAIL_BYTES = 10 * 1024 * 1024
+SESSION_TTL_SECONDS = 120
 
 def _read_tail_lines(path, max_lines=API_CALLS_LOG_TAIL_LINES, max_bytes=API_CALLS_LOG_TAIL_BYTES):
     try:
@@ -314,20 +317,9 @@ def delete_credentials(org_code):
 
 def delete_org_files(org_code):
     org_path = os.path.join(ORG_BASE_DIR, org_code)
-    files = [
-        os.path.join(org_path, CREDENTIALS_FILE),
-        os.path.join(org_path, CONFIG_FILE),
-        os.path.join(org_path, PRESETS_FILE),
-    ]
-    for f in files:
-        if os.path.exists(f):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
     try:
-        if os.path.isdir(org_path) and not os.listdir(org_path):
-            os.rmdir(org_path)
+        if os.path.isdir(org_path):
+            shutil.rmtree(org_path, ignore_errors=True)
     except Exception:
         pass
 
@@ -435,6 +427,65 @@ def _get_dm_store():
         store["data"] = {}
     return store
 
+@st.cache_resource(show_spinner=False)
+def _shared_org_session_store():
+    return {"lock": threading.Lock(), "orgs": {}}
+
+def _get_session_id():
+    if "_session_id" not in st.session_state:
+        st.session_state._session_id = str(uuid.uuid4())
+    return st.session_state._session_id
+
+def _register_org_session_queues(org_code, queues_map, agent_queues_map):
+    store = _shared_org_session_store()
+    now = pytime.time()
+    session_id = _get_session_id()
+    with store["lock"]:
+        org = store["orgs"].setdefault(org_code, {"sessions": {}})
+        org["sessions"][session_id] = {
+            "ts": now,
+            "queues": queues_map,
+            "agent_queues": agent_queues_map
+        }
+        # Prune stale sessions
+        stale = [sid for sid, s in org["sessions"].items() if now - s.get("ts", 0) > SESSION_TTL_SECONDS]
+        for sid in stale:
+            org["sessions"].pop(sid, None)
+        # Build union across active sessions
+        union_queues = {}
+        union_agent = {}
+        for s in org["sessions"].values():
+            union_queues.update(s.get("queues", {}))
+            union_agent.update(s.get("agent_queues", {}))
+        session_count = len(org["sessions"])
+    return union_queues, union_agent, session_count
+
+def _get_org_session_stats(org_code):
+    store = _shared_org_session_store()
+    now = pytime.time()
+    with store["lock"]:
+        org = store["orgs"].get(org_code, {"sessions": {}})
+        stale = [sid for sid, s in org["sessions"].items() if now - s.get("ts", 0) > SESSION_TTL_SECONDS]
+        for sid in stale:
+            org["sessions"].pop(sid, None)
+        union_queues = {}
+        union_agent = {}
+        for s in org["sessions"].values():
+            union_queues.update(s.get("queues", {}))
+            union_agent.update(s.get("agent_queues", {}))
+        return len(org["sessions"]), len(union_queues), len(union_agent)
+
+def _remove_org_session(org_code):
+    store = _shared_org_session_store()
+    session_id = st.session_state.get("_session_id")
+    if not session_id:
+        return
+    with store["lock"]:
+        org = store["orgs"].get(org_code)
+        if not org:
+            return
+        org["sessions"].pop(session_id, None)
+
 def get_shared_data_manager(org_code):
     store = _get_dm_store()
     with store["lock"]:
@@ -535,13 +586,16 @@ def refresh_data_manager_queues():
                     if len(agent_queues_map) < 50: # Safety Cap: Max 50 monitored queues for agents
                         agent_queues_map[primary_q] = p_id
     
+    # Register this session's queues and compute union across active sessions
+    union_queues, union_agent_queues, sess_count = _register_org_session_queues(org_code, all_dashboard_queues, agent_queues_map)
+    
     # DEBUG: Optimization Check
-    print(f"DEBUG: Refresh - Cards: {len(st.session_state.get('dashboard_cards', []))}, MetricQs: {len(all_dashboard_queues)}, AgentQs: {len(agent_queues_map)}")
+    print(f"DEBUG: Refresh - Cards: {len(st.session_state.get('dashboard_cards', []))}, MetricQs: {len(all_dashboard_queues)}, AgentQs: {len(agent_queues_map)}, ActiveSessions: {sess_count}, UnionMetricQs: {len(union_queues)}, UnionAgentQs: {len(union_agent_queues)}")
     
     # We use all_dashboard_queues for overall metrics (efficiency)
     # Pass empty dicts ({}) if empty, do NOT fall back to 'None' or full map
     st.session_state.data_manager.update_api_client(st.session_state.api_client, st.session_state.get('presence_map'))
-    st.session_state.data_manager.start(all_dashboard_queues, agent_queues_map)
+    st.session_state.data_manager.start(union_queues, union_agent_queues)
 
 def create_gauge_chart(value, title, height=250):
     try:
@@ -648,7 +702,7 @@ if not st.session_state.app_user:
             u_org = st.text_input(get_text(st.session_state.language, "org_code"), value="default")
             u_name = st.text_input(get_text(st.session_state.language, "username"))
             u_pass = st.text_input(get_text(st.session_state.language, "password"), type="password")
-            remember_me = st.checkbox(get_text(st.session_state.language, "remember_me"))
+            remember_me = st.checkbox(get_text(st.session_state.language, "remember_me"), value=False, disabled=True, help="Kalici oturum cihaz bazli devre disi.")
             
             if st.form_submit_button(get_text(st.session_state.language, "login"), width='stretch'):
                 user_data = auth_manager.authenticate(u_org, u_name, u_pass)
@@ -702,6 +756,10 @@ with st.sidebar:
     lang = st.session_state.language
     st.write(f"Hoş geldiniz, **{st.session_state.app_user['username']}** ({st.session_state.app_user['role']})")
     if st.button(get_text(lang, "logout_app"), type="secondary", width='stretch'):
+        try:
+            _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
+        except Exception:
+            pass
         st.session_state.app_user = None
         delete_app_session()
         st.rerun()
@@ -813,6 +871,8 @@ if page == get_text(lang, "menu_reports"):
     with c2:
         is_agent = r_type == "report_agent" 
         opts = list(st.session_state.users_map.keys()) if is_agent else list(st.session_state.queues_map.keys())
+        if "rep_nam" in st.session_state:
+            st.session_state.rep_nam = [n for n in st.session_state.rep_nam if n in opts]
         sel_names = st.multiselect(get_text(lang, "select_agents" if is_agent else "select_workgroups"), opts, key="rep_nam")
         sel_ids = [(st.session_state.users_map if is_agent else st.session_state.queues_map)[n] for n in sel_names]
 
@@ -1293,6 +1353,12 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                         if ok:
                             delete_org_files(del_org)
                             remove_shared_data_manager(del_org)
+                            try:
+                                store = _shared_org_session_store()
+                                with store["lock"]:
+                                    store["orgs"].pop(del_org, None)
+                            except Exception:
+                                pass
                             st.success(msg)
                             st.rerun()
                         else:
@@ -1317,12 +1383,14 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
     metric_q = len(dm.queues_map) if dm else 0
     agent_q = len(dm.agent_queues_map) if dm else 0
     last_upd = datetime.fromtimestamp(dm.last_update_time).strftime('%H:%M:%S') if dm and dm.last_update_time else "Never"
+    sess_count, union_metric_q, union_agent_q = _get_org_session_stats(org_sel)
     c_dm1, c_dm2, c_dm3, c_dm4 = st.columns(4)
     c_dm1.metric(get_text(lang, "organization"), org_sel)
     c_dm2.metric(get_text(lang, "org_dm_running"), "Yes" if running else "No")
     c_dm3.metric(get_text(lang, "org_dm_metric_queues"), metric_q)
     c_dm4.metric(get_text(lang, "org_dm_last_update"), last_upd)
     st.caption(get_text(lang, "org_dm_agent_queues") + f": {agent_q}")
+    st.caption(f"Aktif Oturum: {sess_count} | Birlesik MetricQ: {union_metric_q} | Birlesik AgentQ: {union_agent_q}")
     if org_sel != current_org and not running:
         st.info(get_text(lang, "org_dm_requires_session"))
     if org_sel == current_org and not st.session_state.get('api_client'):
@@ -1648,7 +1716,9 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
                     card['size'] = st.selectbox("Size", ["small", "medium", "large"], index=["small", "medium", "large"].index(card.get('size', 'medium')), key=f"sz_{card['id']}")
                     card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
-                    card['queues'] = st.multiselect("Queues", list(st.session_state.queues_map.keys()), default=card.get('queues', []), key=f"q_{card['id']}")
+                    queue_options = list(st.session_state.queues_map.keys())
+                    queue_defaults = [q for q in card.get('queues', []) if q in queue_options]
+                    card['queues'] = st.multiselect("Queues", queue_options, default=queue_defaults, key=f"q_{card['id']}")
                     card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
                     
                     st.write("---")
