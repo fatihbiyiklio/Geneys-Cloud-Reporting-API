@@ -72,6 +72,87 @@ from src.processor import process_analytics_response, to_excel, to_csv, to_parqu
 
 # --- CONFIGURATION ---
 
+API_CALLS_LOG_PATH = os.path.join("logs", "api_calls.jsonl")
+
+def _load_api_calls_log(path, max_lines=200000):
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    entries = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return pd.DataFrame()
+    if not entries:
+        return pd.DataFrame()
+    df = pd.DataFrame(entries)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    if "duration_ms" in df.columns:
+        df["duration_ms"] = pd.to_numeric(df["duration_ms"], errors="coerce")
+    if "status_code" in df.columns:
+        df["status_code"] = pd.to_numeric(df["status_code"], errors="coerce")
+    return df
+
+def _endpoint_reason(endpoint):
+    if not endpoint:
+        return "Bilinmiyor"
+    if "/analytics/queues/observations" in endpoint:
+        return "Canli kuyruk metrikleri (DataManager periyodik)"
+    if "/analytics/conversations/details" in endpoint:
+        return "Detayli konusma raporlari"
+    if "/analytics/conversations/aggregates" in endpoint:
+        return "Gunluk istatistik ve raporlar (dashboard + raporlar)"
+    if "/analytics/users/aggregates" in endpoint:
+        return "Kullanici durum agregeleri"
+    if "/analytics/users/details" in endpoint:
+        return "Kullanici giris/cikis detaylari"
+    if "/routing/queues/" in endpoint and endpoint.endswith("/users"):
+        return "Kuyruk uyeleri (agent listesi)"
+    if endpoint.endswith("/users"):
+        return "Kullanici listesi ve/veya status taramasi"
+    if "/routing/queues" in endpoint:
+        return "Kuyruk listesi"
+    if "/routing/wrapupcodes" in endpoint:
+        return "Wrap-up kodlari"
+    if "/presence/definitions" in endpoint:
+        return "Presence haritasi"
+    return "Diger"
+
+def _endpoint_source(endpoint):
+    if not endpoint:
+        return "Bilinmiyor"
+    if "/analytics/queues/observations" in endpoint:
+        return "Background: DataManager (canli metrik)"
+    if "/analytics/conversations/aggregates" in endpoint:
+        return "Background + Reports (ortak endpoint)"
+    if "/analytics/conversations/details" in endpoint:
+        return "Reports (detayli konusma)"
+    if "/analytics/users/aggregates" in endpoint:
+        return "Reports (kullanici durum agregeleri)"
+    if "/analytics/users/details" in endpoint:
+        return "Reports (kullanici detaylari)"
+    if "/routing/queues/" in endpoint and endpoint.endswith("/users"):
+        return "Background: DataManager (kuyruk uyeleri)"
+    if endpoint.endswith("/users"):
+        return "Background: DataManager (status tarama)"
+    if "/routing/queues" in endpoint:
+        return "Init/Settings (kuyruk listesi)"
+    if "/routing/wrapupcodes" in endpoint:
+        return "Init/Settings (wrapup kodlari)"
+    if "/presence/definitions" in endpoint:
+        return "Init/Settings (presence haritasi)"
+    return "Diger"
+
 def format_status_time(presence_ts, routing_ts):
     """Calculates duration since the most recent status change in HH:MM:SS format."""
     try:
@@ -318,6 +399,8 @@ def import_all_configs(json_data):
 # --- SHARED DATA MANAGER (per org) ---
 _org_dm_lock = threading.Lock()
 _org_data_managers = {}
+_org_maps_lock = threading.Lock()
+_org_maps_cache = {}
 
 def get_shared_data_manager(org_code):
     with _org_dm_lock:
@@ -335,6 +418,25 @@ def ensure_data_manager():
     dm = get_shared_data_manager(org_code)
     st.session_state.data_manager = dm
     return dm
+
+def _fetch_org_maps(api):
+    users = api.get_users()
+    queues = api.get_queues()
+    wrapup = api.get_wrapup_codes()
+    presence = api.get_presence_definitions()
+    return {"users": users, "queues": queues, "wrapup": wrapup, "presence": presence}
+
+def get_shared_org_maps(org_code, api, ttl_seconds=300, force_refresh=False):
+    now = pytime.time()
+    with _org_maps_lock:
+        entry = _org_maps_cache.get(org_code)
+        if entry and not force_refresh and (now - entry.get("ts", 0)) < ttl_seconds:
+            return entry
+    maps = _fetch_org_maps(api)
+    entry = {"ts": now, **maps}
+    with _org_maps_lock:
+        _org_maps_cache[org_code] = entry
+    return entry
 
 def refresh_data_manager_queues():
     """Calculates optimized agent_queues_map and starts/updates DataManager."""
@@ -510,16 +612,18 @@ if st.session_state.app_user:
     if not st.session_state.api_client and saved_creds and not st.session_state.get('genesys_logged_out') and not logged_out_flag:
         cid, csec, reg = saved_creds.get("client_id"), saved_creds.get("client_secret"), saved_creds.get("region", "mypurecloud.ie")
         if cid and csec:
-            client, err = authenticate(cid, csec, reg)
+            client, err = authenticate(cid, csec, reg, org_code=org)
             if client:
                 st.session_state.api_client = client
                 api = GenesysAPI(client)
-                users = api.get_users()
+                maps = get_shared_org_maps(org, api, ttl_seconds=300)
+                users = maps.get("users", [])
+                queues = maps.get("queues", [])
                 st.session_state.users_map = {u['name']: u['id'] for u in users}
                 st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
-                st.session_state.queues_map = {q['name']: q['id'] for q in api.get_queues()}
-                st.session_state.wrapup_map = api.get_wrapup_codes()
-                st.session_state.presence_map = api.get_presence_definitions()
+                st.session_state.queues_map = {q['name']: q['id'] for q in queues}
+                st.session_state.wrapup_map = maps.get("wrapup", {})
+                st.session_state.presence_map = maps.get("presence", {})
                 st.session_state.org_config = saved_creds # Store for later use (refresh interval etc.)
                 refresh_data_manager_queues()
 
@@ -697,6 +801,7 @@ if page == get_text(lang, "menu_reports"):
                  # Fetch all, but we will filter for chats ideally or just process all with attributes
                  # Interaction detail endpoint returns all types.
                  raw_convs = api.get_conversation_details(start_date, end_date)
+                 u_offset = saved_creds.get("utc_offset", 3)
                  # Process with attributes=True (Base structure)
                  df = process_conversation_details(
                      raw_convs, 
@@ -1213,7 +1318,7 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
     if st.button(get_text(lang, "login_genesys")):
         if c_id and c_sec:
             with st.spinner("Authenticating..."):
-                client, err = authenticate(c_id, c_sec, region)
+            client, err = authenticate(c_id, c_sec, region, org_code=org)
                 if client:
                     st.session_state.api_client = client
                     st.session_state.genesys_logged_out = False
@@ -1229,12 +1334,14 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                     else: delete_credentials(org)
                     
                     api = GenesysAPI(client)
-                    users = api.get_users()
+                    maps = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
+                    users = maps.get("users", [])
+                    queues = maps.get("queues", [])
                     st.session_state.users_map = {u['name']: u['id'] for u in users}
                     st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
-                    st.session_state.queues_map = {q['name']: q['id'] for q in api.get_queues()}
-                    st.session_state.wrapup_map = api.get_wrapup_codes()
-                    st.session_state.presence_map = api.get_presence_definitions()
+                    st.session_state.queues_map = {q['name']: q['id'] for q in queues}
+                    st.session_state.wrapup_map = maps.get("wrapup", {})
+                    st.session_state.presence_map = maps.get("presence", {})
                     st.session_state.org_config = conf if conf else load_credentials(org)
                     
                     st.session_state.data_manager.update_api_client(client, st.session_state.presence_map)
@@ -1262,6 +1369,14 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
             st.session_state.users_map = {}
             st.session_state.users_info = {}
             st.session_state.presence_map = {}
+            with _org_maps_lock:
+                _org_maps_cache.pop(org, None)
+            try:
+                token_cache = os.path.join("orgs", org, ".token_cache.json")
+                if os.path.exists(token_cache):
+                    os.remove(token_cache)
+            except Exception:
+                pass
             st.session_state.genesys_logged_out = True
             set_dm_enabled(org, False)
             try:
@@ -1311,6 +1426,64 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
             st.line_chart(df_hourly.set_index("Zaman"))
         else:
             st.info("Son 24 saatte trafik yok.")
+
+        st.divider()
+        st.subheader("API Log Raporu")
+        df_calls = _load_api_calls_log(API_CALLS_LOG_PATH)
+        if df_calls.empty:
+            st.info("API logu bulunamadi. Loglama yeni etkinlestirildiyse veri olusmasi icin biraz zaman tanimlayin.")
+        else:
+            ts_min = df_calls["timestamp"].min()
+            ts_max = df_calls["timestamp"].max()
+            st.caption(f"Kapsam: {ts_min} - {ts_max} | Toplam Kayit: {len(df_calls)}")
+
+            df_ts = df_calls.dropna(subset=["timestamp"]).copy()
+            if not df_ts.empty:
+                df_ts["minute"] = df_ts["timestamp"].dt.floor("min")
+                df_min = df_ts.groupby("minute").size().reset_index(name="Istek Adet")
+                st.line_chart(df_min.set_index("minute"))
+
+            def _pctl(series, p):
+                s = series.dropna()
+                if s.empty:
+                    return np.nan
+                return float(np.nanpercentile(s, p))
+
+            def _error_count(series):
+                s = pd.to_numeric(series, errors="coerce")
+                return int((s >= 400).sum())
+
+            agg = df_calls.groupby("endpoint").agg(
+                Adet=("endpoint", "size"),
+                Ortalama_ms=("duration_ms", "mean"),
+                p50_ms=("duration_ms", lambda s: _pctl(s, 50)),
+                p95_ms=("duration_ms", lambda s: _pctl(s, 95)),
+                Max_ms=("duration_ms", "max"),
+                Hata_Adet=("status_code", _error_count)
+            ).reset_index()
+            agg["Hata_Orani"] = (agg["Hata_Adet"] / agg["Adet"]).fillna(0.0)
+            agg["Neden"] = agg["endpoint"].apply(_endpoint_reason)
+            agg["Kaynak"] = agg["endpoint"].apply(_endpoint_source)
+            agg = agg.sort_values("Adet", ascending=False)
+
+            top_endpoint = agg.iloc[0] if not agg.empty else None
+            if top_endpoint is not None:
+                st.info(f"En cok cagrilan endpoint: {top_endpoint['endpoint']} | Adet: {int(top_endpoint['Adet'])} | Kaynak: {top_endpoint['Kaynak']} | Neden: {top_endpoint['Neden']}")
+
+            src_agg = agg.groupby("Kaynak").agg(
+                Adet=("Adet", "sum"),
+                Ortalama_ms=("Ortalama_ms", "mean"),
+                p50_ms=("p50_ms", "mean"),
+                p95_ms=("p95_ms", "mean"),
+                Max_ms=("Max_ms", "max"),
+                Hata_Adet=("Hata_Adet", "sum")
+            ).reset_index().sort_values("Adet", ascending=False)
+
+            if not src_agg.empty:
+                st.subheader("En Cok Neresi Kullaniliyor (Kaynak Bazli)")
+                st.dataframe(src_agg, use_container_width=True)
+
+            st.dataframe(agg, use_container_width=True)
 
     with tab2:
         st.subheader(get_text(lang, "system_errors"))

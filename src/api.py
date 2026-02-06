@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timezone, timedelta
 from src.monitor import monitor
 
@@ -12,35 +13,55 @@ class GenesysAPI:
 
     def _get(self, path, params=None):
         import requests
-        monitor.log_api_call(path)
+        start = time.monotonic()
         try:
             response = requests.get(f"{self.api_host}{path}", headers=self.headers, params=params, timeout=10)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="GET", status_code=response.status_code, duration_ms=duration_ms)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            try:
+                status_code = response.status_code
+            except Exception:
+                status_code = None
+            monitor.log_api_call(path, method="GET", status_code=status_code, duration_ms=duration_ms)
             monitor.log_error("API_GET", f"HTTP {response.status_code} on {path}", str(e))
             if response.status_code == 401:
                 print("⚠️ Token expired (401). Should trigger re-auth here.")
                 raise e 
             raise e
         except Exception as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="GET", status_code=None, duration_ms=duration_ms)
             monitor.log_error("API_GET", f"System Error on {path}", str(e))
             raise e
 
     def _post(self, path, data):
         import requests
-        monitor.log_api_call(path)
+        start = time.monotonic()
         try:
             response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="POST", status_code=response.status_code, duration_ms=duration_ms)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            try:
+                status_code = response.status_code
+            except Exception:
+                status_code = None
+            monitor.log_api_call(path, method="POST", status_code=status_code, duration_ms=duration_ms)
             monitor.log_error("API_POST", f"HTTP {response.status_code} on {path}", str(e))
             if response.status_code == 401:
                  print("⚠️ Token expired (401) on POST.")
                  raise e
             raise e
         except Exception as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="POST", status_code=None, duration_ms=duration_ms)
             monitor.log_error("API_POST", f"System Error on {path}", str(e))
             raise e
     

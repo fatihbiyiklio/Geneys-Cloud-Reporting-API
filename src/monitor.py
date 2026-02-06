@@ -1,3 +1,5 @@
+import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -22,18 +24,33 @@ class AppMonitor:
             return
             
         self.api_stats = {} # endpoint -> count
-        self.api_calls_log = [] # list of (timestamp, endpoint)
+        self.api_calls_log = [] # list of dicts: {timestamp, endpoint, method, status_code, duration_ms}
         self.error_logs = [] # list of {timestamp, module, message, details}
         self.start_time = datetime.now()
         self._lock = threading.Lock()
+        self._log_path = os.path.join("logs", "api_calls.jsonl")
+        os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
         self._initialized = True
 
-    def log_api_call(self, endpoint):
-        """Records an API call with timestamp and endpoint path."""
+    def log_api_call(self, endpoint, method=None, status_code=None, duration_ms=None):
+        """Records an API call with timestamp, endpoint path, and optional timing metadata."""
         with self._lock:
             clean_endpoint = endpoint.split('?')[0] # Remove query params
             self.api_stats[clean_endpoint] = self.api_stats.get(clean_endpoint, 0) + 1
-            self.api_calls_log.append((datetime.now(), clean_endpoint))
+            entry = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "endpoint": clean_endpoint,
+                "method": method,
+                "status_code": status_code,
+                "duration_ms": duration_ms
+            }
+            self.api_calls_log.append(entry)
+            try:
+                with open(self._log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception:
+                # Avoid crashing the app on logging issues
+                pass
             
             # Keep log manageable (last 1000 calls)
             if len(self.api_calls_log) > 1000:
@@ -71,7 +88,11 @@ class AppMonitor:
         with self._lock:
             cutoff = datetime.now() - timedelta(minutes=minutes)
             count = 0
-            for ts, _ in self.api_calls_log:
+            for entry in self.api_calls_log:
+                try:
+                    ts = datetime.fromisoformat(entry.get("timestamp"))
+                except Exception:
+                    continue
                 if ts > cutoff:
                     count += 1
             return count / minutes
@@ -90,7 +111,11 @@ class AppMonitor:
         with self._lock:
             cutoff = datetime.now() - timedelta(hours=24)
             hourly = {}
-            for ts, _ in self.api_calls_log:
+            for entry in self.api_calls_log:
+                try:
+                    ts = datetime.fromisoformat(entry.get("timestamp"))
+                except Exception:
+                    continue
                 if ts > cutoff:
                     hour_key = ts.strftime("%Y-%m-%d %H:00")
                     hourly[hour_key] = hourly.get(hour_key, 0) + 1
