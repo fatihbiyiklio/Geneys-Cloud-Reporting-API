@@ -25,6 +25,11 @@ def acquire_single_instance_lock():
     global _lock_handle
     try:
         _lock_handle = open(LOCK_FILE, "w")
+        try:
+            _lock_handle.write(str(os.getpid()))
+            _lock_handle.flush()
+        except Exception:
+            pass
         if platform.system().lower().startswith("win"):
             import msvcrt
             try:
@@ -78,11 +83,16 @@ def check_single_instance():
 if __name__ == "__main__":
     import psutil
 
+    # Simple self-test hook for CI/debugging
+    if os.environ.get("GENESYS_SELF_TEST") == "1":
+        print("SELF_TEST_OK")
+        sys.exit(0)
+
     acquire_single_instance_lock()
     app_path = resolve_path("app.py")
 
     # Log file for debugging startup issues (especially on Windows)
-    log_path = os.path.join(os.path.dirname(app_path), "app_startup.log")
+    log_path = os.path.join(os.getcwd(), "app_startup.log")
     def log(msg):
         try:
             with open(log_path, "a", encoding="utf-8") as f:
@@ -112,22 +122,29 @@ if __name__ == "__main__":
     
     restart_count = 0
     last_restart = time.time()
+    def run_streamlit():
+        argv = [
+            "streamlit", "run", app_path,
+            "--server.port=8501", "--server.address=localhost",
+            "--server.headless=true", "--global.developmentMode=false"
+        ]
+        old_argv = sys.argv[:]
+        sys.argv = argv
+        try:
+            stcli.main()
+            return 0
+        except SystemExit as e:
+            return e.code or 0
+        finally:
+            sys.argv = old_argv
+
     while True:
         try:
             # Force Kill: Ensure 8501 is free before starting
             kill_proc_on_port(8501)
             
-            # subprocess.call returns the exit code
-            # We use sys.executable to ensure we use the same Python interpreter
-            cmd = [sys.executable, "-m", "streamlit", "run", app_path, 
-                  "--server.port=8501", "--server.address=localhost", 
-                  "--server.headless=true", "--global.developmentMode=false"]
-            
-            # Using stcli directly in same process allows simple pyinstaller build but harder restart
-            # Switching to subprocess for robust isolation and restart capability
-            import subprocess
-            log(f"Starting streamlit: {' '.join(cmd)}")
-            exit_code = subprocess.call(cmd)
+            log(f"Starting streamlit: {app_path}")
+            exit_code = run_streamlit()
             
             if exit_code == 0:
                 print("🛑 Application stopped gracefully (Exit Code 0).")

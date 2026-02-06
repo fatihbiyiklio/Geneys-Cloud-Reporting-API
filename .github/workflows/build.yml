@@ -58,11 +58,17 @@ jobs:
           --add-data "src;src" `
           run_app.py
 
+    - name: Self-test (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        set GENESYS_SELF_TEST=1
+        .\\dist\\GenesysReporting.exe
+
     - name: Build with PyInstaller (Linux)
       if: matrix.os == 'ubuntu-20.04'
       run: |
         . .venv/bin/activate
-        pyinstaller --onefile --name "applinux" \
+        pyinstaller --onefile --name "GenesysReporting" \
           --collect-all streamlit \
           --collect-all streamlit_autorefresh \
           --collect-all cryptography \
@@ -71,6 +77,11 @@ jobs:
           --add-data "app.py:." \
           --add-data "src:src" \
           run_app.py
+
+    - name: Self-test (Linux)
+      if: matrix.os == 'ubuntu-20.04'
+      run: |
+        GENESYS_SELF_TEST=1 ./dist/GenesysReporting
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -111,6 +122,10 @@ jobs:
           --add-data "app.py:." \
           --add-data "src:src" \
           run_app.py
+
+    - name: Self-test (Debian)
+      run: |
+        GENESYS_SELF_TEST=1 ./dist/GenesysReporting
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
