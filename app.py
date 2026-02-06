@@ -396,22 +396,44 @@ def import_all_configs(json_data):
         return True
     except: return False
 
-# --- SHARED DATA MANAGER (per org) ---
-_org_dm_lock = threading.Lock()
-_org_data_managers = {}
-_org_maps_lock = threading.Lock()
-_org_maps_cache = {}
+# --- SHARED DATA MANAGER (per org, cross-session) ---
+@st.cache_resource(show_spinner=False)
+def _shared_dm_store():
+    return {"lock": threading.Lock(), "data": {}}
+
+def _get_dm_store():
+    store = _shared_dm_store()
+    if "lock" not in store:
+        store["lock"] = threading.Lock()
+    if "data" not in store:
+        store["data"] = {}
+    return store
 
 def get_shared_data_manager(org_code):
-    with _org_dm_lock:
-        dm = _org_data_managers.get(org_code)
+    store = _get_dm_store()
+    with store["lock"]:
+        dm = store["data"].get(org_code)
         if dm is None:
             dm = DataManager()
-            _org_data_managers[org_code] = dm
-        # Apply persisted enabled/disabled state
-        if not is_dm_enabled(org_code):
-            dm.enabled = False
-        return dm
+            store["data"][org_code] = dm
+    # Apply persisted enabled/disabled state every time
+    dm.enabled = is_dm_enabled(org_code)
+    return dm
+
+def get_existing_data_manager(org_code):
+    store = _get_dm_store()
+    with store["lock"]:
+        return store["data"].get(org_code)
+
+def remove_shared_data_manager(org_code):
+    store = _get_dm_store()
+    with store["lock"]:
+        dm = store["data"].pop(org_code, None)
+    if dm:
+        dm.force_stop()
+
+_org_maps_lock = threading.Lock()
+_org_maps_cache = {}
 
 def ensure_data_manager():
     org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
@@ -1227,8 +1249,7 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                         ok, msg = auth_manager.delete_organization(del_org)
                         if ok:
                             delete_org_files(del_org)
-                            with _org_dm_lock:
-                                _org_data_managers.pop(del_org, None)
+                            remove_shared_data_manager(del_org)
                             st.success(msg)
                             st.rerun()
                         else:
@@ -1245,15 +1266,14 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
     else:
         org_sel = current_org
         st.write(f"{get_text(lang, 'organization')}: {org_sel}")
-    with _org_dm_lock:
-        if org_sel == current_org and st.session_state.get('data_manager'):
-            dm = st.session_state.data_manager
-        else:
-            dm = _org_data_managers.get(org_sel)
-        running = dm.is_running() if dm else False
-        metric_q = len(dm.queues_map) if dm else 0
-        agent_q = len(dm.agent_queues_map) if dm else 0
-        last_upd = datetime.fromtimestamp(dm.last_update_time).strftime('%H:%M:%S') if dm and dm.last_update_time else "Never"
+    if org_sel == current_org and st.session_state.get('data_manager'):
+        dm = st.session_state.data_manager
+    else:
+        dm = get_existing_data_manager(org_sel)
+    running = dm.is_running() if dm else False
+    metric_q = len(dm.queues_map) if dm else 0
+    agent_q = len(dm.agent_queues_map) if dm else 0
+    last_upd = datetime.fromtimestamp(dm.last_update_time).strftime('%H:%M:%S') if dm and dm.last_update_time else "Never"
     c_dm1, c_dm2, c_dm3, c_dm4 = st.columns(4)
     c_dm1.metric(get_text(lang, "organization"), org_sel)
     c_dm2.metric(get_text(lang, "org_dm_running"), "Yes" if running else "No")
@@ -1284,10 +1304,9 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
             st.rerun()
     with c_dm6:
         if st.button(get_text(lang, "org_dm_stop")):
-            with _org_dm_lock:
-                dm = _org_data_managers.get(org_sel)
-                if dm and dm.is_running():
-                    dm.force_stop()
+            dm = get_existing_data_manager(org_sel)
+            if dm and dm.is_running():
+                dm.force_stop()
             set_dm_enabled(org_sel, False)
             st.rerun()
 

@@ -39,31 +39,32 @@ class DataManager:
 
     def start(self, queues_map, agent_queues_map=None):
         """Updates monitoring targets and ensures the background thread is running."""
-        # Update monitored maps
-        self.queues_map = queues_map
-        
-        if agent_queues_map is not None:
-            # Check if targets changed significantly to clear cache
-            new_keys = set(agent_queues_map.keys())
-            old_keys = set(self.agent_queues_map.keys())
-            if new_keys != old_keys:
-                print(f"DataManager: Targets changed. Clearing membership cache.")
-                self.queue_members_cache = {}
-            self.agent_queues_map = agent_queues_map
-        
-        # Respect disabled state
-        if not self.enabled:
-            return
+        with self._lock:
+            # Update monitored maps
+            self.queues_map = queues_map
+            
+            if agent_queues_map is not None:
+                # Check if targets changed significantly to clear cache
+                new_keys = set(agent_queues_map.keys())
+                old_keys = set(self.agent_queues_map.keys())
+                if new_keys != old_keys:
+                    print(f"DataManager: Targets changed. Clearing membership cache.")
+                    self.queue_members_cache = {}
+                self.agent_queues_map = agent_queues_map
+            
+            # Respect disabled state
+            if not self.enabled:
+                return
 
-        # Ensure thread is running
-        if self.thread and self.thread.is_alive():
-            # Already running, maps updated above will be picked up
-            return
-        
-        print("DataManager: Starting background update thread...")
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._update_loop, daemon=True)
-        self.thread.start()
+            # Ensure thread is running
+            if self.thread and self.thread.is_alive():
+                # Already running, maps updated above will be picked up
+                return
+            
+            print("DataManager: Starting background update thread...")
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._update_loop, daemon=True)
+            self.thread.start()
 
     def stop(self):
         print("DataManager: Stopping background update thread...")
