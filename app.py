@@ -1318,7 +1318,7 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
     if st.button(get_text(lang, "login_genesys")):
         if c_id and c_sec:
             with st.spinner("Authenticating..."):
-            client, err = authenticate(c_id, c_sec, region, org_code=org)
+                client, err = authenticate(c_id, c_sec, region, org_code=org)
                 if client:
                     st.session_state.api_client = client
                     st.session_state.genesys_logged_out = False
