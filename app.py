@@ -73,23 +73,42 @@ from src.processor import process_analytics_response, to_excel, to_csv, to_parqu
 # --- CONFIGURATION ---
 
 API_CALLS_LOG_PATH = os.path.join("logs", "api_calls.jsonl")
+API_CALLS_LOG_TAIL_LINES = 50000
+API_CALLS_LOG_TAIL_BYTES = 10 * 1024 * 1024
 
-def _load_api_calls_log(path, max_lines=200000):
+def _read_tail_lines(path, max_lines=API_CALLS_LOG_TAIL_LINES, max_bytes=API_CALLS_LOG_TAIL_BYTES):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end_pos = f.tell()
+            if end_pos == 0:
+                return []
+            data = b""
+            block_size = 8192
+            while end_pos > 0 and data.count(b"\n") <= max_lines and len(data) < max_bytes:
+                step = block_size if end_pos >= block_size else end_pos
+                end_pos -= step
+                f.seek(end_pos)
+                data = f.read(step) + data
+            lines = data.splitlines()[-max_lines:]
+            return [line.decode("utf-8", "ignore") for line in lines]
+    except Exception:
+        return []
+
+def _load_api_calls_log(path, max_lines=API_CALLS_LOG_TAIL_LINES):
     if not os.path.exists(path):
         return pd.DataFrame()
     entries = []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= max_lines:
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except Exception:
-                    continue
+        lines = _read_tail_lines(path, max_lines=max_lines)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
     except Exception:
         return pd.DataFrame()
     if not entries:
@@ -321,53 +340,56 @@ def generate_password(length=12):
 
 # --- APP SESSION MANAGEMENT (REMEMBER ME) ---
 def load_app_session():
-    if not os.path.exists(APP_SESSION_FILE): return None
-    try:
-        cipher = _get_cipher()
-        with open(APP_SESSION_FILE, "rb") as f: data = f.read()
-        session_data = json.loads(cipher.decrypt(data).decode('utf-8'))
-        
-        # Check 3-hour expiry
-        timestamp = session_data.get("timestamp", 0)
-        if pytime.time() - timestamp > (3 * 3600):
-            delete_app_session()
-            return None
-            
-        return session_data
-    except Exception:
-        return None
+    # Disabled: server-side remember-me causes cross-device session bleed.
+    return None
 
 def save_app_session(user_data):
-    try:
-        cipher = _get_cipher()
-        # Add timestamp
-        payload = {**user_data, "timestamp": pytime.time()}
-        data = json.dumps(payload).encode('utf-8')
-        with open(APP_SESSION_FILE, "wb") as f: f.write(cipher.encrypt(data))
-        try: os.chmod(APP_SESSION_FILE, 0o600)
-        except: pass
-    except: pass
+    # Disabled: keep sessions per-browser only (no server-side persistence).
+    return
 
 def delete_app_session():
     if os.path.exists(APP_SESSION_FILE): os.remove(APP_SESSION_FILE)
 
+def _user_dir(org_code, username):
+    base = _org_dir(org_code)
+    user_safe = (username or "unknown").replace("/", "_").replace("\\", "_")
+    path = os.path.join(base, "users", user_safe)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _current_user():
+    return st.session_state.app_user if st.session_state.get("app_user") else None
+
 def load_dashboard_config(org_code):
-    org_path = _org_dir(org_code)
-    filename = os.path.join(org_path, CONFIG_FILE)
+    user = _current_user()
+    if user:
+        user_path = _user_dir(org_code, user.get("username"))
+        filename = os.path.join(user_path, CONFIG_FILE)
+    else:
+        org_path = _org_dir(org_code)
+        filename = os.path.join(org_path, CONFIG_FILE)
     if not os.path.exists(filename): return {"layout": 1, "cards": []}
     try:
         with open(filename, "r", encoding='utf-8') as f: return json.load(f)
     except: return {"layout": 1, "cards": []}
 
 def save_dashboard_config(org_code, layout, cards):
-    filename = os.path.join(_org_dir(org_code), CONFIG_FILE)
+    user = _current_user()
+    if user:
+        filename = os.path.join(_user_dir(org_code, user.get("username")), CONFIG_FILE)
+    else:
+        filename = os.path.join(_org_dir(org_code), CONFIG_FILE)
     try:
         with open(filename, "w", encoding='utf-8') as f: json.dump({"layout": layout, "cards": cards}, f, ensure_ascii=False)
     except: pass
 
 def load_presets(org_code):
-    org_path = _org_dir(org_code)
-    filename = os.path.join(org_path, PRESETS_FILE)
+    user = _current_user()
+    if user:
+        filename = os.path.join(_user_dir(org_code, user.get("username")), PRESETS_FILE)
+    else:
+        org_path = _org_dir(org_code)
+        filename = os.path.join(org_path, PRESETS_FILE)
     if not os.path.exists(filename): return []
     try:
         with open(filename, "r", encoding='utf-8') as f:
@@ -376,7 +398,11 @@ def load_presets(org_code):
     except: return []
 
 def save_presets(org_code, presets):
-    filename = os.path.join(_org_dir(org_code), PRESETS_FILE)
+    user = _current_user()
+    if user:
+        filename = os.path.join(_user_dir(org_code, user.get("username")), PRESETS_FILE)
+    else:
+        filename = os.path.join(_org_dir(org_code), PRESETS_FILE)
     try:
         with open(filename, "w", encoding='utf-8') as f: json.dump(presets, f, ensure_ascii=False)
     except: pass
@@ -446,11 +472,30 @@ def _fetch_org_maps(api):
     queues = api.get_queues()
     wrapup = api.get_wrapup_codes()
     presence = api.get_presence_definitions()
-    return {"users": users, "queues": queues, "wrapup": wrapup, "presence": presence}
+    users_map = {u['name']: u['id'] for u in users}
+    users_info = {u['id']: {'name': u['name'], 'username': u.get('username', '')} for u in users}
+    queues_map = {q['name']: q['id'] for q in queues}
+    return {
+        "users": users,
+        "queues": queues,
+        "wrapup": wrapup,
+        "presence": presence,
+        "users_map": users_map,
+        "users_info": users_info,
+        "queues_map": queues_map
+    }
 
 def get_shared_org_maps(org_code, api, ttl_seconds=300, force_refresh=False):
     now = pytime.time()
     with _org_maps_lock:
+        # Prune old entries to prevent memory growth
+        stale = [k for k, v in _org_maps_cache.items() if now - v.get("ts", 0) > 6 * 3600]
+        for k in stale:
+            _org_maps_cache.pop(k, None)
+        if len(_org_maps_cache) > 100:
+            oldest = sorted(_org_maps_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(_org_maps_cache) - 100]
+            for k, _ in oldest:
+                _org_maps_cache.pop(k, None)
         entry = _org_maps_cache.get(org_code)
         if entry and not force_refresh and (now - entry.get("ts", 0)) < ttl_seconds:
             return entry
@@ -639,11 +684,9 @@ if st.session_state.app_user:
                 st.session_state.api_client = client
                 api = GenesysAPI(client)
                 maps = get_shared_org_maps(org, api, ttl_seconds=300)
-                users = maps.get("users", [])
-                queues = maps.get("queues", [])
-                st.session_state.users_map = {u['name']: u['id'] for u in users}
-                st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
-                st.session_state.queues_map = {q['name']: q['id'] for q in queues}
+                st.session_state.users_map = maps.get("users_map", {})
+                st.session_state.users_info = maps.get("users_info", {})
+                st.session_state.queues_map = maps.get("queues_map", {})
                 st.session_state.wrapup_map = maps.get("wrapup", {})
                 st.session_state.presence_map = maps.get("presence", {})
                 st.session_state.org_config = saved_creds # Store for later use (refresh interval etc.)
@@ -1354,11 +1397,9 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                     
                     api = GenesysAPI(client)
                     maps = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
-                    users = maps.get("users", [])
-                    queues = maps.get("queues", [])
-                    st.session_state.users_map = {u['name']: u['id'] for u in users}
-                    st.session_state.users_info = {u['id']: {'name': u['name'], 'username': u['username']} for u in users}
-                    st.session_state.queues_map = {q['name']: q['id'] for q in queues}
+                    st.session_state.users_map = maps.get("users_map", {})
+                    st.session_state.users_info = maps.get("users_info", {})
+                    st.session_state.queues_map = maps.get("queues_map", {})
                     st.session_state.wrapup_map = maps.get("wrapup", {})
                     st.session_state.presence_map = maps.get("presence", {})
                     st.session_state.org_config = conf if conf else load_credentials(org)
@@ -1452,6 +1493,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
         if df_calls.empty:
             st.info("API logu bulunamadi. Loglama yeni etkinlestirildiyse veri olusmasi icin biraz zaman tanimlayin.")
         else:
+            st.caption(f"Not: Rapor son {API_CALLS_LOG_TAIL_LINES} kaydi baz alir (tail okuma).")
             ts_min = df_calls["timestamp"].min()
             ts_max = df_calls["timestamp"].max()
             st.caption(f"Kapsam: {ts_min} - {ts_max} | Toplam Kayit: {len(df_calls)}")
