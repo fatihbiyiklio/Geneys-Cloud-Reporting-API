@@ -17,6 +17,7 @@ import signal
 import traceback
 from streamlit_autorefresh import st_autorefresh
 from streamlit.runtime import Runtime
+from streamlit_cookies_manager import EncryptedCookieManager
 from cryptography.fernet import Fernet
 from src.data_manager import DataManager
 from src.auth_manager import AuthManager
@@ -270,6 +271,8 @@ st.markdown("""
 # --- GLOBAL HELPERS (DEFINED FIRST) ---
 
 APP_SESSION_FILE = ".session.enc"
+APP_SESSION_COOKIE = "app_session"
+APP_SESSION_TTL = 7 * 24 * 3600
 
 def _get_or_create_key():
     if os.path.exists(KEY_FILE):
@@ -282,6 +285,21 @@ def _get_or_create_key():
 
 def _get_cipher():
     return Fernet(_get_or_create_key())
+
+_cookie_manager = None
+
+def _get_cookie_manager():
+    global _cookie_manager
+    if _cookie_manager is None:
+        key = _get_or_create_key()
+        try:
+            key_str = key.decode("utf-8")
+        except Exception:
+            key_str = str(key)
+        _cookie_manager = EncryptedCookieManager(prefix="genesys", password=key_str)
+    if not _cookie_manager.ready():
+        st.stop()
+    return _cookie_manager
 
 def load_credentials(org_code):
     org_path = _org_dir(org_code)
@@ -332,14 +350,37 @@ def generate_password(length=12):
 
 # --- APP SESSION MANAGEMENT (REMEMBER ME) ---
 def load_app_session():
-    # Disabled: server-side remember-me causes cross-device session bleed.
-    return None
+    try:
+        cookies = _get_cookie_manager()
+        raw = cookies.get(APP_SESSION_COOKIE)
+        if not raw:
+            return None
+        session_data = json.loads(raw)
+        timestamp = session_data.get("timestamp", 0)
+        if pytime.time() - timestamp > APP_SESSION_TTL:
+            delete_app_session()
+            return None
+        return session_data
+    except Exception:
+        return None
 
 def save_app_session(user_data):
-    # Disabled: keep sessions per-browser only (no server-side persistence).
-    return
+    try:
+        cookies = _get_cookie_manager()
+        payload = {**user_data, "timestamp": pytime.time()}
+        cookies[APP_SESSION_COOKIE] = json.dumps(payload)
+        cookies.save()
+    except Exception:
+        pass
 
 def delete_app_session():
+    try:
+        cookies = _get_cookie_manager()
+        if APP_SESSION_COOKIE in cookies:
+            del cookies[APP_SESSION_COOKIE]
+            cookies.save()
+    except Exception:
+        pass
     if os.path.exists(APP_SESSION_FILE): os.remove(APP_SESSION_FILE)
 
 def _user_dir(org_code, username):
@@ -702,7 +743,7 @@ if not st.session_state.app_user:
             u_org = st.text_input(get_text(st.session_state.language, "org_code"), value="default")
             u_name = st.text_input(get_text(st.session_state.language, "username"))
             u_pass = st.text_input(get_text(st.session_state.language, "password"), type="password")
-            remember_me = st.checkbox(get_text(st.session_state.language, "remember_me"), value=False, disabled=True, help="Kalici oturum cihaz bazli devre disi.")
+            remember_me = st.checkbox(get_text(st.session_state.language, "remember_me"), value=False, help="Bu cihazda oturumu hatirla.")
             
             if st.form_submit_button(get_text(st.session_state.language, "login"), width='stretch'):
                 user_data = auth_manager.authenticate(u_org, u_name, u_pass)
