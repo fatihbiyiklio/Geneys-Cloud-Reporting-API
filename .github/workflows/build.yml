@@ -28,6 +28,8 @@ jobs:
 
     - name: Install dependencies
       run: |
+        python -m venv .venv
+        . .venv/bin/activate
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
@@ -35,6 +37,7 @@ jobs:
     - name: Build with PyInstaller (Windows)
       if: matrix.os == 'windows-latest'
       run: |
+        . .venv/Scripts/activate
         pyinstaller --onefile --noconsole --name "GenesysReporting" `
           --collect-all streamlit `
           --collect-all streamlit_autorefresh `
@@ -48,6 +51,7 @@ jobs:
     - name: Build with PyInstaller (Linux)
       if: matrix.os == 'ubuntu-20.04'
       run: |
+        . .venv/bin/activate
         pyinstaller --onefile --name "applinux" \
           --collect-all streamlit \
           --collect-all streamlit_autorefresh \
@@ -79,13 +83,16 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python3 -m pip install --upgrade pip
+        python3 -m venv .venv
+        . .venv/bin/activate
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pyinstaller
 
     - name: Build with PyInstaller (Debian)
       run: |
-        pyinstaller --onefile --name "appdebian" \
+        . .venv/bin/activate
+        pyinstaller --onefile --name "GenesysReporting" \
           --collect-all streamlit \
           --collect-all streamlit_autorefresh \
           --collect-all cryptography \

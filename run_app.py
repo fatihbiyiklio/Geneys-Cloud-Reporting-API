@@ -3,6 +3,7 @@ import os
 import sys
 import signal
 import time
+import platform
 
 def resolve_path(path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
@@ -15,6 +16,33 @@ def resolve_path(path):
     return os.path.join(base_path, path)
 
 PID_FILE = ".app.pid"
+LOCK_FILE = ".app.lock"
+
+_lock_handle = None
+
+def acquire_single_instance_lock():
+    """Prevent multiple instances from running at the same time."""
+    global _lock_handle
+    try:
+        _lock_handle = open(LOCK_FILE, "w")
+        if platform.system().lower().startswith("win"):
+            import msvcrt
+            try:
+                msvcrt.locking(_lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("Another instance is already running.")
+                sys.exit(0)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("Another instance is already running.")
+                sys.exit(0)
+    except Exception:
+        # If lock fails for any reason, do not start another instance
+        print("Another instance is already running.")
+        sys.exit(0)
 
 def check_single_instance():
     """Ensures only one instance of the app is running by killing the previous one."""
@@ -50,7 +78,17 @@ def check_single_instance():
 if __name__ == "__main__":
     import psutil
 
+    acquire_single_instance_lock()
     app_path = resolve_path("app.py")
+
+    # Log file for debugging startup issues (especially on Windows)
+    log_path = os.path.join(os.path.dirname(app_path), "app_startup.log")
+    def log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
     
     def kill_proc_on_port(port):
         """Finds and kills any process using the specified port."""
@@ -72,6 +110,8 @@ if __name__ == "__main__":
     # Launch Streamlit in a loop for auto-restart
     print("🚀 Starting Genesys Reporting App...")
     
+    restart_count = 0
+    last_restart = time.time()
     while True:
         try:
             # Force Kill: Ensure 8501 is free before starting
@@ -86,19 +126,31 @@ if __name__ == "__main__":
             # Using stcli directly in same process allows simple pyinstaller build but harder restart
             # Switching to subprocess for robust isolation and restart capability
             import subprocess
+            log(f"Starting streamlit: {' '.join(cmd)}")
             exit_code = subprocess.call(cmd)
             
             if exit_code == 0:
                 print("🛑 Application stopped gracefully (Exit Code 0).")
                 break
             else:
-                print(f"⚠️ Application exited with code {exit_code}. Restarting in 1 second...")
-                time.sleep(1)
+                restart_count += 1
+                now = time.time()
+                if now - last_restart > 60:
+                    restart_count = 1
+                last_restart = now
+                log(f"Exit code {exit_code}. Restart count: {restart_count}")
+                if restart_count >= 5:
+                    print("❌ Too many restarts. Exiting.")
+                    log("Too many restarts. Exiting.")
+                    break
+                print(f"⚠️ Application exited with code {exit_code}. Restarting in 2 seconds...")
+                time.sleep(2)
         except KeyboardInterrupt:
             print("\n👋 Manual interruption. Exiting...")
             break
         except Exception as e:
             print(f"❌ Fatal Error in wrapper: {e}")
+            log(f"Fatal Error in wrapper: {e}")
             time.sleep(5)
             
     sys.exit(0)
