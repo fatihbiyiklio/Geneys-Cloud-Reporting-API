@@ -20,6 +20,7 @@ from streamlit.runtime import Runtime
 from streamlit_cookies_manager import EncryptedCookieManager
 from cryptography.fernet import Fernet
 from src.data_manager import DataManager
+from src.notifications import NotificationManager, AgentNotificationManager, GlobalConversationNotificationManager
 from src.auth_manager import AuthManager
 
 # --- AUTH MANAGER ---
@@ -141,6 +142,10 @@ def _endpoint_reason(endpoint):
         return "Kullanici giris/cikis detaylari"
     if "/routing/queues/" in endpoint and endpoint.endswith("/users"):
         return "Kuyruk uyeleri (agent listesi)"
+    if "/routing/queues/" in endpoint and endpoint.endswith("/conversations"):
+        return "Bekleyen konusmalar (kuyruk konusmalari)"
+    if "/notifications/channels" in endpoint:
+        return "Notifications kanal/abonelik"
     if endpoint.endswith("/users"):
         return "Kullanici listesi ve/veya status taramasi"
     if "/routing/queues" in endpoint:
@@ -166,6 +171,10 @@ def _endpoint_source(endpoint):
         return "Reports (kullanici detaylari)"
     if "/routing/queues/" in endpoint and endpoint.endswith("/users"):
         return "Background: DataManager (kuyruk uyeleri)"
+    if "/routing/queues/" in endpoint and endpoint.endswith("/conversations"):
+        return "Panel: Bekleyen gorusmeler"
+    if "/notifications/channels" in endpoint:
+        return "Panel: Notifications"
     if endpoint.endswith("/users"):
         return "Background: DataManager (status tarama)"
     if "/routing/queues" in endpoint:
@@ -193,6 +202,386 @@ def format_status_time(presence_ts, routing_ts):
         secs = seconds % 60
         return f"{hrs:02d}:{mins:02d}:{secs:02d}"
     except: return "00:00:00"
+
+def format_duration_seconds(seconds):
+    """Formats seconds into HH:MM:SS, returns '-' if None."""
+    try:
+        if seconds is None:
+            return "-"
+        seconds = int(max(0, seconds))
+        hrs = seconds // 3600
+        mins = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    except:
+        return "-"
+
+def _parse_wait_seconds(val):
+    """Parses wait duration from timestamps or numeric durations."""
+    if val is None:
+        return None
+    now = datetime.now(timezone.utc)
+    try:
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                return None
+            # Numeric string
+            if s.replace(".", "", 1).isdigit():
+                val = float(s)
+            else:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                return max((now - dt).total_seconds(), 0)
+        if isinstance(val, (int, float)):
+            v = float(val)
+            # Epoch milliseconds
+            if v > 1e12:
+                return max((now.timestamp() * 1000 - v) / 1000, 0)
+            # Epoch seconds
+            if v > 1e9:
+                return max(now.timestamp() - v, 0)
+            # Assume duration in seconds
+            return max(v, 0)
+    except Exception:
+        return None
+    return None
+
+def _extract_wait_seconds(conv):
+    """Extracts best-effort wait duration in seconds from a queue conversation payload."""
+    candidates = []
+    def add_candidate(v):
+        s = _parse_wait_seconds(v)
+        if s is not None:
+            candidates.append(s)
+
+    for key in ["queueTime", "queueStartTime", "enqueueTime", "startTime", "conversationStart",
+                "waitTime", "timeInQueue", "queueDuration", "waitingTime", "waitSeconds"]:
+        if isinstance(conv, dict) and conv.get(key) is not None:
+            add_candidate(conv.get(key))
+
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    for p in participants:
+        for key in ["queueTime", "queueStartTime", "enqueueTime", "startTime", "connectedTime"]:
+            if p.get(key) is not None:
+                add_candidate(p.get(key))
+        for s in p.get("sessions", []) or []:
+            for key in ["queueTime", "queueStartTime", "enqueueTime", "startTime", "connectedTime"]:
+                if s.get(key) is not None:
+                    add_candidate(s.get(key))
+            for seg in s.get("segments", []) or []:
+                stype = str(seg.get("segmentType", "")).lower()
+                if stype in ["queue", "alert", "acd"] and seg.get("segmentStart") and not seg.get("segmentEnd"):
+                    add_candidate(seg.get("segmentStart"))
+
+    if not candidates:
+        return None
+    return max(candidates)
+
+def _extract_media_type(conv):
+    if not isinstance(conv, dict):
+        return None
+    if conv.get("mediaType"):
+        return conv.get("mediaType")
+    participants = conv.get("participants") or conv.get("participantsDetails") or []
+    for p in participants:
+        for s in p.get("sessions", []) or []:
+            mt = s.get("mediaType")
+            if mt:
+                return mt
+    return None
+
+def _seconds_since(iso_str):
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        return max((datetime.now(timezone.utc) - dt).total_seconds(), 0)
+    except Exception:
+        return None
+
+def _has_ivr_participant(conv):
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose in ["ivr", "flow"]:
+            return True
+    return False
+
+def _session_is_active(session):
+    state = (session.get("state") or "").lower()
+    if session.get("disconnectedTime"):
+        return False
+    return state in ["alerting", "connected", "offering", "dialing", "communicating", "contacting"]
+
+def _classify_conversation_state(conv):
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    has_agent = False
+    has_queue = False
+    has_ivr = False
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        sessions = p.get("sessions", []) or []
+        if purpose in ["ivr", "flow"] and not sessions:
+            has_ivr = True
+        for s in sessions:
+            active = _session_is_active(s)
+            if not active:
+                continue
+            if purpose in ["agent", "user"]:
+                has_agent = True
+            elif purpose in ["acd", "queue"]:
+                has_queue = True
+            elif purpose in ["ivr", "flow"]:
+                has_ivr = True
+    if has_agent:
+        return "interacting"
+    if has_queue:
+        return "waiting"
+    if has_ivr:
+        return "ivr"
+    return "unknown"
+
+def _extract_direction_label(conv):
+    direction = (conv or {}).get("originatingDirection") or (conv or {}).get("direction")
+    if not direction:
+        return None
+    direction = str(direction).lower()
+    if "inbound" in direction:
+        return "Inbound"
+    if "outbound" in direction:
+        return "Outbound"
+    return None
+
+def _extract_queue_name_from_conv(conv, queue_id_to_name=None):
+    queue_id_to_name = queue_id_to_name or {}
+    if isinstance(conv, dict):
+        qname = conv.get("queueName")
+        if qname:
+            return qname
+        qid = conv.get("queueId")
+        if qid and qid in queue_id_to_name:
+            return queue_id_to_name.get(qid)
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose in ["acd", "queue"]:
+            q_id = p.get("queueId") or p.get("routingQueueId") or p.get("participantId")
+            if q_id and q_id in queue_id_to_name:
+                return queue_id_to_name.get(q_id)
+            name = p.get("name")
+            if name:
+                return name
+            qobj = p.get("queue") or {}
+            if isinstance(qobj, dict):
+                if qobj.get("name"):
+                    return qobj.get("name")
+                qid = qobj.get("id")
+                if qid and qid in queue_id_to_name:
+                    return queue_id_to_name.get(qid)
+            for s in p.get("sessions", []) or []:
+                qid = s.get("queueId") or s.get("routingQueueId")
+                if qid and qid in queue_id_to_name:
+                    return queue_id_to_name.get(qid)
+                qname = s.get("queueName")
+                if qname:
+                    return qname
+    # Analytics segments
+    for seg in (conv or {}).get("segments") or []:
+        qname = seg.get("queueName")
+        if qname:
+            return qname
+        qobj = seg.get("queue") or {}
+        if isinstance(qobj, dict):
+            if qobj.get("name"):
+                return qobj.get("name")
+            qid = qobj.get("id")
+            if qid and qid in queue_id_to_name:
+                return queue_id_to_name.get(qid)
+        qid = seg.get("queueId")
+        if qid and qid in queue_id_to_name:
+            return queue_id_to_name.get(qid)
+    return None
+
+def _extract_queue_id_from_conv(conv):
+    if isinstance(conv, dict):
+        qid = conv.get("queueId")
+        if qid:
+            return qid
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose in ["acd", "queue"]:
+            q_id = p.get("queueId") or p.get("routingQueueId") or p.get("participantId")
+            if q_id:
+                return q_id
+            qobj = p.get("queue") or {}
+            if isinstance(qobj, dict):
+                qid = qobj.get("id")
+                if qid:
+                    return qid
+            for s in p.get("sessions", []) or []:
+                qid = s.get("queueId") or s.get("routingQueueId")
+                if qid:
+                    return qid
+    for seg in (conv or {}).get("segments") or []:
+        qid = seg.get("queueId")
+        if qid:
+            return qid
+        qobj = seg.get("queue") or {}
+        if isinstance(qobj, dict):
+            qid = qobj.get("id")
+            if qid:
+                return qid
+    return None
+
+def _extract_agent_id_from_conv(conv):
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose in ["agent", "user"]:
+            return p.get("userId") or (p.get("user") or {}).get("id") or p.get("participantId")
+    return None
+
+def _extract_agent_name_from_conv(conv):
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose in ["agent", "user"]:
+            return p.get("name") or (p.get("user") or {}).get("name")
+    return None
+
+def _is_generic_queue_name(name):
+    if not name:
+        return True
+    return str(name).strip().lower() in ["aktif", "active"]
+
+def _merge_call(existing, incoming):
+    if not existing:
+        return dict(incoming) if incoming else {}
+    merged = dict(existing)
+    def _state_rank(v):
+        v = (v or "").lower()
+        if v == "interacting":
+            return 3
+        if v == "waiting":
+            return 2
+        if v == "ivr":
+            return 1
+        return 0
+    for k, v in (incoming or {}).items():
+        if v is None or v == "":
+            continue
+        if k == "queue_name":
+            if _is_generic_queue_name(v) and not _is_generic_queue_name(existing.get("queue_name")):
+                continue
+            merged[k] = v
+            continue
+        if k == "state":
+            if _state_rank(v) >= _state_rank(existing.get("state")):
+                merged[k] = v
+            continue
+        merged[k] = v
+    if (merged.get("agent_name") or merged.get("agent_id")) and _state_rank(merged.get("state")) < _state_rank("interacting"):
+        merged["state"] = "interacting"
+    return merged
+
+def _fetch_conversation_meta(api, conv_id, queue_id_to_name, users_info=None):
+    if not api or not conv_id:
+        return None
+    try:
+        conv = api.get_conversation(conv_id)
+    except Exception:
+        conv = None
+    if not conv:
+        return None
+    queue_id = _extract_queue_id_from_conv(conv)
+    queue_name = _extract_queue_name_from_conv(conv, queue_id_to_name)
+    agent_id = _extract_agent_id_from_conv(conv)
+    agent_name = _extract_agent_name_from_conv(conv)
+    if not agent_name and agent_id and users_info:
+        agent_name = users_info.get(agent_id, {}).get("name")
+    return {
+        "conversation_id": conv_id,
+        "queue_id": queue_id,
+        "queue_name": queue_name,
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+    }
+
+def _build_active_calls(conversations, lang, queue_id_to_name=None, users_info=None):
+    items = []
+    for conv in conversations or []:
+        if conv.get("conversationEnd"):
+            continue
+        mt = _extract_media_type(conv)
+        state = _classify_conversation_state(conv)
+        direction_label = _extract_direction_label(conv)
+        queue_id = _extract_queue_id_from_conv(conv)
+        queue_name = _extract_queue_name_from_conv(conv, queue_id_to_name) or "Aktif"
+        agent_id = _extract_agent_id_from_conv(conv)
+        agent_name = _extract_agent_name_from_conv(conv)
+        if not agent_name and agent_id and users_info:
+            agent_name = users_info.get(agent_id, {}).get("name")
+        if state == "interacting":
+            state_label = get_text(lang, "interacting")
+        elif state == "waiting":
+            state_label = get_text(lang, "waiting")
+        elif state == "ivr":
+            state_label = "IVR"
+        else:
+            state_label = None
+
+        wait_s = _extract_wait_seconds(conv)
+        if wait_s is None:
+            wait_s = _seconds_since(conv.get("conversationStart"))
+
+        conv_id = conv.get("conversationId") or conv.get("id")
+        items.append({
+            "conversation_id": conv_id,
+            "queue_id": queue_id,
+            "queue_name": queue_name,
+            "wait_seconds": wait_s,
+            "phone": _extract_phone_from_conv(conv),
+            "direction_label": direction_label,
+            "state_label": state_label,
+            "media_type": mt,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+        })
+    return items
+
+def _extract_phone_from_conv(conv):
+    """Best-effort phone extraction from queue conversations payload."""
+    if not isinstance(conv, dict):
+        return None
+    def _clean(v):
+        return str(v).replace("tel:", "").replace("sip:", "").strip()
+    def _is_phone(v):
+        if not v:
+            return False
+        s = _clean(v)
+        digits = "".join(ch for ch in s if ch.isdigit())
+        return len(digits) >= 7
+
+    participants = conv.get("participants") or conv.get("participantsDetails") or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose in ["external", "customer", "outbound"]:
+            for k in ["ani", "addressOther", "address", "name"]:
+                v = p.get(k)
+                if _is_phone(v):
+                    return _clean(v)
+            for s in p.get("sessions", []) or []:
+                for k in ["ani", "addressOther", "address"]:
+                    v = s.get(k)
+                    if _is_phone(v):
+                        return _clean(v)
+    # Fallback to conversation-level fields (avoid dnis/toAddress)
+    for k in ["ani", "addressOther", "fromAddress", "callerId"]:
+        v = conv.get(k)
+        if _is_phone(v):
+            return _clean(v)
+    return None
 
 st.set_page_config(page_title="Genesys Cloud Reporting", layout="wide")
 
@@ -236,15 +625,33 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     html, body, [data-testid="stAppViewContainer"] { font-family: 'Inter', sans-serif !important; background-color: #ffffff !important; }
-    [data-testid="stVerticalBlockBorderWrapper"] { background-color: #ffffff !important; border: 1px solid #eef2f6 !important; border-radius: 12px !important; padding: 1.5rem !important; margin-bottom: 1.5rem !important; }
+    [data-testid="stAppViewContainer"] > .main { padding-top: 0.5rem !important; }
+    [data-testid="stVerticalBlockBorderWrapper"] { background-color: #ffffff !important; border: 1px solid #eef2f6 !important; border-radius: 12px !important; padding: 1rem !important; margin-bottom: 1rem !important; }
     [data-testid="stHorizontalBlock"] { gap: 4px !important; }
+    [data-testid="stHorizontalBlock"] { align-items: flex-start !important; }
     [data-testid="stColumn"] { min-width: 0 !important; padding: 0 !important; }
-    [data-testid="stMetricContainer"] { background-color: #f8fafb !important; border: 1px solid #f1f5f9 !important; padding: 1rem 0.5rem !important; border-radius: 10px !important; text-align: center; }
+    [data-testid="stMetricContainer"] { background-color: #f8fafb !important; border: 1px solid #f1f5f9 !important; padding: 0.75rem 0.5rem !important; border-radius: 10px !important; text-align: center; }
     [data-testid="stMetricContainer"]:hover { background-color: #f1f5f9 !important; }
     [data-testid="stMetricLabel"] { color: #64748b !important; font-size: 0.75rem !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: 0.05em; }
     [data-testid="stMetricValue"] { color: #1e293b !important; font-size: 1.6rem !important; font-weight: 700 !important; }
     hr { margin: 1.5rem 0 !important; border-color: #f1f5f9 !important; }
     button[aria-label="Show password text"], button[aria-label="Hide password text"] { display: none !important; }
+    h1 { margin-bottom: 0.6rem !important; }
+    h2, h3 { margin-top: 0.6rem !important; margin-bottom: 0.4rem !important; }
+    [data-testid="stExpander"] details { border-radius: 10px !important; }
+    [data-testid="stExpander"] details summary { font-size: 0.9rem !important; padding: 0.35rem 0.6rem !important; }
+    .last-update {
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #64748b;
+        text-align: right;
+        margin-top: 0.2rem;
+        line-height: 1.1;
+    }
+    .last-update span {
+        color: #1e293b;
+        font-weight: 700;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -311,7 +718,7 @@ def load_credentials(org_code):
         creds = json.loads(cipher.decrypt(data).decode('utf-8'))
         # Ensure default values for new fields
         if "utc_offset" not in creds: creds["utc_offset"] = 3
-        if "refresh_interval" not in creds: creds["refresh_interval"] = 10
+        if "refresh_interval" not in creds: creds["refresh_interval"] = 15
         return creds
     except: return {}
 
@@ -323,7 +730,7 @@ def save_credentials(org_code, client_id, client_secret, region, utc_offset=3, *
         "client_secret": client_secret, 
         "region": region,
         "utc_offset": utc_offset,
-        "refresh_interval": kwargs.get("refresh_interval", 10)
+        "refresh_interval": kwargs.get("refresh_interval", 15)
     }).encode('utf-8')
     with open(filename, "wb") as f: f.write(cipher.encrypt(data))
     try: os.chmod(filename, 0o600)
@@ -351,6 +758,21 @@ def generate_password(length=12):
 # --- APP SESSION MANAGEMENT (REMEMBER ME) ---
 def load_app_session():
     try:
+        # 1) Try local encrypted session file first (more reliable on refresh)
+        if os.path.exists(APP_SESSION_FILE):
+            try:
+                cipher = _get_cipher()
+                raw_file = open(APP_SESSION_FILE, "rb").read()
+                session_data = json.loads(cipher.decrypt(raw_file).decode("utf-8"))
+                timestamp = session_data.get("timestamp", 0)
+                if pytime.time() - timestamp <= APP_SESSION_TTL:
+                    return session_data
+                # Expired
+                os.remove(APP_SESSION_FILE)
+            except Exception:
+                pass
+
+        # 2) Fallback to cookie
         cookies = _get_cookie_manager()
         raw = cookies.get(APP_SESSION_COOKIE)
         if not raw:
@@ -366,6 +788,19 @@ def load_app_session():
 
 def save_app_session(user_data):
     try:
+        # Save to local encrypted session file for robustness
+        try:
+            cipher = _get_cipher()
+            payload = {**user_data, "timestamp": pytime.time()}
+            with open(APP_SESSION_FILE, "wb") as f:
+                f.write(cipher.encrypt(json.dumps(payload).encode("utf-8")))
+            try:
+                os.chmod(APP_SESSION_FILE, 0o600)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         cookies = _get_cookie_manager()
         payload = {**user_data, "timestamp": pytime.time()}
         cookies[APP_SESSION_COOKIE] = json.dumps(payload)
@@ -472,6 +907,146 @@ def _get_dm_store():
 def _shared_org_session_store():
     return {"lock": threading.Lock(), "orgs": {}}
 
+@st.cache_resource(show_spinner=False)
+def _shared_notif_store():
+    return {"lock": threading.Lock(), "call": {}, "agent": {}, "global": {}}
+
+@st.cache_resource(show_spinner=False)
+def _shared_seed_store():
+    return {"lock": threading.Lock(), "orgs": {}}
+
+def _ensure_seed_org(store, org_code):
+    org = store["orgs"].setdefault(org_code, {
+        "call_seed_ts": 0,
+        "call_seed_data": [],
+        "ivr_calls_ts": 0,
+        "ivr_calls_data": [],
+        "agent_seed_ts": 0,
+        "agent_presence": {},
+        "agent_routing": {},
+        "call_meta": {},
+    })
+    # Ensure backward-compatible keys
+    org.setdefault("call_seed_ts", 0)
+    org.setdefault("call_seed_data", [])
+    org.setdefault("ivr_calls_ts", 0)
+    org.setdefault("ivr_calls_data", [])
+    org.setdefault("agent_seed_ts", 0)
+    org.setdefault("agent_presence", {})
+    org.setdefault("agent_routing", {})
+    org.setdefault("call_meta", {})
+    return org
+
+def _get_shared_call_seed(org_code):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        return org.get("call_seed_ts", 0), list(org.get("call_seed_data") or [])
+
+def _reserve_call_seed(org_code, now_ts, min_interval=10):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        last_ts = org.get("call_seed_ts", 0)
+        if (now_ts - last_ts) < min_interval:
+            return False
+        org["call_seed_ts"] = now_ts
+        return True
+
+def _update_call_seed(org_code, seed_calls, now_ts):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        org["call_seed_ts"] = now_ts
+        org["call_seed_data"] = list(seed_calls or [])
+
+def _get_shared_call_meta(org_code, max_age_seconds=7200):
+    store = _shared_seed_store()
+    now = pytime.time()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        meta = org.get("call_meta", {})
+        stale = [cid for cid, v in meta.items() if (now - v.get("ts", 0)) > max_age_seconds]
+        for cid in stale:
+            meta.pop(cid, None)
+        return dict(meta)
+
+def _update_call_meta(org_code, calls, now_ts):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        meta = org.setdefault("call_meta", {})
+        for c in calls or []:
+            cid = c.get("conversation_id")
+            if not cid:
+                continue
+            qname = c.get("queue_name")
+            qid = c.get("queue_id")
+            agent_id = c.get("agent_id")
+            agent_name = c.get("agent_name")
+            if not qname and not qid and not agent_id and not agent_name:
+                continue
+            entry = meta.get(cid, {})
+            if qname and not _is_generic_queue_name(qname):
+                entry["queue_name"] = qname
+            if qid:
+                entry["queue_id"] = qid
+            if agent_id:
+                entry["agent_id"] = agent_id
+            if agent_name:
+                entry["agent_name"] = agent_name
+            entry["ts"] = now_ts
+            meta[cid] = entry
+
+def _get_shared_agent_seed(org_code):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        return org.get("agent_seed_ts", 0), dict(org.get("agent_presence") or {}), dict(org.get("agent_routing") or {})
+
+def _reserve_agent_seed(org_code, now_ts, min_interval=60):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        last_ts = org.get("agent_seed_ts", 0)
+        if (now_ts - last_ts) < min_interval:
+            return False
+        org["agent_seed_ts"] = now_ts
+        return True
+
+def _merge_agent_seed(org_code, presence_map, routing_map, now_ts):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        if presence_map:
+            org["agent_presence"].update(presence_map)
+        if routing_map:
+            org["agent_routing"].update(routing_map)
+        org["agent_seed_ts"] = now_ts
+
+def _get_shared_ivr_calls(org_code):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        return org.get("ivr_calls_ts", 0), list(org.get("ivr_calls_data") or [])
+
+def _reserve_ivr_calls(org_code, now_ts, min_interval=10):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        last_ts = org.get("ivr_calls_ts", 0)
+        if (now_ts - last_ts) < min_interval:
+            return False
+        org["ivr_calls_ts"] = now_ts
+        return True
+
+def _update_ivr_calls(org_code, calls, now_ts):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        org["ivr_calls_ts"] = now_ts
+        org["ivr_calls_data"] = list(calls or [])
+
 def _get_session_id():
     if "_session_id" not in st.session_state:
         st.session_state._session_id = str(uuid.uuid4())
@@ -516,6 +1091,21 @@ def _get_org_session_stats(org_code):
             union_agent.update(s.get("agent_queues", {}))
         return len(org["sessions"]), len(union_queues), len(union_agent)
 
+def _get_union_session_maps(org_code):
+    store = _shared_org_session_store()
+    now = pytime.time()
+    with store["lock"]:
+        org = store["orgs"].get(org_code, {"sessions": {}})
+        stale = [sid for sid, s in org["sessions"].items() if now - s.get("ts", 0) > SESSION_TTL_SECONDS]
+        for sid in stale:
+            org["sessions"].pop(sid, None)
+        union_queues = {}
+        union_agent = {}
+        for s in org["sessions"].values():
+            union_queues.update(s.get("queues", {}))
+            union_agent.update(s.get("agent_queues", {}))
+        return union_queues, union_agent
+
 def _remove_org_session(org_code):
     store = _shared_org_session_store()
     session_id = st.session_state.get("_session_id")
@@ -558,6 +1148,36 @@ def ensure_data_manager():
     dm = get_shared_data_manager(org_code)
     st.session_state.data_manager = dm
     return dm
+
+def ensure_notifications_manager():
+    org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
+    store = _shared_notif_store()
+    with store["lock"]:
+        nm = store["call"].get(org_code)
+        if nm is None:
+            nm = NotificationManager()
+            store["call"][org_code] = nm
+    return nm
+
+def ensure_agent_notifications_manager():
+    org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
+    store = _shared_notif_store()
+    with store["lock"]:
+        nm = store["agent"].get(org_code)
+        if nm is None or not hasattr(nm, "seed_users_missing") or not hasattr(nm, "get_active_calls"):
+            nm = AgentNotificationManager()
+            store["agent"][org_code] = nm
+    return nm
+
+def ensure_global_conversation_manager():
+    org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
+    store = _shared_notif_store()
+    with store["lock"]:
+        nm = store["global"].get(org_code)
+        if nm is None or not hasattr(nm, "get_active_conversations"):
+            nm = GlobalConversationNotificationManager()
+            store["global"][org_code] = nm
+    return nm
 
 def _fetch_org_maps(api):
     users = api.get_users()
@@ -607,6 +1227,7 @@ def refresh_data_manager_queues():
         
     all_dashboard_queues = {} # For metrics (Observations/Daily)
     agent_queues_map = {} # For agent details (First queue of card)
+    use_agent_notif = st.session_state.get('use_agent_notifications', True)
     
     if 'dashboard_cards' in st.session_state:
         norm_map = {k.strip(): v for k, v in st.session_state.queues_map.items()}
@@ -636,7 +1257,8 @@ def refresh_data_manager_queues():
     # We use all_dashboard_queues for overall metrics (efficiency)
     # Pass empty dicts ({}) if empty, do NOT fall back to 'None' or full map
     st.session_state.data_manager.update_api_client(st.session_state.api_client, st.session_state.get('presence_map'))
-    st.session_state.data_manager.start(union_queues, union_agent_queues)
+    dm_agent_queues = {} if use_agent_notif else union_agent_queues
+    st.session_state.data_manager.start(union_queues, dm_agent_queues)
 
 def create_gauge_chart(value, title, height=250):
     try:
@@ -644,11 +1266,16 @@ def create_gauge_chart(value, title, height=250):
             value = 0
     except Exception:
         value = 0
+    value = float(value)
     fig = go.Figure(go.Indicator(
-        mode = "gauge+number", value = value, title = {'text': title},
-        gauge = {'axis': {'range': [0, 100]}, 'bar': {'color': "#00AEC7"},
-                 'steps': [{'range': [0, 50], 'color': "#ffebee"}, {'range': [50, 80], 'color': "#fff3e0"}, {'range': [80, 100], 'color': "#e8f5e9"}]}))
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=50, b=10), autosize=True)
+        mode="gauge", value=value, title={'text': title},
+        gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "#00AEC7"},
+               'steps': [{'range': [0, 50], 'color': "#ffebee"}, {'range': [50, 80], 'color': "#fff3e0"}, {'range': [80, 100], 'color': "#e8f5e9"}]}))
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=45, b=10), autosize=True)
+    # Scale number size with chart height
+    num_size = max(12, int(height * 0.12))
+    fig.add_annotation(x=0.5, y=0.05, text=f"{value:.0f}", showarrow=False,
+                       font=dict(size=num_size, color="#64748b"))
     return fig
 
 def create_donut_chart(data_dict, title, height=300):
@@ -700,6 +1327,10 @@ if 'wrapup_map' not in st.session_state: st.session_state.wrapup_map = {}
 def init_session_state():
     if 'page' not in st.session_state: st.session_state.page = "Dashboard"
     if 'show_agent_panel' not in st.session_state: st.session_state.show_agent_panel = False
+    if 'show_call_panel' not in st.session_state: st.session_state.show_call_panel = False
+    if 'notifications_manager' not in st.session_state: st.session_state.notifications_manager = None
+    if 'agent_notifications_manager' not in st.session_state: st.session_state.agent_notifications_manager = None
+    if 'use_agent_notifications' not in st.session_state: st.session_state.use_agent_notifications = True
     if 'logged_in' not in st.session_state: st.session_state.logged_in = False
     if 'last_console_log_count' not in st.session_state: st.session_state.last_console_log_count = 0 # Track logged errors
 
@@ -871,7 +1502,7 @@ if page == get_text(lang, "menu_reports"):
         presets = load_presets(org)
         # Single row layout for better alignment
         # Using vertical_alignment="bottom" (Streamlit 1.35+) to align button with inputs
-        c_p1, c_p2, c_p3 = st.columns([3, 2, 1], gap="small", vertical_alignment="bottom")
+        c_p1, c_p2, c_p3, c_p4 = st.columns([3, 2, 1, 1], gap="small", vertical_alignment="bottom")
         
         with c_p1:
             sel_p = st.selectbox(get_text(lang, "select_view"), [get_text(lang, "no_view_selected")] + [p['name'] for p in presets], key="preset_selector")
@@ -892,6 +1523,12 @@ if page == get_text(lang, "menu_reports"):
                 new_p = {"name": p_name_save, "type": st.session_state.get("rep_typ", "report_agent"), "names": st.session_state.get("rep_nam", []), "metrics": st.session_state.get("rep_met", DEFAULT_METRICS), "granularity_label": st.session_state.get("rep_gra", "Toplam"), "fill_gaps": st.session_state.get("rep_fil", False)}
                 presets = [p for p in presets if p['name'] != p_name_save] + [new_p]
                 save_presets(org, presets); st.success(get_text(lang, "view_saved")); st.rerun()
+
+        with c_p4:
+            can_delete = sel_p != get_text(lang, "no_view_selected")
+            if st.button(f"🗑️ {get_text(lang, 'delete_view')}", key="btn_delete_view", width='stretch', disabled=not can_delete) and can_delete:
+                presets = [p for p in presets if p['name'] != sel_p]
+                save_presets(org, presets); st.success(get_text(lang, "view_deleted")); st.rerun()
 
     st.divider()
 
@@ -1691,22 +2328,35 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
     if c_c3:
         if st.session_state.dashboard_mode == "Date": st.session_state.dashboard_date = st.date_input(get_text(lang, "mode_date"), datetime.today(), label_visibility="collapsed")
         elif st.session_state.dashboard_mode == "Live": 
-            c_auto, c_time, c_spacer, c_panel = st.columns([1, 1, 1, 1])
+            c_auto, c_time, c_spacer, c_agent, c_call = st.columns([1, 1, 1, 1, 1])
             auto_ref = c_auto.toggle(get_text(lang, "auto_refresh"), value=True)
             # Toggle moved to far right
-            show_panel = c_panel.toggle(f"👤 {get_text(lang, 'agent_panel')}", value=st.session_state.get('show_agent_panel', False), key='toggle_agent_panel')
-            st.session_state.show_agent_panel = show_panel
+            show_agent_panel = c_agent.toggle(f"👤 {get_text(lang, 'agent_panel')}", value=st.session_state.get('show_agent_panel', False), key='toggle_agent_panel')
+            show_call_panel = c_call.toggle(f"📞 {get_text(lang, 'call_panel')}", value=st.session_state.get('show_call_panel', False), key='toggle_call_panel')
+            st.session_state.show_agent_panel = show_agent_panel
+            st.session_state.show_call_panel = show_call_panel
+            if not show_call_panel and st.session_state.get('notifications_manager'):
+                st.session_state.notifications_manager.stop()
+            if not show_agent_panel:
+                try:
+                    store = _shared_notif_store()
+                    with store["lock"]:
+                        nm = store["agent"].get(org)
+                    if nm:
+                        nm.stop()
+                except Exception:
+                    pass
             
             # Show Last Update Time
             if data_manager.last_update_time > 0:
                 last_upd = datetime.fromtimestamp(data_manager.last_update_time).strftime('%H:%M:%S')
-                c_time.caption(f"Last Update:\n{last_upd}")
+                c_time.markdown(f'<div class="last-update">Last Update: <span>{last_upd}</span></div>', unsafe_allow_html=True)
             
         if st.session_state.dashboard_mode == "Live":
             # DataManager is managed centrally by refresh_data_manager_queues()
             # which is called on login, hot-reload, and config changes.
             # Get dynamic interval (default 10s)
-            ref_int = st.session_state.get('org_config', {}).get('refresh_interval', 10)
+            ref_int = st.session_state.get('org_config', {}).get('refresh_interval', 15)
             if auto_ref: st_autorefresh(interval=ref_int * 1000, key="data_refresh")
 
     # Available metric options
@@ -1735,11 +2385,19 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         "Avg Wait Time": "Ort. Bekleme"
     }
 
-    if st.session_state.get('show_agent_panel', False):
+    show_agent = st.session_state.get('show_agent_panel', False)
+    show_call = st.session_state.get('show_call_panel', False)
+    if show_agent and show_call:
+        # 4-column grid: 2 parts dashboard, 1 part agent, 1 part call
+        main_c, agent_c, call_c = st.columns([2, 1, 1])
+    elif show_agent or show_call:
         main_c, side_c = st.columns([3, 1])
+        agent_c = side_c if show_agent else None
+        call_c = side_c if show_call else None
     else:
         main_c = st.container()
-        side_c = None
+        agent_c = None
+        call_c = None
 
     grid = main_c.columns(st.session_state.dashboard_layout)
     to_del = []
@@ -1747,15 +2405,16 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         with grid[idx % st.session_state.dashboard_layout]:
             # Determine Container Height based on size
             c_size = card.get('size', 'medium')
-            # Base heights: Small=500, Medium=650, Large=800 (Adjusted for content)
-            c_height = 500 if c_size == 'small' else (650 if c_size == 'medium' else 800)
+            # Base heights: xsmall=300, Small=500, Medium=650, Large=800 (Adjusted for content)
+            c_height = 300 if c_size == 'xsmall' else (500 if c_size == 'small' else (650 if c_size == 'medium' else 800))
             
             with st.container(height=c_height, border=True):
                 card_title = card['title'] if card['title'] else f"Grup #{card['id']+1}"
                 st.markdown(f"### {card_title}")
                 with st.expander(f"⚙️ Settings", expanded=False):
                     card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
-                    card['size'] = st.selectbox("Size", ["small", "medium", "large"], index=["small", "medium", "large"].index(card.get('size', 'medium')), key=f"sz_{card['id']}")
+                    size_opts = ["xsmall", "small", "medium", "large"]
+                    card['size'] = st.selectbox("Size", size_opts, index=size_opts.index(card.get('size', 'medium')), key=f"sz_{card['id']}")
                     card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
                     queue_options = list(st.session_state.queues_map.keys())
                     queue_defaults = [q for q in card.get('queues', []) if q in queue_options]
@@ -1943,11 +2602,11 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     # Dynamic Height: Smaller if multiple visuals to fit side-by-side without overflowing vertically if wrapped (though we will use cols)
                     # Actually if side-by-side, we can keep reasonable height but maybe separate row if too many?
                     # For now, put them all in one row.
-                    base_h = 130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190)
+                    base_h = 100 if card.get('size') == 'xsmall' else (130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190))
                     # If multiple, potentially reduce slightly or keep same? User said "too big".
                     # Let's trust the reduced base_h.
                     
-                    panel_key_suffix = "open" if st.session_state.get('show_agent_panel', False) else "closed"
+                    panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
 
                     if visuals:
                         cols = st.columns(len(visuals))
@@ -1978,8 +2637,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     
                     # Render selected visuals
                     visuals = card.get('visual_metrics', ["Service Level"])
-                    base_h = 130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190)
-                    panel_key_suffix = "open" if st.session_state.get('show_agent_panel', False) else "closed"
+                    base_h = 100 if card.get('size') == 'xsmall' else (130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190))
+                    panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
 
                     if visuals:
                         cols = st.columns(len(visuals))
@@ -2001,8 +2660,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         st.rerun()
 
     # --- SIDE PANEL LOGIC ---
-    if st.session_state.get('show_agent_panel', False) and side_c:
-        with side_c:
+    if st.session_state.get('show_agent_panel', False) and agent_c:
+        with agent_c:
             # --- Compact CSS for Agent List and Filters ---
             st.markdown("""
                 <style>
@@ -2050,11 +2709,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             """, unsafe_allow_html=True)
 
             # Filter Text Input
-            sc1, sc2 = st.columns([4, 1])
-            search_term = sc1.text_input("🔍 Agent Ara", "", label_visibility="collapsed", placeholder="Agent Ara...").lower()
-            if sc2.button("🔄", help="Hemen Yenile"):
-                data_manager._fetch_all_data()
-                st.rerun()
+            search_term = st.text_input("🔍 Agent Ara", "", label_visibility="collapsed", placeholder="Agent Ara...").lower()
             
             # Card/Group Filter
             group_options = ["Hepsi (All)"] + [card['title'] or f"Grup #{idx+1}" for idx, card in enumerate(st.session_state.dashboard_cards)]
@@ -2079,43 +2734,83 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             elif st.session_state.dashboard_mode != "Live":
                 st.warning("Agent detayları sadece CANLI modda görünür.")
             else:
-                # DEBUG INFO (Visible if empty or for technical check)
-                with st.expander("🛠 Debug Info", expanded=False):
-                    st.write(f"Total Queues in System: {len(st.session_state.queues_map)}")
-                    st.write(f"Total Dashboard Cards: {len(st.session_state.dashboard_cards)}") # Proof for user
-                    st.write(f"Monitored Agent Queues: {len(data_manager.agent_queues_map)}")
-                    
-                    if st.button("🚨 Sıfırla (Reset Dashboard)", help="Tüm kartları siler ve varsayılan ayarlara döner."):
-                        st.session_state.dashboard_cards = [{"id": 0, "title": "", "queues": [], "size": "medium"}]
-                        st.session_state.dashboard_layout = 3
-                        save_dashboard_config(org, 3, st.session_state.dashboard_cards)
-                        refresh_data_manager_queues()
-                        st.rerun()
+                use_agent_notif = st.session_state.get('use_agent_notifications', True)
+                agent_notif = None
+                agent_data = {}
+                members_map = {}
+                tracked_ids = set()
 
-                    if data_manager.agent_queues_map:
-                        st.json(data_manager.agent_queues_map)
-                    st.write(f"Membership Cache (Queue -> Count):")
-                    for q_id_log, mem_list in data_manager.queue_members_cache.items():
-                        st.write(f"- {q_id_log}: {len(mem_list)} members")
-                    
-                    st.write(f"Agent Detail Cache Size: {len(data_manager.agent_details_cache)}")
-                    st.write(f"Last Background Update: {datetime.fromtimestamp(data_manager.last_update_time).strftime('%H:%M:%S') if data_manager.last_update_time else 'Never'}")
-                    
-                    if st.button("Force Global Fetch"):
-                        print("DEBUG: Force Fetch Triggered")
-                        data_manager._fetch_all_data()
-                        print(f"DEBUG: Cache after fetch: {len(data_manager.queue_members_cache)} queues")
-                        st.rerun()
-                    
-                    if st.button("Clear Cache & Retry"):
-                        data_manager.queue_members_cache = {}
-                        data_manager.agent_details_cache = {}
-                        data_manager.last_member_refresh = 0
-                        st.rerun()
+                if use_agent_notif:
+                    if not st.session_state.get('api_client'):
+                        st.warning(get_text(lang, "genesys_not_connected"))
+                    else:
+                        agent_notif = ensure_agent_notifications_manager()
+                        agent_notif.update_client(
+                            st.session_state.api_client,
+                            st.session_state.queues_map,
+                            st.session_state.get('users_info'),
+                            st.session_state.get('presence_map')
+                        )
+                        queue_ids = [st.session_state.queues_map.get(q) for q in all_queues if st.session_state.queues_map.get(q)]
+                        union_queues_map, union_agent_map = _get_union_session_maps(org)
+                        notif_queue_ids = list(union_agent_map.values()) if union_agent_map else queue_ids
+                        members_map = agent_notif.ensure_members(notif_queue_ids)
+                        user_ids = sorted({m.get("id") for mems in members_map.values() for m in mems if m.get("id")})
+                        max_users = (agent_notif.MAX_TOPICS_PER_CHANNEL * agent_notif.MAX_CHANNELS) // 3
+                        if len(user_ids) > max_users:
+                            st.warning(get_text(lang, "agent_panel_topic_limit"))
+                            user_ids = user_ids[:max_users]
+                        tracked_ids = set(user_ids)
+                        if user_ids:
+                            agent_notif.start(user_ids)
+                            if not agent_notif.connected:
+                                st.info(get_text(lang, "agent_panel_notif_connecting"))
 
-                # Get cached details from DataManager
-                agent_data = st.session_state.data_manager.get_agent_details(all_queues)
-                
+                        # Seed from API if notifications cache is empty/stale
+                        now_ts = pytime.time()
+                        shared_ts, shared_presence, shared_routing = _get_shared_agent_seed(org)
+                        last_msg = getattr(agent_notif, "last_message_ts", 0)
+                        last_evt = getattr(agent_notif, "last_event_ts", 0)
+                        notif_stale = (not agent_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > 60)
+                        if user_ids:
+                            if (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {})) or notif_stale:
+                                if _reserve_agent_seed(org, now_ts, min_interval=60):
+                                    try:
+                                        api = GenesysAPI(st.session_state.api_client)
+                                        snap = api.get_users_status_scan(target_user_ids=user_ids)
+                                        pres = snap.get("presence") or {}
+                                        rout = snap.get("routing") or {}
+                                        agent_notif.seed_users(pres, rout)
+                                        _merge_agent_seed(org, pres, rout, now_ts)
+                                    except Exception:
+                                        pass
+                            else:
+                                if shared_presence or shared_routing:
+                                    pres = {uid: shared_presence.get(uid) for uid in user_ids if uid in shared_presence}
+                                    rout = {uid: shared_routing.get(uid) for uid in user_ids if uid in shared_routing}
+                                    if pres or rout:
+                                        agent_notif.seed_users_missing(pres, rout)
+                        for q_name in all_queues:
+                            q_id = st.session_state.queues_map.get(q_name)
+                            mems = members_map.get(q_id, [])
+                            items = []
+                            for m in mems:
+                                uid = m.get("id")
+                                if tracked_ids and uid not in tracked_ids:
+                                    continue
+                                name = m.get("name") or st.session_state.users_info.get(uid, {}).get("name", "Unknown")
+                                presence = agent_notif.get_user_presence(uid) if agent_notif else {}
+                                routing = agent_notif.get_user_routing(uid) if agent_notif else {}
+                                items.append({
+                                    "id": uid,
+                                    "user": {"id": uid, "name": name, "presence": presence},
+                                    "routingStatus": routing,
+                                })
+                            agent_data[q_name] = items
+                else:
+                    # Get cached details from DataManager
+                    agent_data = st.session_state.data_manager.get_agent_details(all_queues)
+
                 if not agent_data:
                     st.info("Veri bekleniyor...")
                 else:
@@ -2190,7 +2885,11 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
                     st.markdown(f'<p class="aktif-sayisi">Aktif: {len(all_members)}</p>', unsafe_allow_html=True)
                     
-                    for m in all_members:
+                    max_display = 200
+                    for i, m in enumerate(all_members):
+                        if i >= max_display:
+                            st.caption(f"+{len(all_members) - max_display} daha fazla kayıt")
+                            break
                         user_obj = m.get('user', {})
                         name = user_obj.get('name', 'Unknown')
                         # Parse status
@@ -2251,3 +2950,380 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                     </div>
                                 </div>
                             """, unsafe_allow_html=True)
+
+    # --- CALL PANEL LOGIC ---
+    if st.session_state.get('show_call_panel', False) and call_c:
+        with call_c:
+
+            st.markdown("""
+                <style>
+                    .call-card {
+                        padding: 6px 10px !important;
+                        margin-bottom: 6px !important;
+                        border-radius: 8px !important;
+                        border: 1px solid #f1f5f9 !important;
+                        background: #ffffff;
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 10px;
+                    }
+                    .call-queue {
+                        font-size: 1.0rem !important;
+                        font-weight: 600 !important;
+                        color: #1e293b;
+                        line-height: 1.2;
+                    }
+                    .call-wait {
+                        font-size: 0.95rem !important;
+                        color: #334155;
+                        font-weight: 600;
+                        white-space: nowrap;
+                    }
+                    .call-meta {
+                        font-size: 0.9rem;
+                        color: #94a3b8;
+                        margin-top: 3px;
+                    }
+                    .call-queue { line-height: 1.15; }
+                    .call-info { min-width: 0; }
+                    .panel-count {
+                        font-size: 0.85rem;
+                        color: #64748b;
+                        margin-top: -5px !important;
+                        margin-bottom: 5px !important;
+                    }
+                    .panel-top-spacer {
+                        height: 38px;
+                    }
+                </style>
+            """, unsafe_allow_html=True)
+
+            st.markdown("####")
+            st.write("")
+
+            # No filter: show all active calls (waiting + interacting)
+            waiting_calls = []
+            group_options = ["Hepsi (All)"] + [card['title'] or f"Grup #{idx+1}" for idx, card in enumerate(st.session_state.dashboard_cards)]
+            selected_group = st.selectbox("📌 Grup (Kartlar)", group_options, index=0, key="call_panel_group")
+            hide_mevcut = st.checkbox("Mevcut içeren kuyrukları gizle", value=False, key="call_panel_hide_mevcut")
+            group_queues = set()
+            if selected_group != "Hepsi (All)":
+                for idx, card in enumerate(st.session_state.dashboard_cards):
+                    label = card['title'] or f"Grup #{idx+1}"
+                    if label == selected_group and card.get('queues'):
+                        group_queues.update(card['queues'])
+                        break
+
+            # Always use full org queues for call panel; group filter is optional
+            all_queues = set(st.session_state.get('queues_map', {}).keys())
+
+            if st.session_state.dashboard_mode != "Live":
+                st.warning(get_text(lang, "call_panel_live_only"))
+            elif not st.session_state.get('api_client'):
+                st.warning(get_text(lang, "genesys_not_connected"))
+            else:
+                if not all_queues:
+                    st.info(get_text(lang, "no_queue_selected"))
+                else:
+                    now_ts = pytime.time()
+                    union_queues_map, union_agent_map = _get_union_session_maps(org)
+                    queue_id_to_name = {v: k for k, v in st.session_state.queues_map.items()}
+                    global_notif = ensure_global_conversation_manager()
+                    global_notif.update_client(st.session_state.api_client, st.session_state.queues_map)
+                    global_topics = [
+                        "v2.conversations.calls",
+                        "v2.conversations.chats",
+                        "v2.conversations.emails",
+                        "v2.conversations.messages",
+                        "v2.conversations.callbacks",
+                    ]
+                    global_notif.start(global_topics)
+                    active_calls = global_notif.get_active_conversations()
+
+                    agent_active = []
+                    agent_notif = None
+                    if st.session_state.get("show_agent_panel", False):
+                        agent_notif = ensure_agent_notifications_manager()
+                        agent_notif.update_client(
+                            st.session_state.api_client,
+                            st.session_state.queues_map,
+                            st.session_state.get('users_info'),
+                            st.session_state.get('presence_map')
+                        )
+                        if agent_notif.is_running() or agent_notif.connected:
+                            try:
+                                agent_active = agent_notif.get_active_calls()
+                            except Exception:
+                                agent_active = []
+
+                    notif = ensure_notifications_manager()
+                    notif.update_client(st.session_state.api_client, st.session_state.queues_map)
+                    all_queue_ids = list(st.session_state.queues_map.values())
+                    if selected_group == "Hepsi (All)":
+                        sub_queue_ids = all_queue_ids
+                    else:
+                        sub_queue_ids = list(union_queues_map.values()) if union_queues_map else all_queue_ids
+                    if len(sub_queue_ids) > 1000:
+                        st.warning(get_text(lang, "call_panel_topic_limit"))
+                        sub_queue_ids = all_queue_ids
+                    notif.start(sub_queue_ids)
+                    queue_waiting = notif.get_waiting_calls()
+
+                    notif_stale = not notif.connected or getattr(notif, "last_message_ts", 0) == 0
+                    shared_seed_ts, shared_seed_calls = _get_shared_call_seed(org)
+                    if (not queue_waiting or notif_stale) and (now_ts - shared_seed_ts) <= 10 and shared_seed_calls:
+                        queue_waiting = shared_seed_calls
+
+                    if (not queue_waiting or notif_stale) and _reserve_call_seed(org, now_ts, min_interval=10):
+                        api = GenesysAPI(st.session_state.api_client)
+                        id_map = {v: k for k, v in st.session_state.queues_map.items()}
+                        obs_resp = api.get_queue_observations(list(id_map.keys()))
+                        from src.processor import process_observations
+                        obs_list = process_observations(obs_resp, id_map)
+                        obs_map = {row["Queue"]: row for row in obs_list}
+
+                        waiting_queues = []
+                        for q in all_queues:
+                            obs = obs_map.get(q)
+                            if obs and obs.get("Waiting", {}).get("Total", 0) > 0:
+                                waiting_queues.append(q)
+                        if waiting_queues:
+                            seed_calls = []
+                            for q in waiting_queues:
+                                q_id = st.session_state.queues_map.get(q)
+                                if not q_id:
+                                    continue
+                                convs = api.get_queue_conversations(q_id)
+                                for conv in convs or []:
+                                    wait_s = _extract_wait_seconds(conv)
+                                    conv_id = None
+                                    if isinstance(conv, dict):
+                                        conv_id = conv.get("conversationId") or conv.get("id")
+                                        if not conv_id and isinstance(conv.get("conversation"), dict):
+                                            conv_id = conv.get("conversation", {}).get("id")
+                                    phone = _extract_phone_from_conv(conv)
+                                    if conv_id:
+                                        seed_calls.append({
+                                            "conversation_id": conv_id,
+                                            "queue_id": q_id,
+                                            "queue_name": q,
+                                            "wait_seconds": wait_s,
+                                            "phone": phone,
+                                        })
+                            if seed_calls:
+                                notif.upsert_waiting_calls(seed_calls)
+                                queue_waiting = notif.get_waiting_calls()
+                            _update_call_seed(org, seed_calls, now_ts)
+                        else:
+                            _update_call_seed(org, [], now_ts)
+
+                for c in queue_waiting:
+                    if "state" not in c:
+                        c["state"] = "waiting"
+                    if "media_type" not in c:
+                        c["media_type"] = _extract_media_type(c) or "voice"
+
+                combined = {}
+                for c in queue_waiting:
+                    cid = c.get("conversation_id")
+                    if cid:
+                        combined[cid] = c
+                for c in active_calls:
+                    cid = c.get("conversation_id")
+                    if cid:
+                        combined[cid] = _merge_call(combined.get(cid), c)
+                for c in agent_active:
+                    cid = c.get("conversation_id")
+                    if cid:
+                        combined[cid] = _merge_call(combined.get(cid), c)
+
+                active_calls = list(combined.values())
+
+                # Always merge recent analytics to capture IVR-only calls
+                shared_ts, shared_calls = _get_shared_ivr_calls(org)
+                analytics_calls = shared_calls if (now_ts - shared_ts) <= 20 and shared_calls else []
+                if _reserve_ivr_calls(org, now_ts, min_interval=20):
+                    api = GenesysAPI(st.session_state.api_client)
+                    end_dt = datetime.now(timezone.utc)
+                    start_dt = end_dt - timedelta(minutes=30)
+                    convs = api.get_conversation_details_recent(start_dt, end_dt, page_size=100, max_pages=5, order="desc")
+                    analytics_calls = _build_active_calls(convs, lang, queue_id_to_name, st.session_state.get('users_info'))
+                    _update_ivr_calls(org, analytics_calls, now_ts)
+
+                if analytics_calls:
+                    for c in analytics_calls:
+                        cid = c.get("conversation_id")
+                        if cid:
+                            combined[cid] = _merge_call(combined.get(cid), c)
+                    active_calls = list(combined.values())
+
+                # Fill queue/agent from cached metadata and ids
+                call_meta = _get_shared_call_meta(org)
+                # Fill missing queue/agent via direct conversation lookup (throttled)
+                missing_meta_ids = []
+                for c in active_calls:
+                    cid = c.get("conversation_id")
+                    if not cid:
+                        continue
+                    meta_entry = call_meta.get(cid)
+                    meta_ts = meta_entry.get("ts", 0) if meta_entry else 0
+                    if (now_ts - meta_ts) < 60:
+                        continue
+                    missing_queue = _is_generic_queue_name(c.get("queue_name")) and not c.get("queue_id")
+                    missing_agent = not c.get("agent_name") and not c.get("agent_id")
+                    if missing_queue or missing_agent:
+                        missing_meta_ids.append(cid)
+                if missing_meta_ids:
+                    api = GenesysAPI(st.session_state.api_client)
+                    lookups = 0
+                    for cid in missing_meta_ids:
+                        if lookups >= 3:
+                            break
+                        meta = _fetch_conversation_meta(api, cid, queue_id_to_name, st.session_state.get("users_info"))
+                        lookups += 1
+                        if not meta:
+                            continue
+                        _update_call_meta(org, [meta], now_ts)
+                        meta_copy = dict(meta)
+                        meta_copy["ts"] = now_ts
+                        call_meta[cid] = meta_copy
+                        for c in active_calls:
+                            if c.get("conversation_id") == cid:
+                                c.update({k: v for k, v in meta.items() if v})
+                for c in active_calls:
+                    cid = c.get("conversation_id")
+                    meta = call_meta.get(cid) if cid else None
+                    if meta:
+                        if _is_generic_queue_name(c.get("queue_name")) and meta.get("queue_name"):
+                            c["queue_name"] = meta.get("queue_name")
+                        if not c.get("queue_id") and meta.get("queue_id"):
+                            c["queue_id"] = meta.get("queue_id")
+                        if not c.get("agent_name") and meta.get("agent_name"):
+                            c["agent_name"] = meta.get("agent_name")
+                        if not c.get("agent_id") and meta.get("agent_id"):
+                            c["agent_id"] = meta.get("agent_id")
+                    if _is_generic_queue_name(c.get("queue_name")):
+                        qid = c.get("queue_id")
+                        if qid and qid in queue_id_to_name:
+                            c["queue_name"] = queue_id_to_name.get(qid) or c.get("queue_name")
+                    if not c.get("agent_name"):
+                        aid = c.get("agent_id")
+                        if aid and st.session_state.get("users_info"):
+                            c["agent_name"] = st.session_state.users_info.get(aid, {}).get("name")
+
+                _update_call_meta(org, active_calls + (queue_waiting or []), now_ts)
+
+                # Last resort: map Workgroup from agent's primary queue (first dashboard queue)
+                agent_primary_queue = {}
+                if agent_notif and st.session_state.get("dashboard_cards"):
+                    for card in st.session_state.dashboard_cards:
+                        if card.get("queues"):
+                            qname = card["queues"][0]
+                            qid = st.session_state.queues_map.get(qname)
+                            if qid:
+                                for qid_key, mems in (agent_notif.ensure_members([qid]) or {}).items():
+                                    for m in mems:
+                                        uid = m.get("id")
+                                        if uid and uid not in agent_primary_queue:
+                                            agent_primary_queue[uid] = qname
+                    for c in active_calls:
+                        if not _is_generic_queue_name(c.get("queue_name")):
+                            continue
+                        aid = c.get("agent_id")
+                        if aid and aid in agent_primary_queue:
+                            c["queue_name"] = agent_primary_queue.get(aid)
+
+                waiting_calls = active_calls
+
+                with st.expander("🛠 Debug (Görüşme)", expanded=False):
+                    st.write(f"Global Notif Connected: {global_notif.connected if global_notif else False}")
+                    st.write(f"Global Topics: {len(getattr(global_notif, 'subscribed_topics', [])) if global_notif else 0}")
+                    st.write(f"Active Calls (Global): {len(active_calls) if active_calls else 0}")
+                    st.write(f"Global Last Message: {datetime.fromtimestamp(getattr(global_notif, 'last_message_ts', 0)).strftime('%H:%M:%S') if getattr(global_notif, 'last_message_ts', 0) else 'N/A'}")
+                    st.write(f"Global Last Event: {datetime.fromtimestamp(getattr(global_notif, 'last_event_ts', 0)).strftime('%H:%M:%S') if getattr(global_notif, 'last_event_ts', 0) else 'N/A'}")
+                    st.write(f"Global Last Topic: {getattr(global_notif, 'last_topic', '') or 'N/A'}")
+                    st.write(f"Queue Notif Connected: {notif.connected if notif else False}")
+                    st.write(f"Queue Topics: {len(getattr(notif, 'subscribed_topics', [])) if notif else 0}")
+                    st.write(f"Waiting Calls (Queue): {len(queue_waiting) if queue_waiting else 0}")
+                    st.write(f"Queue Last Message: {datetime.fromtimestamp(getattr(notif, 'last_message_ts', 0)).strftime('%H:%M:%S') if getattr(notif, 'last_message_ts', 0) else 'N/A'}")
+                    st.write(f"Queue Last Event: {datetime.fromtimestamp(getattr(notif, 'last_event_ts', 0)).strftime('%H:%M:%S') if getattr(notif, 'last_event_ts', 0) else 'N/A'}")
+
+                # Smooth UI: keep last non-empty list for a short grace window to avoid flicker
+                cache_key = "call_panel_last_active"
+                ts_key = "call_panel_last_ts_active"
+                prev_calls = st.session_state.get(cache_key, [])
+                prev_ts = st.session_state.get(ts_key, 0)
+                now_ts = pytime.time()
+                if waiting_calls:
+                    st.session_state[cache_key] = waiting_calls
+                    st.session_state[ts_key] = now_ts
+                else:
+                    if prev_calls and (now_ts - prev_ts) < 15:
+                        waiting_calls = prev_calls
+
+                if group_queues:
+                    waiting_calls = [c for c in waiting_calls if c.get("queue_name") in group_queues]
+                if hide_mevcut:
+                    waiting_calls = [c for c in waiting_calls if "mevcut" not in (c.get("queue_name") or "").lower()]
+
+                waiting_calls.sort(key=lambda x: x.get("wait_seconds") if x.get("wait_seconds") is not None else -1, reverse=True)
+
+                st.markdown('<div class="panel-top-spacer"></div>', unsafe_allow_html=True)
+                count_label = "Aktif"
+                st.markdown(f'<p class="panel-count">{count_label}: {len(waiting_calls)}</p>', unsafe_allow_html=True)
+
+                if not waiting_calls:
+                    st.info(get_text(lang, "no_waiting_calls"))
+                else:
+                    max_display = 200
+                    for i, item in enumerate(waiting_calls):
+                        if i >= max_display:
+                            st.caption(f"+{len(waiting_calls) - max_display} daha fazla kayıt")
+                            break
+                        wait_str = format_duration_seconds(item.get("wait_seconds"))
+                        q = item.get("queue_name", "")
+                        queue_display = "-" if _is_generic_queue_name(q) else q
+                        queue_text = f"{queue_display}"
+                        conv_id = item.get("conversation_id")
+                        conv_short = conv_id[-6:] if conv_id and len(conv_id) > 6 else conv_id
+                        phone = item.get("phone")
+                        direction_label = item.get("direction_label")
+                        state_label = item.get("state_label")
+                        media_type = item.get("media_type")
+                        agent_name = item.get("agent_name")
+                        agent_id = item.get("agent_id")
+                        state_value = (item.get("state") or "").lower()
+                        if not direction_label:
+                            d = (item.get("direction") or "").lower()
+                            if "inbound" in d:
+                                direction_label = "Inbound"
+                            elif "outbound" in d:
+                                direction_label = "Outbound"
+                        meta_parts = []
+                        is_interacting = bool(agent_name) or bool(agent_id) or state_value == "interacting" or (state_label == get_text(lang, "interacting"))
+                        state_label = "Bağlandı" if is_interacting else "Bekleyen"
+                        if agent_name and is_interacting:
+                            meta_parts.append(f"Agent: {agent_name}")
+                        if direction_label:
+                            meta_parts.append(str(direction_label))
+                        if state_label:
+                            meta_parts.append(str(state_label))
+                        if media_type:
+                            meta_parts.append(str(media_type))
+                        if phone:
+                            meta_parts.append(str(phone))
+                        if conv_short:
+                            meta_parts.append(f"#{conv_short}")
+                        meta_text = " • ".join(meta_parts)
+                        meta_html = f'<div class="call-meta">{meta_text}</div>' if meta_text else ""
+
+                        st.markdown(f"""
+                            <div class="call-card">
+                                <div class="call-info">
+                                    <div class="call-queue">{queue_text}</div>
+                                    {meta_html}
+                                </div>
+                                <div class="call-wait">{wait_str}</div>
+                            </div>
+                        """, unsafe_allow_html=True)
