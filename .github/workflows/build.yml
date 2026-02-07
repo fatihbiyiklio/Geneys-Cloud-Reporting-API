@@ -55,6 +55,7 @@ jobs:
           --collect-all cryptography `
           --collect-all pyarrow `
           --collect-all reportlab `
+          --hidden-import websocket `
           --add-data "app.py;." `
           --add-data "src;src" `
           run_app.py
@@ -102,6 +103,7 @@ jobs:
           --collect-all cryptography \
           --collect-all pyarrow \
           --collect-all reportlab \
+          --hidden-import websocket \
           --add-data "app.py:." \
           --add-data "src:src" \
           run_app.py
