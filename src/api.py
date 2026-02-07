@@ -64,6 +64,33 @@ class GenesysAPI:
             monitor.log_api_call(path, method="POST", status_code=None, duration_ms=duration_ms)
             monitor.log_error("API_POST", f"System Error on {path}", str(e))
             raise e
+
+    def _put(self, path, data):
+        import requests
+        start = time.monotonic()
+        try:
+            response = requests.put(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="PUT", status_code=response.status_code, duration_ms=duration_ms)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            try:
+                status_code = response.status_code
+            except Exception:
+                status_code = None
+            monitor.log_api_call(path, method="PUT", status_code=status_code, duration_ms=duration_ms)
+            monitor.log_error("API_PUT", f"HTTP {response.status_code} on {path}", str(e))
+            if response.status_code == 401:
+                 print("⚠️ Token expired (401) on PUT.")
+                 raise e
+            raise e
+        except Exception as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="PUT", status_code=None, duration_ms=duration_ms)
+            monitor.log_error("API_PUT", f"System Error on {path}", str(e))
+            raise e
     
     # ... (other methods remain unchanged) ...
 
@@ -109,6 +136,30 @@ class GenesysAPI:
             current_start = current_end
             
         return {"conversations": all_conversations}
+
+    def get_conversation_details_recent(self, start_date, end_date, page_size=100, max_pages=5, order="desc"):
+        """Fetches recent conversation detail records for a short interval."""
+        conversations = []
+        interval = f"{start_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+        try:
+            page_number = 1
+            while True:
+                query = {
+                    "interval": interval,
+                    "paging": {"pageSize": page_size, "pageNumber": page_number},
+                    "order": order,
+                    "orderBy": "conversationStart"
+                }
+                data = self._post("/api/v2/analytics/conversations/details/query", query)
+                page = data.get("conversations") or []
+                if page:
+                    conversations.extend(page)
+                if not page or len(page) < page_size or page_number >= max_pages:
+                    break
+                page_number += 1
+        except Exception as e:
+            print(f"Error fetching recent conversation details: {e}")
+        return conversations
 
     def get_users(self):
         """Fetches all users using direct API with paging."""
@@ -542,6 +593,44 @@ class GenesysAPI:
         except Exception as e:
             print(f"Error fetching queue members for {queue_id}: {e}")
         return members
+
+    def create_notification_channel(self):
+        """Creates a notifications channel for websocket events."""
+        return self._post("/api/v2/notifications/channels", {})
+
+    def subscribe_notification_channel(self, channel_id, topics):
+        """Subscribes a channel to the given list of topics."""
+        return self._put(f"/api/v2/notifications/channels/{channel_id}/subscriptions", topics)
+
+    def get_queue_conversations(self, queue_id, page_size=100, max_pages=3):
+        """Fetches active conversations for a queue (best-effort for waiting calls)."""
+        conversations = []
+        try:
+            page_number = 1
+            while True:
+                params = {"pageNumber": page_number, "pageSize": page_size}
+                data = self._get(f"/api/v2/routing/queues/{queue_id}/conversations", params=params)
+
+                entities = data.get("entities") or data.get("conversations") or data.get("results") or []
+                if entities:
+                    conversations.extend(entities)
+
+                if not data.get("nextUri"):
+                    break
+                page_number += 1
+                if page_number > max_pages:
+                    break
+        except Exception as e:
+            print(f"Error fetching queue conversations for {queue_id}: {e}")
+        return conversations
+
+    def get_conversation(self, conversation_id):
+        """Fetch a single conversation by id."""
+        try:
+            return self._get(f"/api/v2/conversations/{conversation_id}")
+        except Exception as e:
+            print(f"Error fetching conversation {conversation_id}: {e}")
+            return {}
     def get_users_status_scan(self, target_user_ids=None, ignored_user_ids=None):
         """
         Scans for ALL users and their statuses using standard User List API.

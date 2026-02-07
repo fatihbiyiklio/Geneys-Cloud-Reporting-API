@@ -14,6 +14,7 @@ credentials.enc
 logs/
 orgs/
 .app.pid
+.app.lock
 *.pid
 *.log
 .genesys_logged_out
@@ -23,3 +24,4 @@ users.json
 dashboard_config.json
 presets.json
 json
+debug_chat_dump.json
