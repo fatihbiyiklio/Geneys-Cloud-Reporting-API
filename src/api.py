@@ -80,8 +80,15 @@ class GenesysAPI:
                 status_code = response.status_code
             except Exception:
                 status_code = None
+            detail = None
+            try:
+                detail = response.text
+                if detail and len(detail) > 2000:
+                    detail = detail[:2000] + "...(truncated)"
+            except Exception:
+                detail = None
             monitor.log_api_call(path, method="PUT", status_code=status_code, duration_ms=duration_ms)
-            monitor.log_error("API_PUT", f"HTTP {response.status_code} on {path}", str(e))
+            monitor.log_error("API_PUT", f"HTTP {response.status_code} on {path}", detail or str(e))
             if response.status_code == 401:
                  print("⚠️ Token expired (401) on PUT.")
                  raise e

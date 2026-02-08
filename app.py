@@ -15,6 +15,7 @@ import threading
 import uuid
 import signal
 import traceback
+import psutil
 from streamlit_autorefresh import st_autorefresh
 from streamlit.runtime import Runtime
 from streamlit_cookies_manager import EncryptedCookieManager
@@ -2195,7 +2196,7 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
 elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
     st.title(f"🛡️ {get_text(lang, 'admin_panel')}")
     
-    tab1, tab2 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}"])
+    tab1, tab2, tab3 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics"])
     
     with tab1:
         stats = monitor.get_stats()
@@ -2301,6 +2302,79 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                     st.code(err['details'], language="json")
         else:
             st.success("Sistemde kayıtlı hata bulunmuyor.")
+
+    with tab3:
+        st.subheader("Sistem Durumu")
+        proc = psutil.Process(os.getpid())
+        try:
+            rss_mb = proc.memory_info().rss / (1024 * 1024)
+        except Exception:
+            rss_mb = 0
+        try:
+            cpu_pct = proc.cpu_percent(interval=0.1)
+        except Exception:
+            cpu_pct = 0
+        thread_count = len(threading.enumerate())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("RSS Bellek (MB)", f"{rss_mb:.1f}")
+        c2.metric("CPU %", f"{cpu_pct:.1f}")
+        c3.metric("Thread", thread_count)
+
+        st.divider()
+        st.subheader("Notifications Durumu")
+        org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
+        store = _shared_notif_store()
+        with store["lock"]:
+            call_nm = store["call"].get(org_code)
+            agent_nm = store["agent"].get(org_code)
+            global_nm = store["global"].get(org_code)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Queue Notifications**")
+            st.write(f"Channels: {len(getattr(call_nm, 'channels', [])) if call_nm else 0}")
+            st.write(f"Connected: {getattr(call_nm, 'connected', False) if call_nm else False}")
+            st.write(f"Topics: {len(getattr(call_nm, 'subscribed_topics', [])) if call_nm else 0}")
+            st.write(f"Truncated: {getattr(call_nm, 'topics_truncated', False) if call_nm else False}")
+            st.write(f"Backoff (s): {getattr(call_nm, '_backoff_seconds', 0) if call_nm else 0}")
+            st.write(f"Last Error: {getattr(call_nm, 'last_subscribe_error', '') if call_nm else ''}")
+            st.write(f"Waiting Calls Cache: {len(getattr(call_nm, 'waiting_calls', {}) or {}) if call_nm else 0}")
+
+        with c2:
+            st.markdown("**Agent Notifications**")
+            st.write(f"Channels: {len(getattr(agent_nm, 'channels', [])) if agent_nm else 0}")
+            st.write(f"Connected: {getattr(agent_nm, 'connected', False) if agent_nm else False}")
+            st.write(f"Topics: {len(getattr(agent_nm, 'subscribed_topics', [])) if agent_nm else 0}")
+            st.write(f"Active Calls Cache: {len(getattr(agent_nm, 'active_calls', {}) or {}) if agent_nm else 0}")
+            st.write(f"Queue Members Cache: {len(getattr(agent_nm, 'queue_members_cache', {}) or {}) if agent_nm else 0}")
+
+        with c3:
+            st.markdown("**Global Notifications**")
+            st.write(f"Connected: {getattr(global_nm, 'connected', False) if global_nm else False}")
+            st.write(f"Topics: {len(getattr(global_nm, 'subscribed_topics', [])) if global_nm else 0}")
+            st.write(f"Backoff (s): {getattr(global_nm, '_backoff_seconds', 0) if global_nm else 0}")
+            st.write(f"Last Error: {getattr(global_nm, 'last_subscribe_error', '') if global_nm else ''}")
+            st.write(f"Active Conversations Cache: {len(getattr(global_nm, 'active_conversations', {}) or {}) if global_nm else 0}")
+
+        st.divider()
+        st.subheader("DataManager Cache Durumu")
+        dm = st.session_state.get("data_manager")
+        if dm:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Obs Cache", len(getattr(dm, "obs_data_cache", {}) or {}))
+            c2.metric("Daily Cache", len(getattr(dm, "daily_data_cache", {}) or {}))
+            c3.metric("Agent Detail Cache", len(getattr(dm, "agent_details_cache", {}) or {}))
+            st.write(f"Queue Members Cache: {len(getattr(dm, 'queue_members_cache', {}) or {})}")
+            st.write(f"Last Update: {datetime.fromtimestamp(getattr(dm, 'last_update_time', 0)).strftime('%H:%M:%S') if getattr(dm, 'last_update_time', 0) else 'N/A'}")
+        else:
+            st.info("DataManager bulunamadi.")
+
+        st.divider()
+        st.subheader("API Trafik")
+        avg_rate = monitor.get_avg_rate_per_minute()
+        recent_rate = monitor.get_rate_per_minute(minutes=1)
+        st.write(f"Son 1 dk: {recent_rate:.1f} istek/dk")
+        st.write(f"Ortalama: {avg_rate:.1f} istek/dk")
 
     # Logout moved to Organization Settings
     
@@ -3036,7 +3110,6 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         "v2.conversations.chats",
                         "v2.conversations.emails",
                         "v2.conversations.messages",
-                        "v2.conversations.callbacks",
                     ]
                     global_notif.start(global_topics)
                     active_calls = global_notif.get_active_conversations()
@@ -3064,10 +3137,11 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         sub_queue_ids = all_queue_ids
                     else:
                         sub_queue_ids = list(union_queues_map.values()) if union_queues_map else all_queue_ids
-                    if len(sub_queue_ids) > 1000:
-                        st.warning(get_text(lang, "call_panel_topic_limit"))
-                        sub_queue_ids = all_queue_ids
-                    notif.start(sub_queue_ids)
+                    notif_started = notif.start(sub_queue_ids)
+                    if not notif_started:
+                        st.warning("Kuyruk bildirimleri baslatilamadi. Polling moduna dusuluyor.")
+                    if getattr(notif, "topics_truncated", False):
+                        st.warning("Kuyruk bildirimleri limit nedeniyle kisaltildi; bazı kuyruklar anlik gorunmeyebilir.")
                     queue_waiting = notif.get_waiting_calls()
 
                     notif_stale = not notif.connected or getattr(notif, "last_message_ts", 0) == 0
@@ -3075,7 +3149,10 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     if (not queue_waiting or notif_stale) and (now_ts - shared_seed_ts) <= 10 and shared_seed_calls:
                         queue_waiting = shared_seed_calls
 
-                    if (not queue_waiting or notif_stale) and _reserve_call_seed(org, now_ts, min_interval=10):
+                    poll_min_interval = 10
+                    if not notif_started:
+                        poll_min_interval = 60
+                    if (not queue_waiting or notif_stale) and _reserve_call_seed(org, now_ts, min_interval=poll_min_interval):
                         api = GenesysAPI(st.session_state.api_client)
                         id_map = {v: k for k, v in st.session_state.queues_map.items()}
                         obs_resp = api.get_queue_observations(list(id_map.keys()))
@@ -3245,6 +3322,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     st.write(f"Global Last Topic: {getattr(global_notif, 'last_topic', '') or 'N/A'}")
                     st.write(f"Queue Notif Connected: {notif.connected if notif else False}")
                     st.write(f"Queue Topics: {len(getattr(notif, 'subscribed_topics', [])) if notif else 0}")
+                    st.write(f"Queue Channels: {len(getattr(notif, 'channels', [])) if notif else 0}")
+                    st.write(f"Queue Topics Truncated: {getattr(notif, 'topics_truncated', False) if notif else False}")
                     st.write(f"Waiting Calls (Queue): {len(queue_waiting) if queue_waiting else 0}")
                     st.write(f"Queue Last Message: {datetime.fromtimestamp(getattr(notif, 'last_message_ts', 0)).strftime('%H:%M:%S') if getattr(notif, 'last_message_ts', 0) else 'N/A'}")
                     st.write(f"Queue Last Event: {datetime.fromtimestamp(getattr(notif, 'last_event_ts', 0)).strftime('%H:%M:%S') if getattr(notif, 'last_event_ts', 0) else 'N/A'}")

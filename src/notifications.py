@@ -10,6 +10,11 @@ from src.api import GenesysAPI
 
 class NotificationManager:
     """Manages a single Genesys Notifications channel and caches waiting calls."""
+    MAX_TOPICS_PER_CHANNEL = 1000
+    MAX_CHANNELS = 20
+    WAITING_CALL_TTL_SECONDS = 900
+    CLEANUP_INTERVAL_SECONDS = 60
+
     def __init__(self):
         self.api = None
         self.queues_map = {}
@@ -17,6 +22,7 @@ class NotificationManager:
         self.channel_id = None
         self.connect_uri = None
         self.subscribed_topics = []
+        self.channels = []
         self._ws = None
         self._thread = None
         self._resub_thread = None
@@ -28,6 +34,11 @@ class NotificationManager:
         self.last_topic = ""
         self.last_event_preview = ""
         self.channel_created_ts = 0
+        self.last_subscribe_error = ""
+        self.topics_truncated = False
+        self._next_retry_ts = 0
+        self._backoff_seconds = 0
+        self._last_cleanup_ts = 0
         # key: (conversation_id, queue_id)
         self.waiting_calls = {}
 
@@ -37,7 +48,21 @@ class NotificationManager:
         self.queue_id_to_name = {v: k for k, v in self.queues_map.items()}
 
     def is_running(self):
-        return self._thread and self._thread.is_alive()
+        return any(ch.get("thread") and ch["thread"].is_alive() for ch in self.channels)
+
+    def _update_connected(self):
+        self.connected = any(ch.get("connected") for ch in self.channels)
+
+    def _reset_backoff(self):
+        self._backoff_seconds = 0
+        self._next_retry_ts = 0
+
+    def _apply_backoff(self, base_seconds=60, max_seconds=900):
+        if self._backoff_seconds <= 0:
+            self._backoff_seconds = base_seconds
+        else:
+            self._backoff_seconds = min(self._backoff_seconds * 2, max_seconds)
+        self._next_retry_ts = time.time() + self._backoff_seconds
 
     def start(self, queue_ids):
         if not self.api:
@@ -45,25 +70,80 @@ class NotificationManager:
         topics = [f"v2.routing.queues.{qid}.conversations" for qid in queue_ids if qid]
         topics = sorted(set(topics))
 
-        with self._lock:
-            if self.subscribed_topics == topics and self.is_running():
-                return True
-            self.subscribed_topics = topics
+        if not topics:
+            with self._lock:
+                self.subscribed_topics = []
+                self.topics_truncated = False
+                self.last_subscribe_error = ""
+            self._reset_backoff()
+            self.stop()
+            return True
 
-        self._stop_event.clear()
-        if not self._ensure_channel_and_subscribe(topics):
+        now = time.time()
+        with self._lock:
+            same_topics = self.subscribed_topics == topics
+
+        if same_topics and self.is_running():
+            return True
+
+        if same_topics and now < self._next_retry_ts and not self.is_running():
             return False
-        self._start_ws()
+
+        if not same_topics or not self.is_running():
+            self._stop_channels()
+            if not same_topics:
+                self._reset_backoff()
+                self.last_subscribe_error = ""
+
+        if self._stop_event.is_set():
+            self._stop_event.clear()
+
+        with self._lock:
+            self.subscribed_topics = topics
+            self.topics_truncated = False
+
+        max_topics = self.MAX_TOPICS_PER_CHANNEL
+        chunks = [topics[i:i + max_topics] for i in range(0, len(topics), max_topics)]
+        if len(chunks) > self.MAX_CHANNELS:
+            chunks = chunks[:self.MAX_CHANNELS]
+            self.topics_truncated = True
+
+        new_channels = []
+        for chunk in chunks:
+            ch = self._create_channel(chunk)
+            if ch:
+                new_channels.append(ch)
+                self._start_ws(ch)
+
+        with self._lock:
+            self.channels = new_channels
+        self._update_connected()
+
+        if not self.channels:
+            return False
+
+        if not self._resub_thread or not self._resub_thread.is_alive():
+            self._resub_thread = threading.Thread(target=self._resubscribe_loop, daemon=True)
+            self._resub_thread.start()
+
         return True
 
     def stop(self):
         self._stop_event.set()
-        try:
-            if self._ws:
-                self._ws.close()
-        except Exception:
-            pass
+        self._stop_channels()
         self.connected = False
+
+    def _stop_channels(self):
+        for ch in self.channels:
+            try:
+                if ch.get("stop_event"):
+                    ch["stop_event"].set()
+                if ch.get("ws"):
+                    ch["ws"].close()
+            except Exception:
+                pass
+        self.channels = []
+        self._update_connected()
 
     def get_waiting_calls(self, max_age_seconds=600):
         now = time.time()
@@ -73,6 +153,17 @@ class NotificationManager:
             for k in stale_keys:
                 self.waiting_calls.pop(k, None)
             return list(self.waiting_calls.values())
+
+    def _prune_waiting_calls(self, max_age_seconds=None):
+        now = time.time()
+        if (now - self._last_cleanup_ts) < self.CLEANUP_INTERVAL_SECONDS:
+            return
+        ttl = max_age_seconds or self.WAITING_CALL_TTL_SECONDS
+        with self._lock:
+            stale_keys = [k for k, v in self.waiting_calls.items() if (now - v.get("last_update", 0)) > ttl]
+            for k in stale_keys:
+                self.waiting_calls.pop(k, None)
+            self._last_cleanup_ts = now
 
     def upsert_waiting_calls(self, calls):
         """Adds or updates waiting calls cache. Expects list of dicts with conversation_id and queue_id."""
@@ -93,35 +184,50 @@ class NotificationManager:
                     "last_update": now,
                 }
 
-    def _ensure_channel_and_subscribe(self, topics):
+    def _create_channel(self, topics):
         try:
             channel = self.api.create_notification_channel()
-            self.channel_id = channel.get("id")
-            self.connect_uri = channel.get("connectUri") or channel.get("connectUriSecured")
-            if not self.channel_id or not self.connect_uri:
-                return False
-            self.api.subscribe_notification_channel(self.channel_id, [{"id": t} for t in topics])
-            with self._lock:
-                self.channel_created_ts = time.time()
-            return True
-        except Exception:
-            return False
+            channel_id = channel.get("id")
+            connect_uri = channel.get("connectUri") or channel.get("connectUriSecured")
+            if not channel_id or not connect_uri:
+                self.last_subscribe_error = "Missing channel id/connectUri"
+                self._apply_backoff()
+                return None
+            self.api.subscribe_notification_channel(channel_id, [{"id": t} for t in topics])
+            self._reset_backoff()
+            return {
+                "channel_id": channel_id,
+                "connect_uri": connect_uri,
+                "topics": topics,
+                "created_ts": time.time(),
+                "ws": None,
+                "thread": None,
+                "connected": False,
+                "stop_event": threading.Event(),
+            }
+        except Exception as e:
+            self.last_subscribe_error = f"{type(e).__name__}: {e}"
+            self._apply_backoff()
+            return None
 
-    def _start_ws(self):
-        if self.is_running():
+    def _start_ws(self, ch):
+        if self._stop_event.is_set() or ch.get("stop_event").is_set():
             return
 
         def on_open(ws):
-            self.connected = True
+            ch["connected"] = True
+            self._update_connected()
 
         def on_close(ws, status_code, msg):
-            self.connected = False
-            if not self._stop_event.is_set():
+            ch["connected"] = False
+            self._update_connected()
+            if not self._stop_event.is_set() and not ch.get("stop_event").is_set():
                 time.sleep(2)
-                self._start_ws()
+                self._start_ws(ch)
 
         def on_error(ws, error):
-            self.connected = False
+            ch["connected"] = False
+            self._update_connected()
 
         def on_message(ws, message):
             try:
@@ -129,6 +235,7 @@ class NotificationManager:
             except Exception:
                 return
             self.last_message_ts = time.time()
+            self._prune_waiting_calls()
             # Heartbeat or non-topic messages
             topic = payload.get("topicName")
             self.last_topic = topic or ""
@@ -141,55 +248,59 @@ class NotificationManager:
                 self.last_event_preview = ""
             self._handle_conversation_event(topic, event)
 
-        self._ws = websocket.WebSocketApp(
-            self.connect_uri,
+        ws = websocket.WebSocketApp(
+            ch["connect_uri"],
             on_open=on_open,
             on_close=on_close,
             on_error=on_error,
             on_message=on_message,
         )
+        ch["ws"] = ws
 
         def run():
             # Keep trying until stop requested
-            while not self._stop_event.is_set():
+            ch_stop = ch.get("stop_event")
+            while not self._stop_event.is_set() and not ch_stop.is_set():
                 try:
-                    self._ws.run_forever(ping_interval=30, ping_timeout=10)
+                    ws.run_forever(ping_interval=30, ping_timeout=10)
                 except Exception:
                     pass
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or ch_stop.is_set():
                     break
                 time.sleep(2)
 
-        self._thread = threading.Thread(target=run, daemon=True)
-        self._thread.start()
-
-        # Start re-subscribe timer thread
-        if not self._resub_thread or not self._resub_thread.is_alive():
-            self._resub_thread = threading.Thread(target=self._resubscribe_loop, daemon=True)
-            self._resub_thread.start()
+        ch["thread"] = threading.Thread(target=run, daemon=True)
+        ch["thread"].start()
 
     def _resubscribe_loop(self):
         # Re-subscribe before 24h to avoid expiry
         while not self._stop_event.is_set():
             time.sleep(60)
             with self._lock:
-                created = getattr(self, "channel_created_ts", 0)
-                topics = list(self.subscribed_topics)
-            if not topics or not created:
-                continue
-            if time.time() - created >= 22 * 3600:
-                try:
-                    # Recreate channel + subscribe
-                    self._ensure_channel_and_subscribe(topics)
-                    # Restart WS with new connect URI
+                channels = list(self.channels)
+            for ch in channels:
+                created = ch.get("created_ts", 0)
+                topics = ch.get("topics", [])
+                if not topics or not created:
+                    continue
+                if time.time() - created >= 22 * 3600:
                     try:
-                        if self._ws:
-                            self._ws.close()
+                        new_ch = self._create_channel(topics)
+                        if new_ch:
+                            try:
+                                if ch.get("stop_event"):
+                                    ch["stop_event"].set()
+                                if ch.get("ws"):
+                                    ch["ws"].close()
+                            except Exception:
+                                pass
+                            with self._lock:
+                                if ch in self.channels:
+                                    self.channels.remove(ch)
+                                self.channels.append(new_ch)
+                            self._start_ws(new_ch)
                     except Exception:
                         pass
-                    self._start_ws()
-                except Exception:
-                    pass
 
     def _handle_conversation_event(self, topic, event):
         conversation_id = event.get("id") or event.get("conversationId")
@@ -250,6 +361,9 @@ class AgentNotificationManager:
     """Manages user presence/routing notifications and queue membership cache."""
     MAX_TOPICS_PER_CHANNEL = 1000
     MAX_CHANNELS = 20
+    USER_CACHE_TTL_SECONDS = 6 * 3600
+    ACTIVE_CALL_TTL_SECONDS = 900
+    CLEANUP_INTERVAL_SECONDS = 120
 
     def __init__(self):
         self.api = None
@@ -261,6 +375,8 @@ class AgentNotificationManager:
         self.last_member_refresh = {}
         self.user_presence = {}
         self.user_routing = {}
+        self._user_presence_ts = {}
+        self._user_routing_ts = {}
         self.active_calls = {}
         self.subscribed_topics = []
         self.channels = []
@@ -271,6 +387,7 @@ class AgentNotificationManager:
         self.last_event_ts = 0
         self.last_topic = ""
         self.last_event_preview = ""
+        self._last_cleanup_ts = 0
 
     def update_client(self, api_client, queues_map, users_info=None, presence_map=None):
         self.api = GenesysAPI(api_client) if api_client else None
@@ -390,16 +507,37 @@ class AgentNotificationManager:
                 self.active_calls.pop(k, None)
             return list(self.active_calls.values())
 
+    def _prune_user_caches(self):
+        now = time.time()
+        if (now - self._last_cleanup_ts) < self.CLEANUP_INTERVAL_SECONDS:
+            return
+        ttl = self.USER_CACHE_TTL_SECONDS
+        with self._lock:
+            stale_users = [uid for uid, ts in self._user_presence_ts.items() if (now - ts) > ttl]
+            for uid in stale_users:
+                self._user_presence_ts.pop(uid, None)
+                self.user_presence.pop(uid, None)
+            stale_users = [uid for uid, ts in self._user_routing_ts.items() if (now - ts) > ttl]
+            for uid in stale_users:
+                self._user_routing_ts.pop(uid, None)
+                self.user_routing.pop(uid, None)
+            stale_calls = [cid for cid, v in self.active_calls.items() if (now - v.get("last_update", 0)) > self.ACTIVE_CALL_TTL_SECONDS]
+            for cid in stale_calls:
+                self.active_calls.pop(cid, None)
+            self._last_cleanup_ts = now
+
     def seed_users(self, presence_map, routing_map):
         """Seed caches from a one-time API snapshot."""
         if presence_map:
             for uid, pres in presence_map.items():
                 if pres:
                     self.user_presence[uid] = pres
+                    self._user_presence_ts[uid] = time.time()
         if routing_map:
             for uid, rout in routing_map.items():
                 if rout:
                     self.user_routing[uid] = rout
+                    self._user_routing_ts[uid] = time.time()
 
     def seed_users_missing(self, presence_map, routing_map):
         """Seed caches only for users not already present."""
@@ -407,10 +545,12 @@ class AgentNotificationManager:
             for uid, pres in presence_map.items():
                 if pres and uid not in self.user_presence:
                     self.user_presence[uid] = pres
+                    self._user_presence_ts[uid] = time.time()
         if routing_map:
             for uid, rout in routing_map.items():
                 if rout and uid not in self.user_routing:
                     self.user_routing[uid] = rout
+                    self._user_routing_ts[uid] = time.time()
 
     def _create_channel(self, topics):
         try:
@@ -452,6 +592,7 @@ class AgentNotificationManager:
             except Exception:
                 return
             self.last_message_ts = time.time()
+            self._prune_user_caches()
             topic = payload.get("topicName")
             self.last_topic = topic or ""
             event = payload.get("eventBody") or {}
@@ -520,8 +661,10 @@ class AgentNotificationManager:
 
         if topic.endswith(".presence"):
             self.user_presence[user_id] = event or {}
+            self._user_presence_ts[user_id] = time.time()
         elif topic.endswith(".routingStatus"):
             self.user_routing[user_id] = event or {}
+            self._user_routing_ts[user_id] = time.time()
         elif ".conversations" in topic:
             self._handle_call_event(event)
 
@@ -597,6 +740,9 @@ class AgentNotificationManager:
 
 class GlobalConversationNotificationManager:
     """Notifications for org-wide conversations (calls/chats/messages/etc)."""
+    ACTIVE_CALL_TTL_SECONDS = 900
+    CLEANUP_INTERVAL_SECONDS = 60
+
     def __init__(self):
         self.api = None
         self.queues_map = {}
@@ -616,6 +762,10 @@ class GlobalConversationNotificationManager:
         self.last_event_preview = ""
         self.channel_created_ts = 0
         self.active_conversations = {}
+        self.last_subscribe_error = ""
+        self._next_retry_ts = 0
+        self._backoff_seconds = 0
+        self._last_cleanup_ts = 0
 
     def update_client(self, api_client, queues_map):
         self.api = GenesysAPI(api_client) if api_client else None
@@ -629,12 +779,34 @@ class GlobalConversationNotificationManager:
         if not self.api:
             return False
         topics = sorted(set(topics or []))
+        if not topics:
+            with self._lock:
+                self.subscribed_topics = []
+                self.last_subscribe_error = ""
+            self._reset_backoff()
+            self.stop()
+            return True
+
+        now = time.time()
         with self._lock:
-            if self.subscribed_topics == topics and self.is_running():
-                return True
-            self.subscribed_topics = topics
+            same_topics = self.subscribed_topics == topics
+
+        if same_topics and self.is_running():
+            return True
+
+        if same_topics and now < self._next_retry_ts and not self.is_running():
+            return False
+
+        if not same_topics or not self.is_running():
+            self.stop()
+            if not same_topics:
+                self._reset_backoff()
+                self.last_subscribe_error = ""
 
         self._stop_event.clear()
+        with self._lock:
+            self.subscribed_topics = topics
+
         if not self._ensure_channel_and_subscribe(topics):
             return False
         self._start_ws()
@@ -649,6 +821,17 @@ class GlobalConversationNotificationManager:
             pass
         self.connected = False
 
+    def _reset_backoff(self):
+        self._backoff_seconds = 0
+        self._next_retry_ts = 0
+
+    def _apply_backoff(self, base_seconds=60, max_seconds=900):
+        if self._backoff_seconds <= 0:
+            self._backoff_seconds = base_seconds
+        else:
+            self._backoff_seconds = min(self._backoff_seconds * 2, max_seconds)
+        self._next_retry_ts = time.time() + self._backoff_seconds
+
     def get_active_conversations(self, max_age_seconds=600):
         now = time.time()
         with self._lock:
@@ -657,18 +840,33 @@ class GlobalConversationNotificationManager:
                 self.active_conversations.pop(k, None)
             return list(self.active_conversations.values())
 
+    def _prune_active_conversations(self):
+        now = time.time()
+        if (now - self._last_cleanup_ts) < self.CLEANUP_INTERVAL_SECONDS:
+            return
+        with self._lock:
+            stale = [k for k, v in self.active_conversations.items() if (now - v.get("last_update", 0)) > self.ACTIVE_CALL_TTL_SECONDS]
+            for k in stale:
+                self.active_conversations.pop(k, None)
+            self._last_cleanup_ts = now
+
     def _ensure_channel_and_subscribe(self, topics):
         try:
             channel = self.api.create_notification_channel()
             self.channel_id = channel.get("id")
             self.connect_uri = channel.get("connectUri") or channel.get("connectUriSecured")
             if not self.channel_id or not self.connect_uri:
+                self.last_subscribe_error = "Missing channel id/connectUri"
+                self._apply_backoff()
                 return False
             self.api.subscribe_notification_channel(self.channel_id, [{"id": t} for t in topics])
             with self._lock:
                 self.channel_created_ts = time.time()
+            self._reset_backoff()
             return True
-        except Exception:
+        except Exception as e:
+            self.last_subscribe_error = f"{type(e).__name__}: {e}"
+            self._apply_backoff()
             return False
 
     def _start_ws(self):
@@ -693,6 +891,7 @@ class GlobalConversationNotificationManager:
             except Exception:
                 return
             self.last_message_ts = time.time()
+            self._prune_active_conversations()
             topic = payload.get("topicName")
             self.last_topic = topic or ""
             event = payload.get("eventBody") or {}
