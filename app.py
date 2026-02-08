@@ -1132,7 +1132,14 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
         t.start()
     return store
 
-def _ensure_seed_org(store, org_code):
+def _ensure_seed_org(store, org_code, max_orgs=20):
+    # Enforce max orgs to prevent memory bloat from abandoned orgs
+    if len(store["orgs"]) > max_orgs and org_code not in store["orgs"]:
+        # Remove oldest org (first key)
+        oldest_key = next(iter(store["orgs"]), None)
+        if oldest_key:
+            store["orgs"].pop(oldest_key, None)
+    
     org = store["orgs"].setdefault(org_code, {
         "call_seed_ts": 0,
         "call_seed_data": [],
@@ -1238,14 +1245,26 @@ def _reserve_agent_seed(org_code, now_ts, min_interval=60):
         org["agent_seed_ts"] = now_ts
         return True
 
-def _merge_agent_seed(org_code, presence_map, routing_map, now_ts):
+def _merge_agent_seed(org_code, presence_map, routing_map, now_ts, max_items=1000):
+    """Merge agent presence/routing data with size limit to prevent memory bloat."""
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
         if presence_map:
             org["agent_presence"].update(presence_map)
+            # Enforce max size - keep most recent entries
+            if len(org["agent_presence"]) > max_items:
+                # Remove oldest half when limit exceeded
+                keys_to_remove = list(org["agent_presence"].keys())[:len(org["agent_presence"]) - max_items]
+                for k in keys_to_remove:
+                    org["agent_presence"].pop(k, None)
         if routing_map:
             org["agent_routing"].update(routing_map)
+            # Enforce max size
+            if len(org["agent_routing"]) > max_items:
+                keys_to_remove = list(org["agent_routing"].keys())[:len(org["agent_routing"]) - max_items]
+                for k in keys_to_remove:
+                    org["agent_routing"].pop(k, None)
         org["agent_seed_ts"] = now_ts
 
 def _get_shared_ivr_calls(org_code):
@@ -1279,11 +1298,22 @@ def _get_session_id():
         st.session_state._session_id = str(uuid.uuid4())
     return st.session_state._session_id
 
-def _register_org_session_queues(org_code, queues_map, agent_queues_map):
+def _register_org_session_queues(org_code, queues_map, agent_queues_map, max_orgs=20):
     store = _shared_org_session_store()
     now = pytime.time()
     session_id = _get_session_id()
     with store["lock"]:
+        # Enforce max orgs to prevent memory bloat
+        if len(store["orgs"]) > max_orgs and org_code not in store["orgs"]:
+            # Remove org with no active sessions or oldest
+            empty_orgs = [k for k, v in store["orgs"].items() if not v.get("sessions")]
+            if empty_orgs:
+                store["orgs"].pop(empty_orgs[0], None)
+            else:
+                oldest_key = next(iter(store["orgs"]), None)
+                if oldest_key:
+                    store["orgs"].pop(oldest_key, None)
+        
         org = store["orgs"].setdefault(org_code, {"sessions": {}})
         org["sessions"][session_id] = {
             "ts": now,
@@ -1344,9 +1374,19 @@ def _remove_org_session(org_code):
             return
         org["sessions"].pop(session_id, None)
 
-def get_shared_data_manager(org_code):
+def get_shared_data_manager(org_code, max_orgs=20):
     store = _get_dm_store()
     with store["lock"]:
+        # Enforce max orgs limit to prevent memory bloat
+        if len(store["data"]) > max_orgs and org_code not in store["data"]:
+            oldest_key = next(iter(store["data"]), None)
+            if oldest_key:
+                old_dm = store["data"].pop(oldest_key, None)
+                if old_dm:
+                    try:
+                        old_dm.force_stop()
+                    except Exception:
+                        pass
         dm = store["data"].get(org_code)
         if dm is None:
             dm = DataManager()
@@ -1376,30 +1416,57 @@ def ensure_data_manager():
     st.session_state.data_manager = dm
     return dm
 
-def ensure_notifications_manager():
+def ensure_notifications_manager(max_orgs=20):
     org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
     store = _shared_notif_store()
     with store["lock"]:
+        # Enforce max orgs limit
+        if len(store["call"]) > max_orgs and org_code not in store["call"]:
+            oldest_key = next(iter(store["call"]), None)
+            if oldest_key:
+                try:
+                    store["call"][oldest_key].stop()
+                except Exception:
+                    pass
+                store["call"].pop(oldest_key, None)
         nm = store["call"].get(org_code)
         if nm is None:
             nm = NotificationManager()
             store["call"][org_code] = nm
     return nm
 
-def ensure_agent_notifications_manager():
+def ensure_agent_notifications_manager(max_orgs=20):
     org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
     store = _shared_notif_store()
     with store["lock"]:
+        # Enforce max orgs limit
+        if len(store["agent"]) > max_orgs and org_code not in store["agent"]:
+            oldest_key = next(iter(store["agent"]), None)
+            if oldest_key:
+                try:
+                    store["agent"][oldest_key].stop()
+                except Exception:
+                    pass
+                store["agent"].pop(oldest_key, None)
         nm = store["agent"].get(org_code)
         if nm is None or not hasattr(nm, "seed_users_missing") or not hasattr(nm, "get_active_calls"):
             nm = AgentNotificationManager()
             store["agent"][org_code] = nm
     return nm
 
-def ensure_global_conversation_manager():
+def ensure_global_conversation_manager(max_orgs=20):
     org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
     store = _shared_notif_store()
     with store["lock"]:
+        # Enforce max orgs limit
+        if len(store["global"]) > max_orgs and org_code not in store["global"]:
+            oldest_key = next(iter(store["global"]), None)
+            if oldest_key:
+                try:
+                    store["global"][oldest_key].stop()
+                except Exception:
+                    pass
+                store["global"].pop(oldest_key, None)
         nm = store["global"].get(org_code)
         if nm is None or not hasattr(nm, "get_active_conversations"):
             nm = GlobalConversationNotificationManager()
@@ -2420,6 +2487,20 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                     f.write("1")
             except Exception:
                 pass
+            
+            # Also logout from app profile
+            try:
+                _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
+            except Exception:
+                pass
+            delete_app_session()
+            st.session_state.app_user = None
+            st.session_state.logged_in = False
+            if 'dashboard_config_loaded' in st.session_state:
+                del st.session_state.dashboard_config_loaded
+            if 'data_manager' in st.session_state:
+                del st.session_state.data_manager
+            
             st.rerun()
 
 elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":

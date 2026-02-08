@@ -12,6 +12,8 @@ class DataManager:
     """
     MAX_QUEUE_MEMBERS_CACHE = 100  # Max queues to cache members for
     MAX_AGENT_DETAILS_CACHE = 100  # Max queues for agent details
+    MAX_OBS_DATA_CACHE = 200       # Max queues for observations cache
+    MAX_DAILY_DATA_CACHE = 200     # Max queues for daily stats cache
     CACHE_CLEANUP_INTERVAL = 300   # 5 minutes
     
     def __init__(self, api_client=None, presence_map=None):
@@ -134,6 +136,32 @@ class DataManager:
         if (current_time - self.last_cache_cleanup) < self.CACHE_CLEANUP_INTERVAL:
             return
         
+        # Get currently active queue names for filtering
+        active_queue_names = set(self.queues_map.keys())
+        active_agent_queue_names = set(self.agent_queues_map.keys())
+        
+        # Trim obs_data_cache - remove entries for queues no longer monitored
+        if self.obs_data_cache:
+            stale_obs_keys = [k for k in self.obs_data_cache.keys() if k not in active_queue_names]
+            for k in stale_obs_keys:
+                self.obs_data_cache.pop(k, None)
+            # Also enforce max size
+            if len(self.obs_data_cache) > self.MAX_OBS_DATA_CACHE:
+                keys_to_remove = list(self.obs_data_cache.keys())[:-self.MAX_OBS_DATA_CACHE]
+                for k in keys_to_remove:
+                    self.obs_data_cache.pop(k, None)
+        
+        # Trim daily_data_cache - remove entries for queues no longer monitored
+        if self.daily_data_cache:
+            stale_daily_keys = [k for k in self.daily_data_cache.keys() if k not in active_queue_names]
+            for k in stale_daily_keys:
+                self.daily_data_cache.pop(k, None)
+            # Also enforce max size
+            if len(self.daily_data_cache) > self.MAX_DAILY_DATA_CACHE:
+                keys_to_remove = list(self.daily_data_cache.keys())[:-self.MAX_DAILY_DATA_CACHE]
+                for k in keys_to_remove:
+                    self.daily_data_cache.pop(k, None)
+        
         # Trim queue_members_cache to max size
         if len(self.queue_members_cache) > self.MAX_QUEUE_MEMBERS_CACHE:
             # Keep only the most recently used
@@ -141,11 +169,16 @@ class DataManager:
             for k in keys_to_remove:
                 self.queue_members_cache.pop(k, None)
         
-        # Trim agent_details_cache
-        if len(self.agent_details_cache) > self.MAX_AGENT_DETAILS_CACHE:
-            keys_to_remove = list(self.agent_details_cache.keys())[:-self.MAX_AGENT_DETAILS_CACHE]
-            for k in keys_to_remove:
+        # Trim agent_details_cache - remove entries for queues no longer monitored
+        if self.agent_details_cache:
+            stale_agent_keys = [k for k in self.agent_details_cache.keys() if k not in active_agent_queue_names]
+            for k in stale_agent_keys:
                 self.agent_details_cache.pop(k, None)
+            # Also enforce max size
+            if len(self.agent_details_cache) > self.MAX_AGENT_DETAILS_CACHE:
+                keys_to_remove = list(self.agent_details_cache.keys())[:-self.MAX_AGENT_DETAILS_CACHE]
+                for k in keys_to_remove:
+                    self.agent_details_cache.pop(k, None)
         
         self.last_cache_cleanup = current_time
     

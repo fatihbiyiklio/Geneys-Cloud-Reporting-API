@@ -14,6 +14,7 @@ class NotificationManager:
     MAX_CHANNELS = 10  # Supports up to 10000 queue topics
     WAITING_CALL_TTL_SECONDS = 300
     CLEANUP_INTERVAL_SECONDS = 45  # Reduced frequency
+    MAX_WAITING_CALLS = 500  # Max waiting calls to cache
 
     def __init__(self):
         self.api = None
@@ -160,9 +161,16 @@ class NotificationManager:
             return
         ttl = max_age_seconds or self.WAITING_CALL_TTL_SECONDS
         with self._lock:
+            # Remove stale entries
             stale_keys = [k for k, v in self.waiting_calls.items() if (now - v.get("last_update", 0)) > ttl]
             for k in stale_keys:
                 self.waiting_calls.pop(k, None)
+            # Enforce max cache size - remove oldest entries
+            if len(self.waiting_calls) > self.MAX_WAITING_CALLS:
+                sorted_items = sorted(self.waiting_calls.items(), key=lambda x: x[1].get("last_update", 0))
+                excess = len(self.waiting_calls) - self.MAX_WAITING_CALLS
+                for k, _ in sorted_items[:excess]:
+                    self.waiting_calls.pop(k, None)
             self._last_cleanup_ts = now
 
     def upsert_waiting_calls(self, calls):
@@ -362,6 +370,10 @@ class AgentNotificationManager:
     USER_CACHE_TTL_SECONDS = 1800
     ACTIVE_CALL_TTL_SECONDS = 300
     CLEANUP_INTERVAL_SECONDS = 90  # Reduced frequency for less lock contention
+    MAX_USER_PRESENCE_CACHE = 1000   # Max users to keep presence for
+    MAX_USER_ROUTING_CACHE = 1000    # Max users to keep routing status for
+    MAX_ACTIVE_CALLS_CACHE = 500     # Max active calls to cache
+    MAX_QUEUE_MEMBERS_CACHE = 100    # Max queues to cache members for
 
     def __init__(self):
         self.api = None
@@ -511,17 +523,52 @@ class AgentNotificationManager:
             return
         ttl = self.USER_CACHE_TTL_SECONDS
         with self._lock:
+            # Prune stale presence entries
             stale_users = [uid for uid, ts in self._user_presence_ts.items() if (now - ts) > ttl]
             for uid in stale_users:
                 self._user_presence_ts.pop(uid, None)
                 self.user_presence.pop(uid, None)
+            
+            # Prune stale routing entries
             stale_users = [uid for uid, ts in self._user_routing_ts.items() if (now - ts) > ttl]
             for uid in stale_users:
                 self._user_routing_ts.pop(uid, None)
                 self.user_routing.pop(uid, None)
+            
+            # Prune stale active calls
             stale_calls = [cid for cid, v in self.active_calls.items() if (now - v.get("last_update", 0)) > self.ACTIVE_CALL_TTL_SECONDS]
             for cid in stale_calls:
                 self.active_calls.pop(cid, None)
+            
+            # Enforce max cache sizes - remove oldest entries
+            if len(self.user_presence) > self.MAX_USER_PRESENCE_CACHE:
+                sorted_items = sorted(self._user_presence_ts.items(), key=lambda x: x[1])
+                excess = len(self.user_presence) - self.MAX_USER_PRESENCE_CACHE
+                for uid, _ in sorted_items[:excess]:
+                    self._user_presence_ts.pop(uid, None)
+                    self.user_presence.pop(uid, None)
+            
+            if len(self.user_routing) > self.MAX_USER_ROUTING_CACHE:
+                sorted_items = sorted(self._user_routing_ts.items(), key=lambda x: x[1])
+                excess = len(self.user_routing) - self.MAX_USER_ROUTING_CACHE
+                for uid, _ in sorted_items[:excess]:
+                    self._user_routing_ts.pop(uid, None)
+                    self.user_routing.pop(uid, None)
+            
+            if len(self.active_calls) > self.MAX_ACTIVE_CALLS_CACHE:
+                sorted_items = sorted(self.active_calls.items(), key=lambda x: x[1].get("last_update", 0))
+                excess = len(self.active_calls) - self.MAX_ACTIVE_CALLS_CACHE
+                for cid, _ in sorted_items[:excess]:
+                    self.active_calls.pop(cid, None)
+            
+            # Enforce max queue_members_cache size
+            if len(self.queue_members_cache) > self.MAX_QUEUE_MEMBERS_CACHE:
+                sorted_items = sorted(self.last_member_refresh.items(), key=lambda x: x[1])
+                excess = len(self.queue_members_cache) - self.MAX_QUEUE_MEMBERS_CACHE
+                for qid, _ in sorted_items[:excess]:
+                    self.queue_members_cache.pop(qid, None)
+                    self.last_member_refresh.pop(qid, None)
+            
             self._last_cleanup_ts = now
 
     def seed_users(self, presence_map, routing_map):
@@ -738,6 +785,7 @@ class GlobalConversationNotificationManager:
     """Notifications for org-wide conversations (calls/chats/messages/etc)."""
     ACTIVE_CALL_TTL_SECONDS = 300
     CLEANUP_INTERVAL_SECONDS = 45  # Reduced frequency
+    MAX_ACTIVE_CONVERSATIONS = 500  # Max conversations to keep in cache
 
     def __init__(self):
         self.api = None
@@ -841,9 +889,16 @@ class GlobalConversationNotificationManager:
         if (now - self._last_cleanup_ts) < self.CLEANUP_INTERVAL_SECONDS:
             return
         with self._lock:
+            # Remove stale entries
             stale = [k for k, v in self.active_conversations.items() if (now - v.get("last_update", 0)) > self.ACTIVE_CALL_TTL_SECONDS]
             for k in stale:
                 self.active_conversations.pop(k, None)
+            # Enforce max cache size - remove oldest entries
+            if len(self.active_conversations) > self.MAX_ACTIVE_CONVERSATIONS:
+                sorted_items = sorted(self.active_conversations.items(), key=lambda x: x[1].get("last_update", 0))
+                excess = len(self.active_conversations) - self.MAX_ACTIVE_CONVERSATIONS
+                for k, _ in sorted_items[:excess]:
+                    self.active_conversations.pop(k, None)
             self._last_cleanup_ts = now
 
     def _ensure_channel_and_subscribe(self, topics):
