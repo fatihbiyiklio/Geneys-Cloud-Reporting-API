@@ -16,7 +16,6 @@ import uuid
 import signal
 import traceback
 import psutil
-from streamlit_autorefresh import st_autorefresh
 from streamlit.runtime import Runtime
 from streamlit_cookies_manager import EncryptedCookieManager
 from cryptography.fernet import Fernet
@@ -34,6 +33,8 @@ auth_manager = AuthManager()
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
 MEMORY_LOG_FILE = os.path.join(LOG_DIR, "memory.jsonl")
+MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "2048"))
+MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "300"))
 
 def _setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -919,7 +920,73 @@ def _shared_seed_store():
 
 @st.cache_resource(show_spinner=False)
 def _shared_memory_store():
-    return {"lock": threading.Lock(), "samples": [], "thread": None, "stop_event": threading.Event()}
+    return {"lock": threading.Lock(), "samples": [], "thread": None, "stop_event": threading.Event(), "last_cleanup_ts": 0}
+
+def _soft_memory_cleanup():
+    """Best-effort cleanup to reduce memory without visible user impact."""
+    try:
+        # Clear seed cache
+        seed = _shared_seed_store()
+        with seed["lock"]:
+            for org in seed.get("orgs", {}).values():
+                org["call_seed_data"] = []
+                org["ivr_calls_data"] = []
+                org["agent_presence"] = {}
+                org["agent_routing"] = {}
+                org["call_meta"] = {}
+                org["call_seed_ts"] = 0
+                org["ivr_calls_ts"] = 0
+                org["agent_seed_ts"] = 0
+    except Exception:
+        pass
+
+    try:
+        # Stop notifications to release WS/thread memory; they will reconnect on next use
+        notif = _shared_notif_store()
+        with notif["lock"]:
+            for key in ["call", "agent", "global"]:
+                for nm in notif.get(key, {}).values():
+                    try:
+                        nm.stop()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    try:
+        # Clear DataManager caches
+        dm_store = _get_dm_store()
+        with dm_store["lock"]:
+            for dm in dm_store.get("data", {}).values():
+                try:
+                    dm.obs_data_cache = {}
+                    dm.daily_data_cache = {}
+                    dm.agent_details_cache = {}
+                    dm.queue_members_cache = {}
+                    dm.last_member_refresh = 0
+                    dm.last_daily_refresh = 0
+                    dm.last_update_time = 0
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        # Clear org maps cache
+        global _org_maps_cache
+        _org_maps_cache = {}
+    except Exception:
+        pass
+
+def _safe_autorefresh(*args, **kwargs):
+    try:
+        from streamlit_autorefresh import st_autorefresh as _st_autorefresh
+        return _st_autorefresh(*args, **kwargs)
+    except RuntimeError:
+        # Runtime not ready yet
+        return None
+    except Exception:
+        return None
 
 def _start_memory_monitor(sample_interval=10, max_samples=720):
     store = _shared_memory_store()
@@ -946,6 +1013,11 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                     store["samples"].append(sample)
                     if len(store["samples"]) > max_samples:
                         store["samples"] = store["samples"][-max_samples:]
+                    last_cleanup = store.get("last_cleanup_ts", 0)
+                if rss_mb >= MEMORY_LIMIT_MB and (time.time() - last_cleanup) > MEMORY_CLEANUP_COOLDOWN_SEC:
+                    _soft_memory_cleanup()
+                    with store["lock"]:
+                        store["last_cleanup_ts"] = time.time()
                 try:
                     with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
                         f.write(json.dumps(sample, ensure_ascii=False) + "\n")
@@ -1307,8 +1379,7 @@ def refresh_data_manager_queues():
     # Register this session's queues and compute union across active sessions
     union_queues, union_agent_queues, sess_count = _register_org_session_queues(org_code, all_dashboard_queues, agent_queues_map)
     
-    # DEBUG: Optimization Check
-    print(f"DEBUG: Refresh - Cards: {len(st.session_state.get('dashboard_cards', []))}, MetricQs: {len(all_dashboard_queues)}, AgentQs: {len(agent_queues_map)}, ActiveSessions: {sess_count}, UnionMetricQs: {len(union_queues)}, UnionAgentQs: {len(union_agent_queues)}")
+    # (debug log removed for build)
     
     # We use all_dashboard_queues for overall metrics (efficiency)
     # Pass empty dicts ({}) if empty, do NOT fall back to 'None' or full map
@@ -1769,12 +1840,7 @@ if page == get_text(lang, "menu_reports"):
                  # Get details
                  raw_data = api.get_conversation_details(s_dt, e_dt)
                  
-                 # DEBUG: Dump first 5 conversations to check attributes
-                 try:
-                     import json
-                     with open("debug_chat_dump.json", "w", encoding="utf-8") as f:
-                         json.dump(raw_data.get('conversations', [])[:5], f, indent=2, default=str)
-                 except: pass
+                 # (debug dump removed for build)
                  
                  df = process_conversation_details(
                      raw_data, 
@@ -2501,7 +2567,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             # which is called on login, hot-reload, and config changes.
             # Get dynamic interval (default 10s)
             ref_int = st.session_state.get('org_config', {}).get('refresh_interval', 15)
-            if auto_ref: st_autorefresh(interval=ref_int * 1000, key="data_refresh")
+            if auto_ref: _safe_autorefresh(interval=ref_int * 1000, key="data_refresh")
 
     # Available metric options
     # Available metric options
@@ -3387,16 +3453,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
                 waiting_calls = active_calls
 
-                with st.expander("🛠 Debug (Görüşme)", expanded=False):
-                    st.write("Global Notif: DEVRE DISI (invalid topic 400)")
-                    st.write(f"Active Calls (Agent): {len(agent_active) if agent_active else 0}")
-                    st.write(f"Queue Notif Connected: {notif.connected if notif else False}")
-                    st.write(f"Queue Topics: {len(getattr(notif, 'subscribed_topics', [])) if notif else 0}")
-                    st.write(f"Queue Channels: {len(getattr(notif, 'channels', [])) if notif else 0}")
-                    st.write(f"Queue Topics Truncated: {getattr(notif, 'topics_truncated', False) if notif else False}")
-                    st.write(f"Waiting Calls (Queue): {len(queue_waiting) if queue_waiting else 0}")
-                    st.write(f"Queue Last Message: {datetime.fromtimestamp(getattr(notif, 'last_message_ts', 0)).strftime('%H:%M:%S') if getattr(notif, 'last_message_ts', 0) else 'N/A'}")
-                    st.write(f"Queue Last Event: {datetime.fromtimestamp(getattr(notif, 'last_event_ts', 0)).strftime('%H:%M:%S') if getattr(notif, 'last_event_ts', 0) else 'N/A'}")
+                # (debug expander removed for build)
 
                 # Smooth UI: keep last non-empty list for a short grace window to avoid flicker
                 cache_key = "call_panel_last_active"

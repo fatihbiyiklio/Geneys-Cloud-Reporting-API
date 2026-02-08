@@ -48,7 +48,7 @@ class DataManager:
                 new_keys = set(agent_queues_map.keys())
                 old_keys = set(self.agent_queues_map.keys())
                 if new_keys != old_keys:
-                    print(f"DataManager: Targets changed. Clearing membership cache.")
+                    monitor.log_error("DataManager", "Targets changed. Clearing membership cache.")
                     self.queue_members_cache = {}
                 self.agent_queues_map = agent_queues_map
             
@@ -61,13 +61,13 @@ class DataManager:
                 # Already running, maps updated above will be picked up
                 return
             
-            print("DataManager: Starting background update thread...")
+            monitor.log_error("DataManager", "Starting background update thread...")
             self.stop_event.clear()
             self.thread = threading.Thread(target=self._update_loop, daemon=True)
             self.thread.start()
 
     def stop(self):
-        print("DataManager: Stopping background update thread...")
+        monitor.log_error("DataManager", "Stopping background update thread...")
         self.enabled = False
         self.stop_event.set()
         if self.thread:
@@ -117,7 +117,7 @@ class DataManager:
                     self._fetch_all_data()
                 except Exception as e:
                     self._log_error(f"Global Update Error: {str(e)}")
-                    print(f"DataManager Loop Error: {e}")
+                    self._log_error(f"DataManager Loop Error: {e}")
                     time.sleep(10)
             
             # Normal sleep interval
@@ -131,7 +131,7 @@ class DataManager:
         id_map = {v: k for k, v in self.queues_map.items()}
         
         # Debug Log to confirm optimization
-        print(f"DEBUG: DataManager Fetching - Metrics Queues: {len(q_ids)}, Agent Queues: {len(self.agent_queues_map)}")
+        # (debug log removed for build)
         
         agent_q_ids = list(self.agent_queues_map.values())
         agent_id_map = {v: k for k, v in self.agent_queues_map.items()}
@@ -181,7 +181,7 @@ class DataManager:
                     new_cache[q_id] = processed
                 except Exception as e:
                     self._log_error(f"Error fetching members for {q_id}: {str(e)}")
-                    print(f"DataManager: Error fetching members for {q_id}: {e}")
+                    self._log_error(f"Error fetching members for {q_id}: {e}")
             self.queue_members_cache = new_cache
             self.last_member_refresh = current_time
 
@@ -214,7 +214,7 @@ class DataManager:
                     status_map[u_id] = {'presence': final_pres, 'routingStatus': final_rout}
             except Exception as e:
                 self._log_error(f"User Scan Error: {str(e)}")
-                print(f"Error updating users: {e}")
+                self._log_error(f"Error updating users: {e}")
             
         # Detail Cache reconstruction
         temp_cache = {}

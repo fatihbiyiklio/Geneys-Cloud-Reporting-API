@@ -29,7 +29,7 @@ class GenesysAPI:
             monitor.log_api_call(path, method="GET", status_code=status_code, duration_ms=duration_ms)
             monitor.log_error("API_GET", f"HTTP {response.status_code} on {path}", str(e))
             if response.status_code == 401:
-                print("⚠️ Token expired (401). Should trigger re-auth here.")
+                monitor.log_error("API_GET", "Token expired (401). Should trigger re-auth here.")
                 raise e 
             raise e
         except Exception as e:
@@ -56,7 +56,7 @@ class GenesysAPI:
             monitor.log_api_call(path, method="POST", status_code=status_code, duration_ms=duration_ms)
             monitor.log_error("API_POST", f"HTTP {response.status_code} on {path}", str(e))
             if response.status_code == 401:
-                 print("⚠️ Token expired (401) on POST.")
+                 monitor.log_error("API_POST", "Token expired (401) on POST.")
                  raise e
             raise e
         except Exception as e:
@@ -90,7 +90,7 @@ class GenesysAPI:
             monitor.log_api_call(path, method="PUT", status_code=status_code, duration_ms=duration_ms)
             monitor.log_error("API_PUT", f"HTTP {response.status_code} on {path}", detail or str(e))
             if response.status_code == 401:
-                 print("⚠️ Token expired (401) on PUT.")
+                 monitor.log_error("API_PUT", "Token expired (401) on PUT.")
                  raise e
             raise e
         except Exception as e:
@@ -137,7 +137,7 @@ class GenesysAPI:
                     # Safe break to prevent infinite loops or OOM
                     if page_number > 200: break 
             except Exception as e:
-                print(f"Error fetching conversation details for chunk {interval}: {e}")
+                monitor.log_error("API_POST", f"Error fetching conversation details for chunk {interval}: {e}")
                 # We continue to next chunk instead of failing completely, usually.
                 
             current_start = current_end
@@ -165,7 +165,7 @@ class GenesysAPI:
                     break
                 page_number += 1
         except Exception as e:
-            print(f"Error fetching recent conversation details: {e}")
+            monitor.log_error("API_POST", f"Error fetching recent conversation details: {e}")
         return conversations
 
     def get_users(self):
@@ -188,7 +188,7 @@ class GenesysAPI:
                 else:
                     break
         except Exception as e:
-            print(f"Error: {e}")
+            monitor.log_error("API_GET", f"Error: {e}")
             return {"error": str(e)}
         return users
 
@@ -208,7 +208,7 @@ class GenesysAPI:
                 else:
                     break
         except Exception:
-            print("Error: Could not fetch queues from Genesys Cloud.")
+            monitor.log_error("API_GET", "Error: Could not fetch queues from Genesys Cloud.")
         return queues
 
     def get_wrapup_codes(self):
@@ -227,7 +227,7 @@ class GenesysAPI:
                 else:
                     break
         except Exception as e:
-            print(f"Error fetching wrap-up codes: {e}")
+            monitor.log_error("API_GET", f"Error fetching wrap-up codes: {e}")
         return codes
 
     def get_analytics_conversations_aggregate(self, start_date, end_date, granularity="P1D", group_by=None, filter_type=None, filter_ids=None, metrics=None, media_types=None):
@@ -319,7 +319,7 @@ class GenesysAPI:
             try:
                 data = self._post("/api/v2/analytics/conversations/aggregates/query", query)
             except Exception as e:
-                print(f"Error fetching aggregate chunk {interval}: {e}")
+                monitor.log_error("API_POST", f"Error fetching aggregate chunk {interval}: {e}")
                 data = {}
 
             if 'results' in data:
@@ -345,7 +345,7 @@ class GenesysAPI:
                 if 'results' in data:
                     all_results.extend(data['results'])
             except Exception:
-                print("Error: Observations query failed.")
+                monitor.log_error("API_POST", "Error: Observations query failed.")
         
         # Return a structure that matches the SDK response for consistency
         return {"results": all_results} if all_results else None
@@ -373,7 +373,7 @@ class GenesysAPI:
                 if 'results' in data:
                     all_results.extend(data['results'])
             except Exception:
-                print("Error: Daily stats query failed.")
+                monitor.log_error("API_POST", "Error: Daily stats query failed.")
         
         return {"results": all_results} if all_results else None
 
@@ -457,7 +457,7 @@ class GenesysAPI:
                     break
                     
         except Exception as e:
-            print(f"Error getting queue stats from details: {e}")
+            monitor.log_error("API_GET", f"Error getting queue stats from details: {e}")
         
         return stats
 
@@ -491,7 +491,7 @@ class GenesysAPI:
                 else:
                     break
         except Exception:
-            print("Error: Presence definitions fetch failed.")
+            monitor.log_error("API_GET", "Error: Presence definitions fetch failed.")
         return definitions
 
     def get_user_aggregates(self, start_date, end_date, user_ids):
@@ -523,7 +523,7 @@ class GenesysAPI:
                 try:
                     data = self._post("/api/v2/analytics/users/aggregates/query", query)
                 except Exception as e:
-                    print(f"Error fetching user aggregates batch {i} for {interval}: {e}")
+                    monitor.log_error("API_POST", f"Error fetching user aggregates batch {i} for {interval}: {e}")
                     data = {}
 
                 if data and 'results' in data:
@@ -571,7 +571,7 @@ class GenesysAPI:
                         else:
                             break
                 except Exception as e:
-                    print(f"Error details batch {i} interval {interval}: {e}")
+                    monitor.log_error("API_POST", f"Error details batch {i} interval {interval}: {e}")
             
             curr = curr_end
             
@@ -598,7 +598,7 @@ class GenesysAPI:
                 else:
                     break
         except Exception as e:
-            print(f"Error fetching queue members for {queue_id}: {e}")
+            monitor.log_error("API_GET", f"Error fetching queue members for {queue_id}: {e}")
         return members
 
     def create_notification_channel(self):
@@ -628,7 +628,7 @@ class GenesysAPI:
                 if page_number > max_pages:
                     break
         except Exception as e:
-            print(f"Error fetching queue conversations for {queue_id}: {e}")
+            monitor.log_error("API_GET", f"Error fetching queue conversations for {queue_id}: {e}")
         return conversations
 
     def get_conversation(self, conversation_id):
@@ -636,7 +636,7 @@ class GenesysAPI:
         try:
             return self._get(f"/api/v2/conversations/{conversation_id}")
         except Exception as e:
-            print(f"Error fetching conversation {conversation_id}: {e}")
+            monitor.log_error("API_GET", f"Error fetching conversation {conversation_id}: {e}")
             return {}
     def get_users_status_scan(self, target_user_ids=None, ignored_user_ids=None):
         """
@@ -678,7 +678,7 @@ class GenesysAPI:
                     
                 if page_number > 20: break # Safety break
             except Exception as e:
-                print(f"API: Error in user scan: {e}")
+                monitor.log_error("API_GET", f"API: Error in user scan: {e}")
                 break
                 
         return {"presence": presence_map, "routing": routing_map}
