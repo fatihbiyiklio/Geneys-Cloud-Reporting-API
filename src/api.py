@@ -1,6 +1,11 @@
 import time
+import requests
 from datetime import datetime, timezone, timedelta
 from src.monitor import monitor
+
+# Shared session for connection pooling (reduces Windows socket/handle overhead)
+_session = requests.Session()
+_session.headers.update({"Content-Type": "application/json"})
 
 class GenesysAPI:
     def __init__(self, auth_data):
@@ -12,10 +17,10 @@ class GenesysAPI:
         }
 
     def _get(self, path, params=None):
-        import requests
         start = time.monotonic()
+        headers = self.headers
         try:
-            response = requests.get(f"{self.api_host}{path}", headers=self.headers, params=params, timeout=10)
+            response = _session.get(f"{self.api_host}{path}", headers=headers, params=params, timeout=10)
             duration_ms = int((time.monotonic() - start) * 1000)
             monitor.log_api_call(path, method="GET", status_code=response.status_code, duration_ms=duration_ms)
             response.raise_for_status()
@@ -39,10 +44,10 @@ class GenesysAPI:
             raise e
 
     def _post(self, path, data):
-        import requests
         start = time.monotonic()
+        headers = self.headers
         try:
-            response = requests.post(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
+            response = _session.post(f"{self.api_host}{path}", headers=headers, json=data, timeout=10)
             duration_ms = int((time.monotonic() - start) * 1000)
             monitor.log_api_call(path, method="POST", status_code=response.status_code, duration_ms=duration_ms)
             response.raise_for_status()
@@ -66,10 +71,10 @@ class GenesysAPI:
             raise e
 
     def _put(self, path, data):
-        import requests
         start = time.monotonic()
+        headers = self.headers
         try:
-            response = requests.put(f"{self.api_host}{path}", headers=self.headers, json=data, timeout=10)
+            response = _session.put(f"{self.api_host}{path}", headers=headers, json=data, timeout=10)
             duration_ms = int((time.monotonic() - start) * 1000)
             monitor.log_api_call(path, method="PUT", status_code=response.status_code, duration_ms=duration_ms)
             response.raise_for_status()

@@ -11,9 +11,9 @@ from src.api import GenesysAPI
 class NotificationManager:
     """Manages a single Genesys Notifications channel and caches waiting calls."""
     MAX_TOPICS_PER_CHANNEL = 1000
-    MAX_CHANNELS = 20
-    WAITING_CALL_TTL_SECONDS = 900
-    CLEANUP_INTERVAL_SECONDS = 60
+    MAX_CHANNELS = 10  # Supports up to 10000 queue topics
+    WAITING_CALL_TTL_SECONDS = 300
+    CLEANUP_INTERVAL_SECONDS = 45  # Reduced frequency
 
     def __init__(self):
         self.api = None
@@ -221,9 +221,7 @@ class NotificationManager:
         def on_close(ws, status_code, msg):
             ch["connected"] = False
             self._update_connected()
-            if not self._stop_event.is_set() and not ch.get("stop_event").is_set():
-                time.sleep(2)
-                self._start_ws(ch)
+            # Reconnection handled by run() loop - no need for recursive call
 
         def on_error(ws, error):
             ch["connected"] = False
@@ -275,7 +273,7 @@ class NotificationManager:
     def _resubscribe_loop(self):
         # Re-subscribe before 24h to avoid expiry
         while not self._stop_event.is_set():
-            time.sleep(60)
+            time.sleep(120)
             with self._lock:
                 channels = list(self.channels)
             for ch in channels:
@@ -360,10 +358,10 @@ class NotificationManager:
 class AgentNotificationManager:
     """Manages user presence/routing notifications and queue membership cache."""
     MAX_TOPICS_PER_CHANNEL = 1000
-    MAX_CHANNELS = 20
-    USER_CACHE_TTL_SECONDS = 6 * 3600
-    ACTIVE_CALL_TTL_SECONDS = 900
-    CLEANUP_INTERVAL_SECONDS = 120
+    MAX_CHANNELS = 10  # Supports up to 10000 topics (~3333 users)
+    USER_CACHE_TTL_SECONDS = 1800
+    ACTIVE_CALL_TTL_SECONDS = 300
+    CLEANUP_INTERVAL_SECONDS = 90  # Reduced frequency for less lock contention
 
     def __init__(self):
         self.api = None
@@ -579,9 +577,7 @@ class AgentNotificationManager:
 
         def on_close(ws, status_code, msg):
             ch["connected"] = False
-            if not self._stop_event.is_set() and not ch.get("stop_event").is_set():
-                time.sleep(2)
-                self._start_ws(ch)
+            # Reconnection handled by run() loop - no need for recursive call
 
         def on_error(ws, error):
             ch["connected"] = False
@@ -617,19 +613,19 @@ class AgentNotificationManager:
             ch_stop = ch.get("stop_event")
             while not self._stop_event.is_set() and not ch_stop.is_set():
                 try:
-                    ws.run_forever(ping_interval=30, ping_timeout=10)
+                    ws.run_forever(ping_interval=45, ping_timeout=15)
                 except Exception:
                     pass
                 if self._stop_event.is_set() or ch_stop.is_set():
                     break
-                time.sleep(2)
+                time.sleep(3)
 
         ch["thread"] = threading.Thread(target=run, daemon=True)
         ch["thread"].start()
 
     def _resubscribe_loop(self):
         while not self._stop_event.is_set():
-            time.sleep(60)
+            time.sleep(120)
             for ch in list(self.channels):
                 created = ch.get("created_ts", 0)
                 topics = ch.get("topics", [])
@@ -740,8 +736,8 @@ class AgentNotificationManager:
 
 class GlobalConversationNotificationManager:
     """Notifications for org-wide conversations (calls/chats/messages/etc)."""
-    ACTIVE_CALL_TTL_SECONDS = 900
-    CLEANUP_INTERVAL_SECONDS = 60
+    ACTIVE_CALL_TTL_SECONDS = 300
+    CLEANUP_INTERVAL_SECONDS = 45  # Reduced frequency
 
     def __init__(self):
         self.api = None
@@ -878,9 +874,7 @@ class GlobalConversationNotificationManager:
 
         def on_close(ws, status_code, msg):
             self.connected = False
-            if not self._stop_event.is_set():
-                time.sleep(2)
-                self._start_ws()
+            # Reconnection handled by run() loop - no need for recursive call
 
         def on_error(ws, error):
             self.connected = False
@@ -914,12 +908,12 @@ class GlobalConversationNotificationManager:
         def run():
             while not self._stop_event.is_set():
                 try:
-                    self._ws.run_forever(ping_interval=30, ping_timeout=10)
+                    self._ws.run_forever(ping_interval=45, ping_timeout=15)
                 except Exception:
                     pass
                 if self._stop_event.is_set():
                     break
-                time.sleep(2)
+                time.sleep(3)
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
@@ -930,7 +924,7 @@ class GlobalConversationNotificationManager:
 
     def _resubscribe_loop(self):
         while not self._stop_event.is_set():
-            time.sleep(60)
+            time.sleep(120)
             with self._lock:
                 created = getattr(self, "channel_created_ts", 0)
                 topics = list(self.subscribed_topics)

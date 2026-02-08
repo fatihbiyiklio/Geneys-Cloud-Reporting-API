@@ -15,7 +15,12 @@ import threading
 import uuid
 import signal
 import traceback
+import warnings
 import psutil
+
+# Suppress st.cache deprecation warning from streamlit_cookies_manager
+warnings.filterwarnings("ignore", message=".*st.cache.*deprecated.*")
+
 from streamlit.runtime import Runtime
 from streamlit_cookies_manager import EncryptedCookieManager
 from cryptography.fernet import Fernet
@@ -33,8 +38,8 @@ auth_manager = AuthManager()
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
 MEMORY_LOG_FILE = os.path.join(LOG_DIR, "memory.jsonl")
-MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "2048"))
-MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "300"))
+MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "1024"))
+MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "120"))
 
 def _setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -628,6 +633,24 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     html, body, [data-testid="stAppViewContainer"] { font-family: 'Inter', sans-serif !important; background-color: #ffffff !important; }
+    
+    /* Prevent flicker/blur during Streamlit rerun */
+    [data-testid="stAppViewContainer"] {
+        backface-visibility: hidden;
+        -webkit-backface-visibility: hidden;
+        transform: translateZ(0);
+        -webkit-transform: translateZ(0);
+    }
+    /* Hide Streamlit running indicator that causes blur effect */
+    div[data-testid="stStatusWidget"] {
+        visibility: hidden !important;
+        opacity: 0 !important;
+    }
+    /* Disable skeleton loading animation */
+    .stMarkdown, .stDataFrame, [data-testid="column"] {
+        animation: none !important;
+        transition: none !important;
+    }
     [data-testid="stAppViewContainer"] > .main { padding-top: 0.5rem !important; }
     [data-testid="stVerticalBlockBorderWrapper"] { background-color: #ffffff !important; border: 1px solid #eef2f6 !important; border-radius: 12px !important; padding: 1rem !important; margin-bottom: 1rem !important; }
     [data-testid="stHorizontalBlock"] { gap: 4px !important; }
@@ -659,24 +682,52 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Suppress known noisy browser console warnings from embedded iframes/features
-st.markdown("""
-<script>
-(() => {
-  const blocked = [
-    "Unrecognized feature:",
-    "An iframe which has both allow-scripts and allow-same-origin"
-  ];
-  const origWarn = console.warn;
-  console.warn = function(...args) {
-    try {
-      const msg = args && args.length ? String(args[0]) : "";
-      if (blocked.some(b => msg.includes(b))) return;
-    } catch (e) {}
-    return origWarn.apply(console, args);
-  };
-})();
-</script>
-""", unsafe_allow_html=True)
+# Using components.html for more reliable script injection
+try:
+    import streamlit.components.v1 as components
+    components.html("""
+    <script>
+    (function() {
+        if (window.__consoleFiltered) return;
+        window.__consoleFiltered = true;
+        
+        const blocked = [
+            "Unrecognized feature",
+            "allow-scripts and allow-same-origin",
+            "ambient-light-sensor",
+            "battery",
+            "document-domain",
+            "layout-animations",
+            "legacy-image-formats",
+            "oversized-images",
+            "vr",
+            "wake-lock",
+            "sandbox"
+        ];
+        
+        const origWarn = console.warn;
+        const origError = console.error;
+        
+        console.warn = function(...args) {
+            try {
+                const msg = args.map(a => String(a)).join(" ");
+                if (blocked.some(b => msg.includes(b))) return;
+            } catch (e) {}
+            return origWarn.apply(console, args);
+        };
+        
+        console.error = function(...args) {
+            try {
+                const msg = args.map(a => String(a)).join(" ");
+                if (blocked.some(b => msg.includes(b))) return;
+            } catch (e) {}
+            return origError.apply(console, args);
+        };
+    })();
+    </script>
+    """, height=0, width=0)
+except Exception:
+    pass
 
 # --- GLOBAL HELPERS (DEFINED FIRST) ---
 
@@ -812,6 +863,14 @@ def save_app_session(user_data):
         pass
 
 def delete_app_session():
+    # Delete session file first
+    try:
+        if os.path.exists(APP_SESSION_FILE):
+            os.remove(APP_SESSION_FILE)
+    except Exception:
+        pass
+    
+    # Delete cookie
     try:
         cookies = _get_cookie_manager()
         if APP_SESSION_COOKIE in cookies:
@@ -819,7 +878,13 @@ def delete_app_session():
             cookies.save()
     except Exception:
         pass
-    if os.path.exists(APP_SESSION_FILE): os.remove(APP_SESSION_FILE)
+    
+    # Double-check file is gone
+    try:
+        if os.path.exists(APP_SESSION_FILE):
+            os.remove(APP_SESSION_FILE)
+    except Exception:
+        pass
 
 def _user_dir(org_code, username):
     base = _org_dir(org_code)
@@ -924,6 +989,7 @@ def _shared_memory_store():
 
 def _soft_memory_cleanup():
     """Best-effort cleanup to reduce memory without visible user impact."""
+    import gc
     try:
         # Clear seed cache
         seed = _shared_seed_store()
@@ -937,6 +1003,12 @@ def _soft_memory_cleanup():
                 org["call_seed_ts"] = 0
                 org["ivr_calls_ts"] = 0
                 org["agent_seed_ts"] = 0
+    except Exception:
+        pass
+    
+    # Force garbage collection
+    try:
+        gc.collect()
     except Exception:
         pass
 
@@ -996,8 +1068,23 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
         store["stop_event"].clear()
 
         def run():
+            import gc
             os.makedirs(LOG_DIR, exist_ok=True)
             proc = psutil.Process(os.getpid())
+            gc_counter = 0
+            log_write_counter = 0
+            MEMORY_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB max
+            
+            def _rotate_memory_log():
+                try:
+                    if os.path.exists(MEMORY_LOG_FILE) and os.path.getsize(MEMORY_LOG_FILE) > MEMORY_LOG_MAX_BYTES:
+                        backup = MEMORY_LOG_FILE + ".1"
+                        if os.path.exists(backup):
+                            os.remove(backup)
+                        os.rename(MEMORY_LOG_FILE, backup)
+                except Exception:
+                    pass
+            
             while not store["stop_event"].is_set():
                 try:
                     rss_mb = proc.memory_info().rss / (1024 * 1024)
@@ -1014,11 +1101,23 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                     if len(store["samples"]) > max_samples:
                         store["samples"] = store["samples"][-max_samples:]
                     last_cleanup = store.get("last_cleanup_ts", 0)
-                if rss_mb >= MEMORY_LIMIT_MB and (time.time() - last_cleanup) > MEMORY_CLEANUP_COOLDOWN_SEC:
+                
+                # Periodic garbage collection every 5 minutes
+                gc_counter += 1
+                if gc_counter >= 30:  # 30 * 10 sec = 5 min
+                    gc.collect()
+                    gc_counter = 0
+                
+                if rss_mb >= MEMORY_LIMIT_MB and (pytime.time() - last_cleanup) > MEMORY_CLEANUP_COOLDOWN_SEC:
                     _soft_memory_cleanup()
                     with store["lock"]:
-                        store["last_cleanup_ts"] = time.time()
+                        store["last_cleanup_ts"] = pytime.time()
                 try:
+                    # Rotate log every 100 writes (~16 min)
+                    log_write_counter += 1
+                    if log_write_counter >= 100:
+                        _rotate_memory_log()
+                        log_write_counter = 0
                     with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
                         f.write(json.dumps(sample, ensure_ascii=False) + "\n")
                 except Exception:
@@ -1026,7 +1125,7 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                 for _ in range(max(1, int(sample_interval * 5))):
                     if store["stop_event"].is_set():
                         break
-                    time.sleep(0.2)
+                    pytime.sleep(0.2)
 
         t = threading.Thread(target=run, daemon=True)
         store["thread"] = t
@@ -1071,7 +1170,7 @@ def _reserve_call_seed(org_code, now_ts, min_interval=10):
         org["call_seed_ts"] = now_ts
         return True
 
-def _update_call_seed(org_code, seed_calls, now_ts, max_items=2000):
+def _update_call_seed(org_code, seed_calls, now_ts, max_items=300):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
@@ -1081,7 +1180,7 @@ def _update_call_seed(org_code, seed_calls, now_ts, max_items=2000):
             data = data[:max_items]
         org["call_seed_data"] = data
 
-def _get_shared_call_meta(org_code, max_age_seconds=7200):
+def _get_shared_call_meta(org_code, max_age_seconds=600):
     store = _shared_seed_store()
     now = pytime.time()
     with store["lock"]:
@@ -1092,7 +1191,7 @@ def _get_shared_call_meta(org_code, max_age_seconds=7200):
             meta.pop(cid, None)
         return dict(meta)
 
-def _update_call_meta(org_code, calls, now_ts, max_items=2000):
+def _update_call_meta(org_code, calls, now_ts, max_items=300):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
@@ -1165,7 +1264,7 @@ def _reserve_ivr_calls(org_code, now_ts, min_interval=10):
         org["ivr_calls_ts"] = now_ts
         return True
 
-def _update_ivr_calls(org_code, calls, now_ts, max_items=2000):
+def _update_ivr_calls(org_code, calls, now_ts, max_items=300):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
@@ -1328,12 +1427,12 @@ def _fetch_org_maps(api):
 def get_shared_org_maps(org_code, api, ttl_seconds=300, force_refresh=False):
     now = pytime.time()
     with _org_maps_lock:
-        # Prune old entries to prevent memory growth
-        stale = [k for k, v in _org_maps_cache.items() if now - v.get("ts", 0) > 6 * 3600]
+        # Prune old entries to prevent memory growth - reduced from 6h to 30min
+        stale = [k for k, v in _org_maps_cache.items() if now - v.get("ts", 0) > 1800]
         for k in stale:
             _org_maps_cache.pop(k, None)
-        if len(_org_maps_cache) > 100:
-            oldest = sorted(_org_maps_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(_org_maps_cache) - 100]
+        if len(_org_maps_cache) > 10:  # Reduced from 100 to 10
+            oldest = sorted(_org_maps_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(_org_maps_cache) - 10]
             for k, _ in oldest:
                 _org_maps_cache.pop(k, None)
         entry = _org_maps_cache.get(org_code)
@@ -1434,13 +1533,13 @@ def sanitize_numeric_df(df):
 def render_downloads(df, base_name):
     c1, c2, c3, c4 = st.columns(4, gap="small")
     with c1:
-        st.download_button("Excel", data=to_excel(df), file_name=f"{base_name}.xlsx", use_container_width=True)
+        st.download_button("Excel", data=to_excel(df), file_name=f"{base_name}.xlsx", width='stretch')
     with c2:
-        st.download_button("CSV", data=to_csv(df), file_name=f"{base_name}.csv", mime="text/csv", use_container_width=True)
+        st.download_button("CSV", data=to_csv(df), file_name=f"{base_name}.csv", mime="text/csv", width='stretch')
     with c3:
-        st.download_button("Parquet", data=to_parquet(df), file_name=f"{base_name}.parquet", mime="application/octet-stream", use_container_width=True)
+        st.download_button("Parquet", data=to_parquet(df), file_name=f"{base_name}.parquet", mime="application/octet-stream", width='stretch')
     with c4:
-        st.download_button("PDF", data=to_pdf(df, title=base_name), file_name=f"{base_name}.pdf", mime="application/pdf", use_container_width=True)
+        st.download_button("PDF", data=to_pdf(df, title=base_name), file_name=f"{base_name}.pdf", mime="application/pdf", width='stretch')
 # --- INITIALIZATION ---
 if 'api_client' not in st.session_state: st.session_state.api_client = None
 if 'genesys_logged_out' not in st.session_state: st.session_state.genesys_logged_out = False
@@ -1559,8 +1658,17 @@ with st.sidebar:
             _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
         except Exception:
             pass
-        st.session_state.app_user = None
+        # Clear session file and cookie FIRST
         delete_app_session()
+        # Clear all session state
+        st.session_state.app_user = None
+        st.session_state.api_client = None
+        st.session_state.logged_in = False
+        st.session_state.genesys_logged_out = True
+        if 'dashboard_config_loaded' in st.session_state:
+            del st.session_state.dashboard_config_loaded
+        if 'data_manager' in st.session_state:
+            del st.session_state.data_manager
         st.rerun()
     st.title(get_text(lang, "settings"))
     
@@ -2410,9 +2518,9 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
 
             if not src_agg.empty:
                 st.subheader("En Cok Neresi Kullaniliyor (Kaynak Bazli)")
-                st.dataframe(src_agg, use_container_width=True)
+                st.dataframe(src_agg, width='stretch')
 
-            st.dataframe(agg, use_container_width=True)
+            st.dataframe(agg, width='stretch')
 
     with tab2:
         st.subheader(get_text(lang, "system_errors"))
@@ -2823,13 +2931,13 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         for idx, vis in enumerate(visuals):
                             with cols[idx]:
                                 if vis == "Service Level":
-                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Answer Rate":
                                     ar_val = float(daily_values.get("Answer Rate", "0").replace('%', ''))
-                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Abandon Rate":
                                     ab_val = float(daily_values.get("Abandon Rate", "0").replace('%', ''))
-                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
                 
                 else:
                     # Historical mode (Yesterday/Date) - show daily stats with gauge
@@ -2855,13 +2963,13 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         for idx, vis in enumerate(visuals):
                             with cols[idx]:
                                 if vis == "Service Level":
-                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Answer Rate":
                                     ar_val = float(daily_values.get("Answer Rate", "0").replace('%', ''))
-                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Abandon Rate":
                                     ab_val = float(daily_values.get("Abandon Rate", "0").replace('%', ''))
-                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
 
     if to_del:
         for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]
@@ -3167,6 +3275,15 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
             st.markdown("""
                 <style>
+                    /* Prevent panel flicker during refresh */
+                    [data-testid="column"]:has(.call-card) {
+                        content-visibility: auto;
+                        contain-intrinsic-size: auto 500px;
+                    }
+                    .call-panel-container {
+                        min-height: 100px;
+                        will-change: contents;
+                    }
                     .call-card {
                         padding: 6px 10px !important;
                         margin-bottom: 6px !important;
@@ -3177,6 +3294,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         align-items: center;
                         justify-content: space-between;
                         gap: 10px;
+                        opacity: 1;
+                        transition: opacity 0.15s ease-in-out;
                     }
                     .call-queue {
                         font-size: 1.0rem !important;

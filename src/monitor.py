@@ -72,9 +72,9 @@ class AppMonitor:
                 # Avoid crashing the app on logging issues
                 pass
             
-            # Keep log manageable (last 1000 calls)
-            if len(self.api_calls_log) > 1000:
-                self.api_calls_log.pop(0)
+            # Keep log manageable (last 200 calls instead of 1000)
+            if len(self.api_calls_log) > 200:
+                self.api_calls_log = self.api_calls_log[-200:]
 
     def log_error(self, module, message, details=None):
         """Records an application error."""

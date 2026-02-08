@@ -10,6 +10,10 @@ class DataManager:
     Manages background data fetching from Genesys API.
     Designed to work with Streamlit's @st.cache_resource.
     """
+    MAX_QUEUE_MEMBERS_CACHE = 100  # Max queues to cache members for
+    MAX_AGENT_DETAILS_CACHE = 100  # Max queues for agent details
+    CACHE_CLEANUP_INTERVAL = 300   # 5 minutes
+    
     def __init__(self, api_client=None, presence_map=None):
         self.api = GenesysAPI(api_client) if api_client else None
         self.presence_map = presence_map or {}
@@ -27,6 +31,7 @@ class DataManager:
         self.last_member_refresh = 0
         self.last_daily_refresh = 0
         self.last_update_time = 0
+        self.last_cache_cleanup = 0
         self.error_log = [] # For console sync in app.py
         
         # Threading
@@ -48,7 +53,6 @@ class DataManager:
                 new_keys = set(agent_queues_map.keys())
                 old_keys = set(self.agent_queues_map.keys())
                 if new_keys != old_keys:
-                    monitor.log_error("DataManager", "Targets changed. Clearing membership cache.")
                     self.queue_members_cache = {}
                 self.agent_queues_map = agent_queues_map
             
@@ -61,13 +65,11 @@ class DataManager:
                 # Already running, maps updated above will be picked up
                 return
             
-            monitor.log_error("DataManager", "Starting background update thread...")
             self.stop_event.clear()
             self.thread = threading.Thread(target=self._update_loop, daemon=True)
             self.thread.start()
 
     def stop(self):
-        monitor.log_error("DataManager", "Stopping background update thread...")
         self.enabled = False
         self.stop_event.set()
         if self.thread:
@@ -126,7 +128,31 @@ class DataManager:
                     break
                 time.sleep(0.2)
 
+    def _cleanup_old_caches(self):
+        """Periodically trim caches to prevent memory bloat."""
+        current_time = time.time()
+        if (current_time - self.last_cache_cleanup) < self.CACHE_CLEANUP_INTERVAL:
+            return
+        
+        # Trim queue_members_cache to max size
+        if len(self.queue_members_cache) > self.MAX_QUEUE_MEMBERS_CACHE:
+            # Keep only the most recently used
+            keys_to_remove = list(self.queue_members_cache.keys())[:-self.MAX_QUEUE_MEMBERS_CACHE]
+            for k in keys_to_remove:
+                self.queue_members_cache.pop(k, None)
+        
+        # Trim agent_details_cache
+        if len(self.agent_details_cache) > self.MAX_AGENT_DETAILS_CACHE:
+            keys_to_remove = list(self.agent_details_cache.keys())[:-self.MAX_AGENT_DETAILS_CACHE]
+            for k in keys_to_remove:
+                self.agent_details_cache.pop(k, None)
+        
+        self.last_cache_cleanup = current_time
+    
     def _fetch_all_data(self):
+        # Periodic cache cleanup
+        self._cleanup_old_caches()
+        
         q_ids = list(self.queues_map.values())
         id_map = {v: k for k, v in self.queues_map.items()}
         
