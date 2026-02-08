@@ -33,6 +33,7 @@ auth_manager = AuthManager()
 # --- LOGGING ---
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
+MEMORY_LOG_FILE = os.path.join(LOG_DIR, "memory.jsonl")
 
 def _setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -916,6 +917,50 @@ def _shared_notif_store():
 def _shared_seed_store():
     return {"lock": threading.Lock(), "orgs": {}}
 
+@st.cache_resource(show_spinner=False)
+def _shared_memory_store():
+    return {"lock": threading.Lock(), "samples": [], "thread": None, "stop_event": threading.Event()}
+
+def _start_memory_monitor(sample_interval=10, max_samples=720):
+    store = _shared_memory_store()
+    with store["lock"]:
+        if store.get("thread") and store["thread"].is_alive():
+            return store
+        store["stop_event"].clear()
+
+        def run():
+            os.makedirs(LOG_DIR, exist_ok=True)
+            proc = psutil.Process(os.getpid())
+            while not store["stop_event"].is_set():
+                try:
+                    rss_mb = proc.memory_info().rss / (1024 * 1024)
+                except Exception:
+                    rss_mb = 0
+                try:
+                    cpu_pct = proc.cpu_percent(interval=None)
+                except Exception:
+                    cpu_pct = 0
+                ts = datetime.now().isoformat(timespec="seconds")
+                sample = {"timestamp": ts, "rss_mb": rss_mb, "cpu_pct": cpu_pct}
+                with store["lock"]:
+                    store["samples"].append(sample)
+                    if len(store["samples"]) > max_samples:
+                        store["samples"] = store["samples"][-max_samples:]
+                try:
+                    with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+                for _ in range(max(1, int(sample_interval * 5))):
+                    if store["stop_event"].is_set():
+                        break
+                    time.sleep(0.2)
+
+        t = threading.Thread(target=run, daemon=True)
+        store["thread"] = t
+        t.start()
+    return store
+
 def _ensure_seed_org(store, org_code):
     org = store["orgs"].setdefault(org_code, {
         "call_seed_ts": 0,
@@ -954,12 +999,15 @@ def _reserve_call_seed(org_code, now_ts, min_interval=10):
         org["call_seed_ts"] = now_ts
         return True
 
-def _update_call_seed(org_code, seed_calls, now_ts):
+def _update_call_seed(org_code, seed_calls, now_ts, max_items=2000):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
         org["call_seed_ts"] = now_ts
-        org["call_seed_data"] = list(seed_calls or [])
+        data = list(seed_calls or [])
+        if len(data) > max_items:
+            data = data[:max_items]
+        org["call_seed_data"] = data
 
 def _get_shared_call_meta(org_code, max_age_seconds=7200):
     store = _shared_seed_store()
@@ -972,7 +1020,7 @@ def _get_shared_call_meta(org_code, max_age_seconds=7200):
             meta.pop(cid, None)
         return dict(meta)
 
-def _update_call_meta(org_code, calls, now_ts):
+def _update_call_meta(org_code, calls, now_ts, max_items=2000):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
@@ -998,6 +1046,10 @@ def _update_call_meta(org_code, calls, now_ts):
                 entry["agent_name"] = agent_name
             entry["ts"] = now_ts
             meta[cid] = entry
+        if len(meta) > max_items:
+            oldest = sorted(meta.items(), key=lambda kv: kv[1].get("ts", 0))[:len(meta) - max_items]
+            for cid, _ in oldest:
+                meta.pop(cid, None)
 
 def _get_shared_agent_seed(org_code):
     store = _shared_seed_store()
@@ -1041,12 +1093,15 @@ def _reserve_ivr_calls(org_code, now_ts, min_interval=10):
         org["ivr_calls_ts"] = now_ts
         return True
 
-def _update_ivr_calls(org_code, calls, now_ts):
+def _update_ivr_calls(org_code, calls, now_ts, max_items=2000):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
         org["ivr_calls_ts"] = now_ts
-        org["ivr_calls_data"] = list(calls or [])
+        data = list(calls or [])
+        if len(data) > max_items:
+            data = data[:max_items]
+        org["ivr_calls_data"] = data
 
 def _get_session_id():
     if "_session_id" not in st.session_state:
@@ -2304,6 +2359,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
             st.success("Sistemde kayıtlı hata bulunmuyor.")
 
     with tab3:
+        _start_memory_monitor(sample_interval=10, max_samples=720)
         st.subheader("Sistem Durumu")
         proc = psutil.Process(os.getpid())
         try:
@@ -2375,6 +2431,20 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
         recent_rate = monitor.get_rate_per_minute(minutes=1)
         st.write(f"Son 1 dk: {recent_rate:.1f} istek/dk")
         st.write(f"Ortalama: {avg_rate:.1f} istek/dk")
+
+        st.divider()
+        st.subheader("Bellek Trendi")
+        store = _shared_memory_store()
+        with store["lock"]:
+            samples = list(store.get("samples") or [])
+        if samples:
+            df_mem = pd.DataFrame(samples)
+            df_mem["timestamp"] = pd.to_datetime(df_mem["timestamp"], errors="coerce")
+            df_mem = df_mem.dropna(subset=["timestamp"])
+            if not df_mem.empty:
+                st.line_chart(df_mem.set_index("timestamp")[["rss_mb"]])
+        else:
+            st.info("Bellek örneği henüz yok.")
 
     # Logout moved to Organization Settings
     
@@ -3103,32 +3173,34 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     now_ts = pytime.time()
                     union_queues_map, union_agent_map = _get_union_session_maps(org)
                     queue_id_to_name = {v: k for k, v in st.session_state.queues_map.items()}
-                    global_notif = ensure_global_conversation_manager()
-                    global_notif.update_client(st.session_state.api_client, st.session_state.queues_map)
-                    global_topics = [
-                        "v2.conversations.calls",
-                        "v2.conversations.chats",
-                        "v2.conversations.emails",
-                        "v2.conversations.messages",
-                    ]
-                    global_notif.start(global_topics)
-                    active_calls = global_notif.get_active_conversations()
+                    # Global conversation topics are invalid in some orgs (HTTP 400).
+                    # Use queue + agent notifications for active/waiting calls.
+                    active_calls = []
 
                     agent_active = []
-                    agent_notif = None
-                    if st.session_state.get("show_agent_panel", False):
-                        agent_notif = ensure_agent_notifications_manager()
-                        agent_notif.update_client(
-                            st.session_state.api_client,
-                            st.session_state.queues_map,
-                            st.session_state.get('users_info'),
-                            st.session_state.get('presence_map')
-                        )
-                        if agent_notif.is_running() or agent_notif.connected:
-                            try:
-                                agent_active = agent_notif.get_active_calls()
-                            except Exception:
-                                agent_active = []
+                    agent_notif = ensure_agent_notifications_manager()
+                    agent_notif.update_client(
+                        st.session_state.api_client,
+                        st.session_state.queues_map,
+                        st.session_state.get('users_info'),
+                        st.session_state.get('presence_map')
+                    )
+                    notif_queue_ids = list(union_agent_map.values()) if union_agent_map else list(st.session_state.queues_map.values())
+                    members_map = agent_notif.ensure_members(notif_queue_ids)
+                    user_ids = sorted({m.get("id") for mems in members_map.values() for m in mems if m.get("id")})
+                    max_users = (agent_notif.MAX_TOPICS_PER_CHANNEL * agent_notif.MAX_CHANNELS) // 3
+                    if len(user_ids) > max_users:
+                        st.warning(get_text(lang, "agent_panel_topic_limit"))
+                        user_ids = user_ids[:max_users]
+                    if user_ids:
+                        agent_notif.start(user_ids)
+                        if not agent_notif.connected:
+                            st.info(get_text(lang, "agent_panel_notif_connecting"))
+                    if agent_notif.is_running() or agent_notif.connected:
+                        try:
+                            agent_active = agent_notif.get_active_calls()
+                        except Exception:
+                            agent_active = []
 
                     notif = ensure_notifications_manager()
                     notif.update_client(st.session_state.api_client, st.session_state.queues_map)
@@ -3217,14 +3289,16 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
                 active_calls = list(combined.values())
 
-                # Always merge recent analytics to capture IVR-only calls
+                # Merge recent analytics to capture IVR-only calls (only if live signals are stale)
                 shared_ts, shared_calls = _get_shared_ivr_calls(org)
-                analytics_calls = shared_calls if (now_ts - shared_ts) <= 20 and shared_calls else []
-                if _reserve_ivr_calls(org, now_ts, min_interval=20):
+                analytics_calls = shared_calls if (now_ts - shared_ts) <= 60 and shared_calls else []
+                notif_stale = (not notif.connected) or (getattr(notif, "last_message_ts", 0) == 0) or ((now_ts - getattr(notif, "last_message_ts", 0)) > 60)
+                should_refresh_ivr = notif_stale or (not queue_waiting and not agent_active)
+                if should_refresh_ivr and _reserve_ivr_calls(org, now_ts, min_interval=60):
                     api = GenesysAPI(st.session_state.api_client)
                     end_dt = datetime.now(timezone.utc)
-                    start_dt = end_dt - timedelta(minutes=30)
-                    convs = api.get_conversation_details_recent(start_dt, end_dt, page_size=100, max_pages=5, order="desc")
+                    start_dt = end_dt - timedelta(minutes=20)
+                    convs = api.get_conversation_details_recent(start_dt, end_dt, page_size=100, max_pages=4, order="desc")
                     analytics_calls = _build_active_calls(convs, lang, queue_id_to_name, st.session_state.get('users_info'))
                     _update_ivr_calls(org, analytics_calls, now_ts)
 
@@ -3314,12 +3388,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 waiting_calls = active_calls
 
                 with st.expander("🛠 Debug (Görüşme)", expanded=False):
-                    st.write(f"Global Notif Connected: {global_notif.connected if global_notif else False}")
-                    st.write(f"Global Topics: {len(getattr(global_notif, 'subscribed_topics', [])) if global_notif else 0}")
-                    st.write(f"Active Calls (Global): {len(active_calls) if active_calls else 0}")
-                    st.write(f"Global Last Message: {datetime.fromtimestamp(getattr(global_notif, 'last_message_ts', 0)).strftime('%H:%M:%S') if getattr(global_notif, 'last_message_ts', 0) else 'N/A'}")
-                    st.write(f"Global Last Event: {datetime.fromtimestamp(getattr(global_notif, 'last_event_ts', 0)).strftime('%H:%M:%S') if getattr(global_notif, 'last_event_ts', 0) else 'N/A'}")
-                    st.write(f"Global Last Topic: {getattr(global_notif, 'last_topic', '') or 'N/A'}")
+                    st.write("Global Notif: DEVRE DISI (invalid topic 400)")
+                    st.write(f"Active Calls (Agent): {len(agent_active) if agent_active else 0}")
                     st.write(f"Queue Notif Connected: {notif.connected if notif else False}")
                     st.write(f"Queue Topics: {len(getattr(notif, 'subscribed_topics', [])) if notif else 0}")
                     st.write(f"Queue Channels: {len(getattr(notif, 'channels', [])) if notif else 0}")
