@@ -2620,6 +2620,163 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
         else:
             st.info("Bellek örneği henüz yok.")
 
+        st.divider()
+        st.subheader("🔍 Bellek Kaynak Analizi (RSS Şişme Tespiti)")
+        
+        # Calculate memory usage of each component
+        memory_breakdown = []
+        
+        # 1. Session State
+        try:
+            session_keys = list(st.session_state.keys())
+            session_size_estimate = 0
+            session_details = []
+            for key in session_keys:
+                try:
+                    val = st.session_state[key]
+                    size_kb = sys.getsizeof(val) / 1024
+                    if hasattr(val, '__dict__'):
+                        size_kb += sys.getsizeof(val.__dict__) / 1024
+                    if isinstance(val, (dict, list)):
+                        # Deep size estimate for collections
+                        size_kb = len(json.dumps(val, default=str)) / 1024 if size_kb < 1 else size_kb
+                    session_size_estimate += size_kb
+                    if size_kb > 10:  # Only show items > 10KB
+                        session_details.append({"key": key, "size_kb": size_kb, "type": type(val).__name__})
+                except:
+                    pass
+            memory_breakdown.append({"Kaynak": "Session State", "Boyut (KB)": session_size_estimate, "Öğe Sayısı": len(session_keys)})
+        except:
+            pass
+        
+        # 2. Notification Managers
+        try:
+            org_code = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
+            store = _shared_notif_store()
+            with store["lock"]:
+                call_nm = store["call"].get(org_code)
+                agent_nm = store["agent"].get(org_code)
+                global_nm = store["global"].get(org_code)
+            
+            # Waiting calls cache
+            if call_nm:
+                wc = getattr(call_nm, 'waiting_calls', {}) or {}
+                wc_size = len(json.dumps(list(wc.values()), default=str)) / 1024 if wc else 0
+                memory_breakdown.append({"Kaynak": "Waiting Calls Cache", "Boyut (KB)": wc_size, "Öğe Sayısı": len(wc)})
+            
+            # User presence/routing cache
+            if agent_nm:
+                up = getattr(agent_nm, 'user_presence', {}) or {}
+                ur = getattr(agent_nm, 'user_routing', {}) or {}
+                ac = getattr(agent_nm, 'active_calls', {}) or {}
+                qm = getattr(agent_nm, 'queue_members_cache', {}) or {}
+                
+                up_size = len(json.dumps(up, default=str)) / 1024 if up else 0
+                ur_size = len(json.dumps(ur, default=str)) / 1024 if ur else 0
+                ac_size = len(json.dumps(list(ac.values()), default=str)) / 1024 if ac else 0
+                qm_size = len(json.dumps(qm, default=str)) / 1024 if qm else 0
+                
+                memory_breakdown.append({"Kaynak": "User Presence Cache", "Boyut (KB)": up_size, "Öğe Sayısı": len(up)})
+                memory_breakdown.append({"Kaynak": "User Routing Cache", "Boyut (KB)": ur_size, "Öğe Sayısı": len(ur)})
+                memory_breakdown.append({"Kaynak": "Active Calls Cache", "Boyut (KB)": ac_size, "Öğe Sayısı": len(ac)})
+                memory_breakdown.append({"Kaynak": "Queue Members Cache", "Boyut (KB)": qm_size, "Öğe Sayısı": len(qm)})
+            
+            # Global conversations
+            if global_nm:
+                gc = getattr(global_nm, 'active_conversations', {}) or {}
+                gc_size = len(json.dumps(list(gc.values()), default=str)) / 1024 if gc else 0
+                memory_breakdown.append({"Kaynak": "Global Conversations Cache", "Boyut (KB)": gc_size, "Öğe Sayısı": len(gc)})
+        except:
+            pass
+        
+        # 3. DataManager Caches
+        try:
+            dm = st.session_state.get("data_manager")
+            if dm:
+                obs = getattr(dm, 'obs_data_cache', {}) or {}
+                daily = getattr(dm, 'daily_data_cache', {}) or {}
+                agent = getattr(dm, 'agent_details_cache', {}) or {}
+                qmem = getattr(dm, 'queue_members_cache', {}) or {}
+                
+                obs_size = len(json.dumps(obs, default=str)) / 1024 if obs else 0
+                daily_size = len(json.dumps(daily, default=str)) / 1024 if daily else 0
+                agent_size = len(json.dumps(agent, default=str)) / 1024 if agent else 0
+                qmem_size = len(json.dumps(qmem, default=str)) / 1024 if qmem else 0
+                
+                memory_breakdown.append({"Kaynak": "DM Obs Cache", "Boyut (KB)": obs_size, "Öğe Sayısı": len(obs)})
+                memory_breakdown.append({"Kaynak": "DM Daily Cache", "Boyut (KB)": daily_size, "Öğe Sayısı": len(daily)})
+                memory_breakdown.append({"Kaynak": "DM Agent Cache", "Boyut (KB)": agent_size, "Öğe Sayısı": len(agent)})
+                memory_breakdown.append({"Kaynak": "DM Queue Members", "Boyut (KB)": qmem_size, "Öğe Sayısı": len(qmem)})
+        except:
+            pass
+        
+        # 4. Shared Seed Store
+        try:
+            seed_store = _shared_seed_store()
+            with seed_store["lock"]:
+                orgs = seed_store.get("orgs", {})
+                for org_key, org_data in orgs.items():
+                    call_seed = org_data.get("call_seed_data", [])
+                    ivr_calls = org_data.get("ivr_calls_data", [])
+                    call_meta = org_data.get("call_meta", {})
+                    agent_pres = org_data.get("agent_presence", {})
+                    agent_rout = org_data.get("agent_routing", {})
+                    
+                    cs_size = len(json.dumps(call_seed, default=str)) / 1024 if call_seed else 0
+                    ivr_size = len(json.dumps(ivr_calls, default=str)) / 1024 if ivr_calls else 0
+                    cm_size = len(json.dumps(call_meta, default=str)) / 1024 if call_meta else 0
+                    ap_size = len(json.dumps(agent_pres, default=str)) / 1024 if agent_pres else 0
+                    ar_size = len(json.dumps(agent_rout, default=str)) / 1024 if agent_rout else 0
+                    
+                    memory_breakdown.append({"Kaynak": f"Seed: Call Data ({org_key})", "Boyut (KB)": cs_size, "Öğe Sayısı": len(call_seed)})
+                    memory_breakdown.append({"Kaynak": f"Seed: IVR Calls ({org_key})", "Boyut (KB)": ivr_size, "Öğe Sayısı": len(ivr_calls)})
+                    memory_breakdown.append({"Kaynak": f"Seed: Call Meta ({org_key})", "Boyut (KB)": cm_size, "Öğe Sayısı": len(call_meta)})
+                    memory_breakdown.append({"Kaynak": f"Seed: Agent Presence ({org_key})", "Boyut (KB)": ap_size, "Öğe Sayısı": len(agent_pres)})
+                    memory_breakdown.append({"Kaynak": f"Seed: Agent Routing ({org_key})", "Boyut (KB)": ar_size, "Öğe Sayısı": len(agent_rout)})
+        except:
+            pass
+        
+        # 5. Monitor Logs
+        try:
+            api_log = getattr(monitor, 'api_calls_log', []) or []
+            error_log = getattr(monitor, 'error_logs', []) or []
+            api_size = len(json.dumps(api_log, default=str)) / 1024 if api_log else 0
+            err_size = len(json.dumps(error_log, default=str)) / 1024 if error_log else 0
+            memory_breakdown.append({"Kaynak": "API Calls Log (Memory)", "Boyut (KB)": api_size, "Öğe Sayısı": len(api_log)})
+            memory_breakdown.append({"Kaynak": "Error Log (Memory)", "Boyut (KB)": err_size, "Öğe Sayısı": len(error_log)})
+        except:
+            pass
+        
+        # Display breakdown
+        if memory_breakdown:
+            df_breakdown = pd.DataFrame(memory_breakdown)
+            df_breakdown = df_breakdown.sort_values("Boyut (KB)", ascending=False)
+            df_breakdown["Boyut (KB)"] = df_breakdown["Boyut (KB)"].round(1)
+            
+            # Show top memory consumers
+            total_kb = df_breakdown["Boyut (KB)"].sum()
+            st.metric("Toplam Cache Boyutu", f"{total_kb:.1f} KB ({total_kb/1024:.2f} MB)")
+            
+            # Find the biggest consumer
+            if not df_breakdown.empty:
+                top = df_breakdown.iloc[0]
+                pct = (top["Boyut (KB)"] / total_kb * 100) if total_kb > 0 else 0
+                if pct > 30:
+                    st.warning(f"⚠️ En büyük kaynak: **{top['Kaynak']}** - {top['Boyut (KB)']:.1f} KB ({pct:.1f}%)")
+                else:
+                    st.success(f"✅ En büyük kaynak: **{top['Kaynak']}** - {top['Boyut (KB)']:.1f} KB ({pct:.1f}%)")
+            
+            st.dataframe(df_breakdown, use_container_width=True, hide_index=True)
+            
+            # Show session state details if significant
+            if session_details:
+                with st.expander("📦 Session State Detayları (>10 KB)"):
+                    df_session = pd.DataFrame(session_details).sort_values("size_kb", ascending=False)
+                    df_session["size_kb"] = df_session["size_kb"].round(1)
+                    st.dataframe(df_session, use_container_width=True, hide_index=True)
+        else:
+            st.info("Bellek analizi yapılamadı.")
+
     # Logout moved to Organization Settings
     
     # Org DataManager controls moved to Organization Settings
