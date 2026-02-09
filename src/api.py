@@ -51,6 +51,8 @@ class GenesysAPI:
             duration_ms = int((time.monotonic() - start) * 1000)
             monitor.log_api_call(path, method="POST", status_code=response.status_code, duration_ms=duration_ms)
             response.raise_for_status()
+            if response.status_code == 204 or not response.content:
+                return {"status": response.status_code}
             return response.json()
         except requests.exceptions.HTTPError as e:
             duration_ms = int((time.monotonic() - start) * 1000)
@@ -103,7 +105,218 @@ class GenesysAPI:
             monitor.log_api_call(path, method="PUT", status_code=None, duration_ms=duration_ms)
             monitor.log_error("API_PUT", f"System Error on {path}", str(e))
             raise e
+
+    def _patch(self, path, data=None):
+        start = time.monotonic()
+        headers = self.headers
+        try:
+            response = _session.patch(f"{self.api_host}{path}", headers=headers, json=data or {}, timeout=15)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="PATCH", status_code=response.status_code, duration_ms=duration_ms)
+            response.raise_for_status()
+            # Some PATCH endpoints return 202/204 with no body
+            if response.status_code in (202, 204) or not response.content:
+                return {"status": response.status_code}
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            try:
+                status_code = response.status_code
+            except Exception:
+                status_code = None
+            detail = None
+            try:
+                detail = response.text
+                if detail and len(detail) > 2000:
+                    detail = detail[:2000] + "...(truncated)"
+            except Exception:
+                detail = None
+            monitor.log_api_call(path, method="PATCH", status_code=status_code, duration_ms=duration_ms)
+            monitor.log_error("API_PATCH", f"HTTP {response.status_code} on {path}", detail or str(e))
+            raise e
+        except Exception as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(path, method="PATCH", status_code=None, duration_ms=duration_ms)
+            monitor.log_error("API_PATCH", f"System Error on {path}", str(e))
+            raise e
+
+    def disconnect_conversation(self, conversation_id):
+        """Disconnect/close a conversation.
+        
+        Per Genesys Cloud docs (https://developer.genesys.cloud/routing/conversations/call-handling-guide):
+        - Disconnect: PATCH /api/v2/conversations/calls/{id}/participants/{pid} {"state":"disconnected"}
+        - Wrapup:     PATCH /api/v2/conversations/calls/{id}/participants/{pid} {"wrapup":{"code":"...","notes":"..."}}
+        
+        NOTE: These endpoints require user context (Authorization Code / Implicit grant).
+              Client Credentials grant will get 403 "requires user context".
+              The caller must supply a user-context token.
+        
+        The permission 'conversation:communication:disconnect' allows updating any participant,
+        not just the authenticated user's own leg.
+        """
+        # 1. Get conversation details
+        conv = self._get(f"/api/v2/conversations/{conversation_id}")
+        participants = conv.get('participants', [])
+        
+        MEDIA_KEYS = ["calls", "callbacks", "chats", "emails", "messages",
+                      "cobrowsesessions", "videos", "screenshares", "socialExpressions"]
+        ACTIVE_COMM_STATES = {"connected", "alerting", "offering", "contacting", "dialing", "transmitting"}
+        SYSTEM_PURPOSES = {"ivr", "acd", "workflow", "system", "dialer"}
+        
+        # Detect primary media type
+        media_type = None
+        for p in participants:
+            for mk in MEDIA_KEYS:
+                comms = p.get(mk)
+                if comms and isinstance(comms, list) and len(comms) > 0:
+                    media_type = mk
+                    break
+            if media_type:
+                break
+        
+        # Build media-specific base path for PATCH
+        if media_type:
+            base_path = f"/api/v2/conversations/{media_type}/{conversation_id}/participants"
+        else:
+            base_path = f"/api/v2/conversations/{conversation_id}/participants"
+        
+        results = {"disconnected": [], "skipped": [], "errors": [], "media_type": media_type}
+        
+        # Get a default wrapup code for wrapup-pending participants
+        default_wrapup_code = None
+        try:
+            wrapup_codes = self.get_wrapup_codes()
+            if wrapup_codes:
+                for wid, wname in wrapup_codes.items():
+                    if 'default' in wname.lower():
+                        default_wrapup_code = wid
+                        break
+                if not default_wrapup_code:
+                    default_wrapup_code = next(iter(wrapup_codes))
+        except Exception:
+            pass
+        
+        for p in participants:
+            pid = p.get('id')
+            p_purpose = (p.get('purpose') or '').lower()
+            p_name = p.get('name', p.get('address', 'Unknown'))
+            p_state = (p.get('state') or '').lower()
+            
+            # Skip system participants — can't be disconnected
+            if p_purpose in SYSTEM_PURPOSES:
+                results["skipped"].append({
+                    "id": pid, "name": p_name, "purpose": p_purpose,
+                    "state": p_state, "reason": "system"
+                })
+                continue
+            
+            # Analyze communication sessions
+            has_active_comm = False
+            needs_wrapup = False
+            
+            for mk in MEDIA_KEYS:
+                comms = p.get(mk)
+                if not comms or not isinstance(comms, list):
+                    continue
+                for comm in comms:
+                    comm_state = (comm.get('state') or '').lower()
+                    if comm_state in ACTIVE_COMM_STATES:
+                        has_active_comm = True
+                        break
+                    if comm_state == 'disconnected':
+                        wrapup = comm.get('wrapup')
+                        if not wrapup or not wrapup.get('code'):
+                            needs_wrapup = True
+                if has_active_comm:
+                    break
+            
+            # Check top-level wrapupRequired
+            if not has_active_comm and not needs_wrapup:
+                if p.get('wrapupRequired', False):
+                    p_wrapup = p.get('wrapup')
+                    if not p_wrapup or not p_wrapup.get('code'):
+                        needs_wrapup = True
+            
+            # Fully ended — skip
+            if p_state in ('disconnected', 'terminated') and not needs_wrapup and not has_active_comm:
+                results["skipped"].append({
+                    "id": pid, "name": p_name, "purpose": p_purpose,
+                    "state": p_state, "reason": "ended"
+                })
+                continue
+            
+            # Customer in disconnected state with no wrapup — skip
+            if p_purpose == 'customer' and p_state == 'disconnected' and not needs_wrapup:
+                results["skipped"].append({
+                    "id": pid, "name": p_name, "purpose": p_purpose,
+                    "state": p_state, "reason": "customer_ended"
+                })
+                continue
+            
+            # --- Try to close this participant ---
+            action_taken = None
+            last_error = None
+            
+            # Strategy 1: Wrapup pending → PATCH with wrapup code (per Genesys docs, wrapup is sent via PATCH)
+            if needs_wrapup and default_wrapup_code:
+                try:
+                    self._patch(
+                        f"{base_path}/{pid}",
+                        data={
+                            "wrapup": {
+                                "code": default_wrapup_code,
+                                "notes": "Admin disconnect"
+                            }
+                        }
+                    )
+                    action_taken = "wrapup_submitted"
+                except Exception as e:
+                    last_error = self._extract_error_detail(e)
+            
+            # Strategy 2: Active comm or wrapup failed → PATCH state disconnected
+            if not action_taken:
+                try:
+                    self._patch(f"{base_path}/{pid}", data={"state": "disconnected"})
+                    action_taken = "disconnected"
+                except Exception as e:
+                    last_error = self._extract_error_detail(e)
+            
+            # Strategy 3: If PATCH disconnect failed, try with wrapupSkipped
+            if not action_taken:
+                try:
+                    self._patch(
+                        f"{base_path}/{pid}",
+                        data={"state": "disconnected", "wrapupSkipped": True}
+                    )
+                    action_taken = "disconnected+wrapupSkipped"
+                except Exception as e:
+                    last_error = self._extract_error_detail(e)
+            
+            if action_taken:
+                results["disconnected"].append({
+                    "id": pid, "name": p_name, "purpose": p_purpose, "action": action_taken
+                })
+            else:
+                results["errors"].append({
+                    "id": pid, "name": p_name, "purpose": p_purpose, "error": last_error or "Unknown error"
+                })
+        
+        return results
     
+    def _extract_error_detail(self, e):
+        """Extract meaningful error message from an exception."""
+        error_detail = str(e)
+        try:
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    body = e.response.json()
+                    error_detail = body.get('message', body.get('error', error_detail))
+                except Exception:
+                    error_detail = e.response.text[:500] if e.response.text else error_detail
+        except Exception:
+            pass
+        return error_detail
+
     # ... (other methods remain unchanged) ...
 
     def get_conversation_details(self, start_date, end_date):
@@ -173,6 +386,24 @@ class GenesysAPI:
             monitor.log_error("API_POST", f"Error fetching recent conversation details: {e}")
         return conversations
 
+    def get_conversation(self, conversation_id):
+        """Fetch single conversation with full participant attributes."""
+        try:
+            data = self._get(f"/api/v2/conversations/{conversation_id}")
+            return data
+        except Exception as e:
+            monitor.log_error("API_GET", f"Error fetching conversation {conversation_id}: {e}")
+            return None
+
+    def get_conversation_call(self, conversation_id):
+        """Fetch call conversation with participant attributes."""
+        try:
+            data = self._get(f"/api/v2/conversations/calls/{conversation_id}")
+            return data
+        except Exception as e:
+            # Fallback to generic conversation endpoint
+            return self.get_conversation(conversation_id)
+
     def get_users(self):
         """Fetches all users using direct API with paging."""
         users = []
@@ -234,6 +465,167 @@ class GenesysAPI:
         except Exception as e:
             monitor.log_error("API_GET", f"Error fetching wrap-up codes: {e}")
         return codes
+
+    def get_groups(self, page_size=100):
+        """Fetches all groups from Genesys Cloud."""
+        groups = []
+        try:
+            page_number = 1
+            while True:
+                data = self._get("/api/v2/groups", params={"pageNumber": page_number, "pageSize": page_size, "sortOrder": "ASC"})
+                if 'entities' in data:
+                    for g in data['entities']:
+                        groups.append({
+                            'id': g['id'],
+                            'name': g.get('name', ''),
+                            'description': g.get('description', ''),
+                            'memberCount': g.get('memberCount', 0),
+                            'type': g.get('type', ''),
+                            'state': g.get('state', '')
+                        })
+                    if not data.get('nextUri'):
+                        break
+                    page_number += 1
+                else:
+                    break
+        except Exception as e:
+            monitor.log_error("API_GET", f"Error fetching groups: {e}")
+        return groups
+
+    def get_group_members(self, group_id, page_size=100):
+        """Fetches members of a specific group."""
+        members = []
+        try:
+            page_number = 1
+            while True:
+                data = self._get(f"/api/v2/groups/{group_id}/members", params={"pageNumber": page_number, "pageSize": page_size})
+                if 'entities' in data:
+                    for m in data['entities']:
+                        members.append({
+                            'id': m['id'],
+                            'name': m.get('name', ''),
+                            'email': m.get('email', ''),
+                            'state': m.get('state', '')
+                        })
+                    if not data.get('nextUri'):
+                        break
+                    page_number += 1
+                else:
+                    break
+        except Exception as e:
+            monitor.log_error("API_GET", f"Error fetching group members for {group_id}: {e}")
+        return members
+
+    def add_group_members(self, group_id, member_ids):
+        """Add members to a group. member_ids is a list of user IDs.
+        POST /api/v2/groups/{groupId}/members
+        Body: {"memberIds": ["id1", "id2", ...], "version": 1}
+        """
+        return self._post(f"/api/v2/groups/{group_id}/members", data={"memberIds": member_ids, "version": 1})
+
+    def add_group_to_queues(self, group_id, queue_ids):
+        """Add a group to one or more queues via PUT /api/v2/routing/queues/{queueId}.
+        Uses the memberGroups field (list[MemberGroup]) with type='GROUP'.
+        1) GET queue to retrieve current memberGroups
+        2) Append {"id": groupId, "type": "GROUP"} if not already present
+        3) PUT queue with updated memberGroups
+        """
+        results = {}
+        for qid in queue_ids:
+            try:
+                queue_data = self._get(f"/api/v2/routing/queues/{qid}")
+                member_groups = queue_data.get("memberGroups") or []
+                existing_ids = {mg.get("id") for mg in member_groups}
+                if group_id in existing_ids:
+                    results[qid] = {"success": True, "already": True}
+                    continue
+                member_groups.append({"id": group_id, "type": "GROUP"})
+                queue_data["memberGroups"] = member_groups
+                # Remove read-only fields that cannot be sent in PUT
+                for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
+                                 "memberCount", "userMemberCount", "joinedMemberCount"]:
+                    queue_data.pop(ro_field, None)
+                self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
+                results[qid] = {"success": True}
+            except Exception as e:
+                results[qid] = {"success": False, "error": self._extract_error_detail(e)}
+                monitor.log_error("API_PUT", f"Error adding group {group_id} to queue {qid}: {e}")
+        return results
+
+    def remove_group_from_queues(self, group_id, queue_ids):
+        """Remove a group from one or more queues via PUT /api/v2/routing/queues/{queueId}.
+        Uses the memberGroups field — removes the group from the list.
+        1) GET queue to retrieve current memberGroups
+        2) Filter out the group_id
+        3) PUT queue with updated memberGroups
+        """
+        results = {}
+        for qid in queue_ids:
+            try:
+                queue_data = self._get(f"/api/v2/routing/queues/{qid}")
+                member_groups = queue_data.get("memberGroups") or []
+                new_member_groups = [mg for mg in member_groups if mg.get("id") != group_id]
+                if len(new_member_groups) == len(member_groups):
+                    results[qid] = {"success": True, "not_found": True}
+                    continue
+                queue_data["memberGroups"] = new_member_groups
+                # Remove read-only fields that cannot be sent in PUT
+                for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
+                                 "memberCount", "userMemberCount", "joinedMemberCount"]:
+                    queue_data.pop(ro_field, None)
+                self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
+                results[qid] = {"success": True}
+            except Exception as e:
+                results[qid] = {"success": False, "error": self._extract_error_detail(e)}
+                monitor.log_error("API_PUT", f"Error removing group {group_id} from queue {qid}: {e}")
+        return results
+
+    def remove_group_members(self, group_id, member_ids):
+        """Remove members from a group.
+        DELETE /api/v2/groups/{groupId}/members with ids query param.
+        """
+        ids_str = ",".join(member_ids)
+        start = time.monotonic()
+        try:
+            response = _session.delete(
+                f"{self.api_host}/api/v2/groups/{group_id}/members",
+                headers=self.headers,
+                params={"ids": ids_str},
+                timeout=10
+            )
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(f"/api/v2/groups/{group_id}/members", method="DELETE", status_code=response.status_code, duration_ms=duration_ms)
+            response.raise_for_status()
+            return {"status": response.status_code}
+        except Exception as e:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            monitor.log_api_call(f"/api/v2/groups/{group_id}/members", method="DELETE", status_code=None, duration_ms=duration_ms)
+            monitor.log_error("API_DELETE", f"Error removing group members: {e}")
+            raise e
+
+    def get_users(self, page_size=100, max_pages=50):
+        """Fetches all users from Genesys Cloud."""
+        users = []
+        try:
+            page_number = 1
+            while page_number <= max_pages:
+                data = self._get("/api/v2/users", params={"pageNumber": page_number, "pageSize": page_size, "sortOrder": "ASC"})
+                if 'entities' in data:
+                    for u in data['entities']:
+                        users.append({
+                            'id': u['id'],
+                            'name': u.get('name', ''),
+                            'email': u.get('email', ''),
+                            'state': u.get('state', '')
+                        })
+                    if not data.get('nextUri'):
+                        break
+                    page_number += 1
+                else:
+                    break
+        except Exception as e:
+            monitor.log_error("API_GET", f"Error fetching users: {e}")
+        return users
 
     def get_analytics_conversations_aggregate(self, start_date, end_date, granularity="P1D", group_by=None, filter_type=None, filter_ids=None, metrics=None, media_types=None):
         dimension = "userId" if filter_type == 'user' else "queueId"

@@ -164,12 +164,17 @@ class NotificationManager:
                     except Exception:
                         pass
                     ch["ws"] = None
-                # Clear thread reference
+                # Join thread to prevent accumulation
+                t = ch.get("thread")
+                if t and t.is_alive():
+                    try:
+                        t.join(timeout=2)
+                    except Exception:
+                        pass
                 ch["thread"] = None
             except Exception:
                 pass
         self._update_connected()
-        # Force garbage collection after stopping channels
         _cleanup_dead_websockets()
 
     def get_waiting_calls(self, max_age_seconds=600):
@@ -293,7 +298,7 @@ class NotificationManager:
         def run():
             # Keep trying until stop requested
             ch_stop = ch.get("stop_event")
-            max_retries = 100  # Prevent infinite loop
+            max_retries = 10  # Prevent lingering threads
             retry_count = 0
             while not self._stop_event.is_set() and not ch_stop.is_set() and retry_count < max_retries:
                 try:
@@ -479,7 +484,13 @@ class AgentNotificationManager:
                     except Exception:
                         pass
                     ch["ws"] = None
-                # Clear thread reference
+                # Join thread to prevent accumulation
+                t = ch.get("thread")
+                if t and t.is_alive():
+                    try:
+                        t.join(timeout=2)
+                    except Exception:
+                        pass
                 ch["thread"] = None
             except Exception:
                 pass
@@ -716,7 +727,7 @@ class AgentNotificationManager:
 
         def run():
             ch_stop = ch.get("stop_event")
-            max_retries = 100  # Prevent infinite loop
+            max_retries = 10  # Prevent lingering threads
             retry_count = 0
             while not self._stop_event.is_set() and not ch_stop.is_set() and retry_count < max_retries:
                 try:
@@ -944,6 +955,13 @@ class GlobalConversationNotificationManager:
                 self._ws = None
         except Exception:
             pass
+        # Join thread to prevent accumulation
+        t = self._thread
+        if t and t.is_alive():
+            try:
+                t.join(timeout=2)
+            except Exception:
+                pass
         self._thread = None
         self.connected = False
         # Force cleanup
@@ -967,6 +985,24 @@ class GlobalConversationNotificationManager:
             for k in stale:
                 self.active_conversations.pop(k, None)
             return list(self.active_conversations.values())
+
+    def seed_conversations(self, conversations):
+        """Upsert conversations from API. Updates existing entries, adds new ones."""
+        now = time.time()
+        with self._lock:
+            for conv in conversations or []:
+                conv_id = conv.get("conversation_id")
+                if not conv_id:
+                    continue
+                existing = self.active_conversations.get(conv_id)
+                if existing:
+                    # Keep WS data if fresher, otherwise update from API
+                    ws_ts = existing.get("last_update", 0)
+                    # If WS updated this conv within last 10s, prefer WS data
+                    if (now - ws_ts) < 10:
+                        continue
+                conv["last_update"] = now
+                self.active_conversations[conv_id] = conv
 
     def _prune_active_conversations(self):
         now = time.time()
@@ -1032,9 +1068,12 @@ class GlobalConversationNotificationManager:
                 self.last_event_preview = json.dumps(event)[:1000]
             except Exception:
                 self.last_event_preview = ""
-            if not topic or not topic.startswith("v2.conversations."):
+            # Accept both queue-based and direct conversation topics
+            if not topic:
                 return
-            self._handle_conversation_event(event)
+            if not (topic.startswith("v2.routing.queues.") or topic.startswith("v2.conversations.")):
+                return
+            self._handle_conversation_event(event, topic)
 
         self._ws = websocket.WebSocketApp(
             self.connect_uri,
@@ -1046,7 +1085,7 @@ class GlobalConversationNotificationManager:
         _active_ws_connections.add(self._ws)
 
         def run():
-            max_retries = 100  # Prevent infinite loop
+            max_retries = 10  # Prevent lingering threads
             retry_count = 0
             while not self._stop_event.is_set() and retry_count < max_retries:
                 try:
@@ -1099,13 +1138,20 @@ class GlobalConversationNotificationManager:
                 except Exception:
                     pass
 
-    def _handle_conversation_event(self, event):
+    def _handle_conversation_event(self, event, topic=None):
         if not isinstance(event, dict):
             return
         conv_id = event.get("id") or event.get("conversationId")
         if not conv_id:
             return
         self.last_event_ts = time.time()
+
+        # Extract queue ID from topic (v2.routing.queues.{queueId}.conversations)
+        topic_queue_id = None
+        if topic and topic.startswith("v2.routing.queues."):
+            parts = topic.split(".")
+            if len(parts) >= 4:
+                topic_queue_id = parts[3]
 
         active = False
         for p in event.get("participants", []) or []:
@@ -1121,18 +1167,49 @@ class GlobalConversationNotificationManager:
                 self.active_conversations.pop(conv_id, None)
             return
 
-        queue_name = "Aktif"
-        queue_id = None
+        queue_name = None
+        queue_id = topic_queue_id  # From the topic itself
         wait_seconds = None
+        ivr_attrs = {}
+        ivr_name = None
+        
+        # If we got queue_id from topic, resolve its name immediately
+        if queue_id:
+            queue_name = self.queue_id_to_name.get(queue_id)
+        
         for p in event.get("participants", []) or []:
             purpose = (p.get("purpose") or "").lower()
+            
+            # Extract participant attributes (IVR/workgroup data)
+            p_attrs = p.get("attributes") or {}
+            if p_attrs:
+                for key, val in p_attrs.items():
+                    if val:
+                        ivr_attrs[key] = val
+            
+            # IVR participant name = IVR/flow name (workgroup bilgisi)
+            if purpose == "ivr" and p.get("name"):
+                ivr_name = p.get("name")
+            
             if purpose in ["acd", "queue"]:
-                q_id = p.get("queueId") or p.get("routingQueueId") or p.get("participantId")
+                # Queue name from participant name (Full API / WS)
+                p_name = p.get("name")
+                # Queue ID from various sources
+                q_id = p.get("queueId") or p.get("routingQueueId")
+                if not q_id:
+                    qobj = p.get("queue") or {}
+                    if isinstance(qobj, dict):
+                        q_id = qobj.get("id")
+                        if not p_name:
+                            p_name = qobj.get("name")
+                
                 if q_id:
                     queue_id = q_id
-                    queue_name = self.queue_id_to_name.get(q_id, queue_name) or p.get("name") or queue_name
-                elif p.get("name"):
-                    queue_name = p.get("name") or queue_name
+                    # Prefer mapping, then participant name
+                    queue_name = self.queue_id_to_name.get(q_id) or p_name or queue_name
+                elif p_name:
+                    queue_name = p_name
+                    
                 for s in p.get("sessions", []) or []:
                     if wait_seconds is None:
                         wait_seconds = _parse_wait_seconds(s.get("connectedTime") or s.get("startTime"))
@@ -1141,6 +1218,12 @@ class GlobalConversationNotificationManager:
                         break
             if wait_seconds is not None:
                 break
+        
+        # If no queue name found, use IVR name as fallback
+        if not queue_name and ivr_name:
+            queue_name = ivr_name
+        if not queue_name:
+            queue_name = "-"
 
         if wait_seconds is None:
             wait_seconds = _parse_wait_seconds(event.get("conversationStart"))
@@ -1149,6 +1232,25 @@ class GlobalConversationNotificationManager:
         agent_id, agent_name = _extract_agent_identity(event)
         direction = event.get("originatingDirection") or event.get("direction")
         state = _classify_conversation_state(event)
+        
+        # Format IVR display
+        ivr_display = None
+        if ivr_attrs:
+            priority_keys = ["workgroup", "dtmf", "menu", "selection", "departman", "secim", "choice", "option", "priority", "note", "callback"]
+            for pkey in priority_keys:
+                for key, val in ivr_attrs.items():
+                    if pkey in key.lower() and val:
+                        display_key = key.split(".")[-1] if "." in key else key
+                        ivr_display = f"{display_key}: {val}"
+                        break
+                if ivr_display:
+                    break
+            if not ivr_display:
+                for key, val in ivr_attrs.items():
+                    if val:
+                        display_key = key.split(".")[-1] if "." in key else key
+                        ivr_display = f"{display_key}: {val}"
+                        break
 
         with self._lock:
             self.active_conversations[conv_id] = {
@@ -1162,6 +1264,8 @@ class GlobalConversationNotificationManager:
                 "agent_id": agent_id,
                 "agent_name": agent_name,
                 "media_type": media_type,
+                "ivr_attrs": ivr_attrs,
+                "ivr_selection": ivr_display,
                 "last_update": time.time(),
             }
 

@@ -31,6 +31,9 @@ class AppMonitor:
         self._log_path = os.path.join("logs", "api_calls.jsonl")
         self._log_max_bytes = int(os.environ.get("API_LOG_MAX_BYTES", 50 * 1024 * 1024))
         self._log_max_files = int(os.environ.get("API_LOG_MAX_FILES", 5))
+        self._last_stats_prune = time.time()
+        self.MAX_ENDPOINT_STATS = 200  # Max unique endpoints to track
+        self.STATS_PRUNE_INTERVAL = 3600  # Prune every hour
         os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
         self._initialized = True
 
@@ -55,7 +58,24 @@ class AppMonitor:
         """Records an API call with timestamp, endpoint path, and optional timing metadata."""
         with self._lock:
             clean_endpoint = endpoint.split('?')[0] # Remove query params
+            # Normalize UUIDs in path to prevent unbounded key growth
+            # e.g., /api/v2/routing/queues/abc-123/users -> /api/v2/routing/queues/{id}/users
+            import re
+            clean_endpoint = re.sub(
+                r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+                '{id}', clean_endpoint
+            )
             self.api_stats[clean_endpoint] = self.api_stats.get(clean_endpoint, 0) + 1
+            
+            # Periodically prune api_stats to prevent unbounded growth
+            now = time.time()
+            if (now - self._last_stats_prune) > self.STATS_PRUNE_INTERVAL:
+                if len(self.api_stats) > self.MAX_ENDPOINT_STATS:
+                    # Keep only top N by call count
+                    sorted_stats = sorted(self.api_stats.items(), key=lambda x: x[1], reverse=True)
+                    self.api_stats = dict(sorted_stats[:self.MAX_ENDPOINT_STATS])
+                self._last_stats_prune = now
+            
             entry = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "endpoint": clean_endpoint,

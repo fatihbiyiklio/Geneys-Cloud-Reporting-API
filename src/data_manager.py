@@ -75,8 +75,14 @@ class DataManager:
         self.enabled = False
         self.stop_event.set()
         if self.thread:
-            self.thread.join(timeout=2)
+            self.thread.join(timeout=5)
             self.thread = None
+        # Clear caches on stop to free memory
+        self.obs_data_cache = {}
+        self.daily_data_cache = {}
+        self.agent_details_cache = {}
+        self.queue_members_cache = {}
+        self.error_log = []
 
     def resume(self):
         self.enabled = True
