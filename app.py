@@ -38,13 +38,8 @@ auth_manager = AuthManager()
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
 MEMORY_LOG_FILE = os.path.join(LOG_DIR, "memory.jsonl")
-MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "800"))  # Cleanup threshold
-MEMORY_RESTART_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_RESTART_LIMIT_MB", "1024"))  # Hard restart threshold
-MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "60"))
-MEMORY_RESTART_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_RESTART_COOLDOWN_SEC", "300"))  # Min 5 min between restarts
-
-# Restart state file to prevent restart loops
-RESTART_STATE_FILE = os.path.join(LOG_DIR, ".last_restart")
+MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "1024"))
+MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "120"))
 
 def _setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -78,143 +73,6 @@ if hasattr(threading, "excepthook"):
     threading.excepthook = _thread_excepthook
 
 atexit.register(lambda: logger.info("App process exiting"))
-
-# --- GRACEFUL RESTART MECHANISM ---
-def _can_restart():
-    """Check if enough time has passed since last restart to prevent restart loops."""
-    try:
-        if os.path.exists(RESTART_STATE_FILE):
-            with open(RESTART_STATE_FILE, "r") as f:
-                last_restart = float(f.read().strip())
-            if pytime.time() - last_restart < MEMORY_RESTART_COOLDOWN_SEC:
-                return False
-    except Exception:
-        pass
-    return True
-
-def _mark_restart():
-    """Record restart timestamp."""
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        with open(RESTART_STATE_FILE, "w") as f:
-            f.write(str(pytime.time()))
-    except Exception:
-        pass
-
-def _graceful_restart(reason="memory_limit"):
-    """
-    Gracefully restart the application without user disruption.
-    This is a silent restart - users will experience a brief reload.
-    """
-    import gc
-    
-    logger.warning(f"Initiating graceful restart. Reason: {reason}")
-    
-    # Check cooldown to prevent restart loops
-    if not _can_restart():
-        logger.warning("Restart skipped - cooldown period not elapsed")
-        return False
-    
-    try:
-        # 1. Stop all notification managers (use globals with safety checks)
-        try:
-            if '_shared_notif_store' in dir():
-                notif = _shared_notif_store()
-                with notif["lock"]:
-                    for key in ["call", "agent", "global"]:
-                        for nm in list(notif.get(key, {}).values()):
-                            try:
-                                nm.stop()
-                            except Exception:
-                                pass
-                        notif[key] = {}
-        except Exception as e:
-            logger.error(f"Error stopping notifications: {e}")
-        
-        # 2. Stop all data managers
-        try:
-            if '_get_dm_store' in dir():
-                dm_store = _get_dm_store()
-                with dm_store["lock"]:
-                    for dm in list(dm_store.get("data", {}).values()):
-                        try:
-                            dm.force_stop()
-                        except Exception:
-                            pass
-                    dm_store["data"] = {}
-        except Exception as e:
-            logger.error(f"Error stopping data managers: {e}")
-        
-        # 3. Stop memory monitor
-        try:
-            if '_shared_memory_store' in dir():
-                mem_store = _shared_memory_store()
-                mem_store["stop_event"].set()
-        except Exception:
-            pass
-        
-        # 4. Clear all caches
-        try:
-            global _org_maps_cache
-            _org_maps_cache = {}
-        except Exception:
-            pass
-        
-        try:
-            if '_shared_seed_store' in dir():
-                seed = _shared_seed_store()
-                with seed["lock"]:
-                    seed["orgs"] = {}
-        except Exception:
-            pass
-        
-        try:
-            if '_shared_org_session_store' in dir():
-                sess = _shared_org_session_store()
-                with sess["lock"]:
-                    sess["orgs"] = {}
-        except Exception:
-            pass
-        
-        # 5. Force garbage collection
-        gc.collect(generation=0)
-        gc.collect(generation=1)
-        gc.collect(generation=2)
-        
-        # 6. Mark restart time
-        _mark_restart()
-        
-        # 7. Log final memory state
-        try:
-            proc = psutil.Process(os.getpid())
-            final_mb = proc.memory_info().rss / (1024 * 1024)
-            logger.info(f"Pre-restart memory: {final_mb:.1f} MB")
-        except Exception:
-            pass
-        
-        # 8. Perform the restart using os.execv (replaces current process)
-        logger.info("Executing restart...")
-        
-        # Get the original command used to start this process
-        python_exe = sys.executable
-        script_path = os.path.abspath(sys.argv[0])
-        args = sys.argv[:]
-        
-        # For streamlit, we need to restart properly
-        if "streamlit" in script_path or any("streamlit" in arg for arg in args):
-            # Running via streamlit run
-            os.execv(python_exe, [python_exe] + args)
-        else:
-            # Running directly
-            os.execv(python_exe, [python_exe, script_path] + args[1:])
-        
-    except Exception as e:
-        logger.error(f"Restart failed: {e}")
-        # Fallback: just exit and let supervisor/docker restart
-        logger.info("Falling back to sys.exit for restart")
-        sys.exit(42)  # Special exit code for restart
-    
-    return True
 
 # --- IMPORTS & PATHS ---
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -776,60 +634,23 @@ st.markdown("""
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     html, body, [data-testid="stAppViewContainer"] { font-family: 'Inter', sans-serif !important; background-color: #ffffff !important; }
     
-    /* === PREVENT ALL BLUR/FLICKER EFFECTS DURING RERUN === */
-    [data-testid="stAppViewContainer"],
-    [data-testid="stAppViewContainer"] *,
-    .main,
-    .main *,
-    .stApp,
-    .stApp * {
-        backface-visibility: hidden !important;
-        -webkit-backface-visibility: hidden !important;
+    /* Prevent flicker/blur during Streamlit rerun */
+    [data-testid="stAppViewContainer"] {
+        backface-visibility: hidden;
+        -webkit-backface-visibility: hidden;
         transform: translateZ(0);
         -webkit-transform: translateZ(0);
     }
-    
-    /* Hide Streamlit running/loading indicator completely */
-    div[data-testid="stStatusWidget"],
-    .stStatusWidget,
-    [data-testid="stAppViewBlockContainer"] > div:first-child > div[style*="opacity"] {
+    /* Hide Streamlit running indicator that causes blur effect */
+    div[data-testid="stStatusWidget"] {
         visibility: hidden !important;
         opacity: 0 !important;
-        display: none !important;
     }
-    
-    /* Disable ALL animations, transitions, and skeleton loading */
-    .stMarkdown, .stDataFrame, .stTable, .stMetric,
-    [data-testid="column"], [data-testid="stVerticalBlock"],
-    [data-testid="stHorizontalBlock"], [data-testid="element-container"],
-    .element-container, .block-container,
-    [data-testid="stExpander"], [data-testid="stMetricContainer"] {
+    /* Disable skeleton loading animation */
+    .stMarkdown, .stDataFrame, [data-testid="column"] {
         animation: none !important;
         transition: none !important;
-        -webkit-animation: none !important;
-        -webkit-transition: none !important;
     }
-    
-    /* Prevent opacity changes during rerun */
-    [data-stale="true"],
-    [data-stale="false"],
-    .stale {
-        opacity: 1 !important;
-        filter: none !important;
-        -webkit-filter: none !important;
-    }
-    
-    /* Disable blur filter on any element */
-    * {
-        filter: none !important;
-        -webkit-filter: none !important;
-    }
-    
-    /* Keep full opacity during updates */
-    .updating, .loading, [aria-busy="true"] {
-        opacity: 1 !important;
-    }
-    
     [data-testid="stAppViewContainer"] > .main { padding-top: 0.5rem !important; }
     [data-testid="stVerticalBlockBorderWrapper"] { background-color: #ffffff !important; border: 1px solid #eef2f6 !important; border-radius: 12px !important; padding: 1rem !important; margin-bottom: 1rem !important; }
     [data-testid="stHorizontalBlock"] { gap: 4px !important; }
@@ -1169,15 +990,6 @@ def _shared_memory_store():
 def _soft_memory_cleanup():
     """Best-effort cleanup to reduce memory without visible user impact."""
     import gc
-    
-    # Force garbage collection first
-    try:
-        gc.collect(generation=0)
-        gc.collect(generation=1)
-        gc.collect(generation=2)
-    except Exception:
-        pass
-    
     try:
         # Clear seed cache
         seed = _shared_seed_store()
@@ -1194,12 +1006,18 @@ def _soft_memory_cleanup():
     except Exception:
         pass
     
+    # Force garbage collection
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
     try:
         # Stop notifications to release WS/thread memory; they will reconnect on next use
         notif = _shared_notif_store()
         with notif["lock"]:
             for key in ["call", "agent", "global"]:
-                for nm in list(notif.get(key, {}).values()):
+                for nm in notif.get(key, {}).values():
                     try:
                         nm.stop()
                     except Exception:
@@ -1211,7 +1029,7 @@ def _soft_memory_cleanup():
         # Clear DataManager caches
         dm_store = _get_dm_store()
         with dm_store["lock"]:
-            for dm in list(dm_store.get("data", {}).values()):
+            for dm in dm_store.get("data", {}).values():
                 try:
                     dm.obs_data_cache = {}
                     dm.daily_data_cache = {}
@@ -1229,25 +1047,6 @@ def _soft_memory_cleanup():
         # Clear org maps cache
         global _org_maps_cache
         _org_maps_cache = {}
-    except Exception:
-        pass
-    
-    try:
-        # Clear org session store of stale sessions
-        store = _shared_org_session_store()
-        now = pytime.time()
-        with store["lock"]:
-            for org in list(store.get("orgs", {}).values()):
-                sessions = org.get("sessions", {})
-                stale = [sid for sid, s in sessions.items() if now - s.get("ts", 0) > SESSION_TTL_SECONDS]
-                for sid in stale:
-                    sessions.pop(sid, None)
-    except Exception:
-        pass
-    
-    # Final garbage collection
-    try:
-        gc.collect()
     except Exception:
         pass
 
@@ -1275,7 +1074,6 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
             gc_counter = 0
             log_write_counter = 0
             MEMORY_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB max
-            last_rss_mb = 0
             
             def _rotate_memory_log():
                 try:
@@ -1304,73 +1102,16 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                         store["samples"] = store["samples"][-max_samples:]
                     last_cleanup = store.get("last_cleanup_ts", 0)
                 
-                # Periodic garbage collection every 2 minutes (was 5 min)
+                # Periodic garbage collection every 5 minutes
                 gc_counter += 1
-                if gc_counter >= 12:  # 12 * 10 sec = 2 min
+                if gc_counter >= 30:  # 30 * 10 sec = 5 min
                     gc.collect()
                     gc_counter = 0
                 
-                # If memory is growing rapidly, run cleanup more often
-                if rss_mb > last_rss_mb * 1.2 and rss_mb > 500:  # 20% growth and over 500MB
-                    gc.collect()
-                
-                last_rss_mb = rss_mb
-                
-                # CRITICAL: Hard restart if memory exceeds restart limit (1GB default)
-                if rss_mb >= MEMORY_RESTART_LIMIT_MB:
-                    logger.warning(f"Memory critical: {rss_mb:.1f} MB >= {MEMORY_RESTART_LIMIT_MB} MB limit")
-                    # First try aggressive cleanup
+                if rss_mb >= MEMORY_LIMIT_MB and (pytime.time() - last_cleanup) > MEMORY_CLEANUP_COOLDOWN_SEC:
                     _soft_memory_cleanup()
-                    _cleanup_orphan_resources()
-                    gc.collect(generation=2)
-                    
-                    # Re-check memory after cleanup
-                    try:
-                        rss_mb_after = proc.memory_info().rss / (1024 * 1024)
-                    except Exception:
-                        rss_mb_after = rss_mb
-                    
-                    logger.info(f"Memory after cleanup: {rss_mb_after:.1f} MB")
-                    
-                    # If still over limit, trigger graceful restart
-                    if rss_mb_after >= MEMORY_RESTART_LIMIT_MB * 0.9:  # 90% of limit after cleanup
-                        logger.warning(f"Memory still high ({rss_mb_after:.1f} MB), initiating graceful restart")
-                        try:
-                            # Log to file before restart
-                            with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
-                                restart_log = {
-                                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                                    "event": "RESTART_TRIGGERED",
-                                    "rss_mb": rss_mb_after,
-                                    "limit_mb": MEMORY_RESTART_LIMIT_MB
-                                }
-                                f.write(json.dumps(restart_log, ensure_ascii=False) + "\n")
-                        except Exception:
-                            pass
-                        
-                        # Perform graceful restart
-                        _graceful_restart(reason=f"memory_limit_exceeded_{rss_mb_after:.0f}MB")
-                        # If restart failed, continue monitoring
-                        with store["lock"]:
-                            store["last_cleanup_ts"] = pytime.time()
-                
-                # Soft cleanup threshold
-                elif rss_mb >= MEMORY_LIMIT_MB and (pytime.time() - last_cleanup) > MEMORY_CLEANUP_COOLDOWN_SEC:
-                    _soft_memory_cleanup()
-                    _cleanup_orphan_resources()
                     with store["lock"]:
                         store["last_cleanup_ts"] = pytime.time()
-                
-                # Periodic orphan cleanup every 5 minutes regardless of memory
-                orphan_cleanup_counter = getattr(run, '_orphan_counter', 0) + 1
-                run._orphan_counter = orphan_cleanup_counter
-                if orphan_cleanup_counter >= 30:  # 30 * 10 sec = 5 min
-                    try:
-                        _cleanup_orphan_resources()
-                    except Exception:
-                        pass
-                    run._orphan_counter = 0
-                
                 try:
                     # Rotate log every 100 writes (~16 min)
                     log_write_counter += 1
@@ -1632,71 +1373,6 @@ def _remove_org_session(org_code):
         if not org:
             return
         org["sessions"].pop(session_id, None)
-
-def _cleanup_orphan_resources():
-    """Clean up resources for orgs with no active sessions."""
-    import gc
-    
-    # Get orgs with active sessions
-    session_store = _shared_org_session_store()
-    now = pytime.time()
-    active_orgs = set()
-    
-    with session_store["lock"]:
-        for org_code, org in list(session_store.get("orgs", {}).items()):
-            sessions = org.get("sessions", {})
-            # Clean stale sessions
-            stale = [sid for sid, s in sessions.items() if now - s.get("ts", 0) > SESSION_TTL_SECONDS]
-            for sid in stale:
-                sessions.pop(sid, None)
-            if sessions:
-                active_orgs.add(org_code)
-            else:
-                # Remove empty org entry
-                session_store["orgs"].pop(org_code, None)
-    
-    # Stop DataManagers for inactive orgs
-    dm_store = _get_dm_store()
-    with dm_store["lock"]:
-        orphan_dms = [org_code for org_code in dm_store.get("data", {}).keys() 
-                      if org_code not in active_orgs]
-    
-    for org_code in orphan_dms:
-        try:
-            with dm_store["lock"]:
-                dm = dm_store["data"].pop(org_code, None)
-            if dm:
-                dm.force_stop()
-        except Exception:
-            pass
-    
-    # Stop notification managers for inactive orgs
-    notif_store = _shared_notif_store()
-    with notif_store["lock"]:
-        for key in ["call", "agent", "global"]:
-            orphan_notifs = [org_code for org_code in notif_store.get(key, {}).keys()
-                           if org_code not in active_orgs]
-            for org_code in orphan_notifs:
-                try:
-                    nm = notif_store[key].pop(org_code, None)
-                    if nm:
-                        nm.stop()
-                except Exception:
-                    pass
-    
-    # Cleanup seed store for inactive orgs
-    seed_store = _shared_seed_store()
-    with seed_store["lock"]:
-        orphan_seeds = [org_code for org_code in seed_store.get("orgs", {}).keys()
-                       if org_code not in active_orgs]
-        for org_code in orphan_seeds:
-            seed_store["orgs"].pop(org_code, None)
-    
-    # Force garbage collection
-    try:
-        gc.collect()
-    except Exception:
-        pass
 
 def get_shared_data_manager(org_code, max_orgs=20):
     store = _get_dm_store()
@@ -3558,9 +3234,6 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         display: flex;
                         align-items: center;
                         gap: 10px;
-                        opacity: 1 !important;
-                        transition: none !important;
-                        animation: none !important;
                     }
                     .status-dot {
                         width: 12px;
@@ -3841,12 +3514,11 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             st.markdown("""
                 <style>
                     /* Prevent panel flicker during refresh */
-                    [data-testid="column"]:has(.call-card),
-                    [data-testid="column"]:has(.agent-card) {
+                    [data-testid="column"]:has(.call-card) {
                         content-visibility: auto;
                         contain-intrinsic-size: auto 500px;
                     }
-                    .call-panel-container, .agent-panel-container {
+                    .call-panel-container {
                         min-height: 100px;
                         will-change: contents;
                     }
@@ -3860,9 +3532,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         align-items: center;
                         justify-content: space-between;
                         gap: 10px;
-                        opacity: 1 !important;
-                        transition: none !important;
-                        animation: none !important;
+                        opacity: 1;
+                        transition: opacity 0.15s ease-in-out;
                     }
                     .call-queue {
                         font-size: 1.0rem !important;
