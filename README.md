@@ -32,12 +32,6 @@ Bu uygulama, Genesys Cloud platformu için gerçek zamanlı dashboard ve geçmi�
 
 ## 🚀 Dağıtım Seçenekleri (Production)
 
-### Docker
-```bash
-docker build -t genesys-dashboard .
-docker run -p 8501:8501 -v $(pwd)/orgs:/app/orgs genesys-dashboard
-```
-
 ### Bağımsız Çalıştırılabilir Dosya
 GitHub Actions üzerinden her sürüm için otomatik olarak **Linux** ve **Windows** binary'leri oluşturulur.
 - Release sekmesinden indirip doğrudan çalıştırabilirsiniz
