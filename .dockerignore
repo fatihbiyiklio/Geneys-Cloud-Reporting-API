@@ -1,16 +1,53 @@
-venv/
+# Version control
 .git/
 .github/
+.gitignore
+
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# Python
+venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.db
-.DS_Store
-credentials.enc
-.secret.key
+*.egg-info/
 dist/
 build/
 *.spec
+*.egg
+
+# Secrets & sensitive data (MUST NOT include)
+credentials.enc
+.secret.key
+.session.enc
+users.json
+
+# Runtime data (created at runtime)
+logs/
+orgs/
+*.log
+*.pid
+.app.lock
+.app.pid
+.last_restart
+
+# Config files (will be mounted or created at runtime)
+dashboard_config.json
+presets.json
+debug_chat_dump.json
+app_startup.log
+
+# OS files
+.DS_Store
+*.db
+Thumbs.db
+
+# Documentation (keep for reference)
+# README.md
+# USER_GUIDE.md

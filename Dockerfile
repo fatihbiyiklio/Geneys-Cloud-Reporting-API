@@ -5,7 +5,11 @@ FROM python:3.10-slim
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     STREAMLIT_SERVER_USAGE_STATS=false \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    GENESYS_MEMORY_LIMIT_MB=800 \
+    GENESYS_MEMORY_RESTART_LIMIT_MB=1024 \
+    GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC=60 \
+    GENESYS_MEMORY_RESTART_COOLDOWN_SEC=300
 
 # Set the working directory
 WORKDIR /app
@@ -21,8 +25,14 @@ RUN apt-get update && \
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
-COPY . .
+# Copy application files (selective - avoid secrets)
+COPY app.py run_app.py start.sh ./
+COPY src/ ./src/
+COPY .streamlit/ ./.streamlit/
+
+# Create necessary directories and set permissions
+RUN mkdir -p logs orgs && \
+    chmod +x /app/start.sh
 
 # Create a non-root user and switch to it for security
 RUN useradd -m streamlituser && \
@@ -32,9 +42,9 @@ USER streamlituser
 # Expose Streamlit port
 EXPOSE 8501
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+# Healthcheck - increased timeouts for memory-constrained environments
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl --fail http://localhost:8501/_stcore/health || exit 1
 
-# Run streamlit
-ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Run with auto-restart wrapper
+ENTRYPOINT ["/bin/bash", "/app/start.sh"]

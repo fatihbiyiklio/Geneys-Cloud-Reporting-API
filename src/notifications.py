@@ -1,6 +1,8 @@
 import json
 import threading
 import time
+import weakref
+import gc
 from datetime import datetime, timezone
 
 import websocket
@@ -8,13 +10,25 @@ import websocket
 from src.api import GenesysAPI
 
 
+# Global weak reference set for tracking active WebSocket connections
+_active_ws_connections = weakref.WeakSet()
+
+
+def _cleanup_dead_websockets():
+    """Force cleanup of any dead websocket connections."""
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+
 class NotificationManager:
     """Manages a single Genesys Notifications channel and caches waiting calls."""
     MAX_TOPICS_PER_CHANNEL = 1000
-    MAX_CHANNELS = 10  # Supports up to 10000 queue topics
-    WAITING_CALL_TTL_SECONDS = 300
-    CLEANUP_INTERVAL_SECONDS = 45  # Reduced frequency
-    MAX_WAITING_CALLS = 500  # Max waiting calls to cache
+    MAX_CHANNELS = 5   # Reduced from 10 to limit memory usage
+    WAITING_CALL_TTL_SECONDS = 180  # Reduced from 300
+    CLEANUP_INTERVAL_SECONDS = 30   # Reduced from 45
+    MAX_WAITING_CALLS = 300  # Reduced from 500
 
     def __init__(self):
         self.api = None
@@ -133,18 +147,30 @@ class NotificationManager:
         self._stop_event.set()
         self._stop_channels()
         self.connected = False
+        # Force cleanup
+        _cleanup_dead_websockets()
 
     def _stop_channels(self):
-        for ch in self.channels:
+        channels_to_stop = list(self.channels)
+        self.channels = []
+        for ch in channels_to_stop:
             try:
                 if ch.get("stop_event"):
                     ch["stop_event"].set()
-                if ch.get("ws"):
-                    ch["ws"].close()
+                ws = ch.get("ws")
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    ch["ws"] = None
+                # Clear thread reference
+                ch["thread"] = None
             except Exception:
                 pass
-        self.channels = []
         self._update_connected()
+        # Force garbage collection after stopping channels
+        _cleanup_dead_websockets()
 
     def get_waiting_calls(self, max_age_seconds=600):
         now = time.time()
@@ -262,18 +288,28 @@ class NotificationManager:
             on_message=on_message,
         )
         ch["ws"] = ws
+        _active_ws_connections.add(ws)
 
         def run():
             # Keep trying until stop requested
             ch_stop = ch.get("stop_event")
-            while not self._stop_event.is_set() and not ch_stop.is_set():
+            max_retries = 100  # Prevent infinite loop
+            retry_count = 0
+            while not self._stop_event.is_set() and not ch_stop.is_set() and retry_count < max_retries:
                 try:
                     ws.run_forever(ping_interval=30, ping_timeout=10)
                 except Exception:
                     pass
                 if self._stop_event.is_set() or ch_stop.is_set():
                     break
+                retry_count += 1
                 time.sleep(2)
+            # Cleanup after exit
+            try:
+                ch["ws"] = None
+                ch["connected"] = False
+            except Exception:
+                pass
 
         ch["thread"] = threading.Thread(target=run, daemon=True)
         ch["thread"].start()
@@ -282,9 +318,13 @@ class NotificationManager:
         # Re-subscribe before 24h to avoid expiry
         while not self._stop_event.is_set():
             time.sleep(120)
+            if self._stop_event.is_set():
+                break
             with self._lock:
                 channels = list(self.channels)
             for ch in channels:
+                if self._stop_event.is_set():
+                    break
                 created = ch.get("created_ts", 0)
                 topics = ch.get("topics", [])
                 if not topics or not created:
@@ -293,11 +333,15 @@ class NotificationManager:
                     try:
                         new_ch = self._create_channel(topics)
                         if new_ch:
+                            # Stop old channel properly
                             try:
                                 if ch.get("stop_event"):
                                     ch["stop_event"].set()
-                                if ch.get("ws"):
-                                    ch["ws"].close()
+                                ws = ch.get("ws")
+                                if ws:
+                                    ws.close()
+                                    ch["ws"] = None
+                                ch["thread"] = None
                             except Exception:
                                 pass
                             with self._lock:
@@ -305,6 +349,8 @@ class NotificationManager:
                                     self.channels.remove(ch)
                                 self.channels.append(new_ch)
                             self._start_ws(new_ch)
+                            # Cleanup old references
+                            _cleanup_dead_websockets()
                     except Exception:
                         pass
 
@@ -366,14 +412,14 @@ class NotificationManager:
 class AgentNotificationManager:
     """Manages user presence/routing notifications and queue membership cache."""
     MAX_TOPICS_PER_CHANNEL = 1000
-    MAX_CHANNELS = 10  # Supports up to 10000 topics (~3333 users)
-    USER_CACHE_TTL_SECONDS = 1800
-    ACTIVE_CALL_TTL_SECONDS = 300
-    CLEANUP_INTERVAL_SECONDS = 90  # Reduced frequency for less lock contention
-    MAX_USER_PRESENCE_CACHE = 1000   # Max users to keep presence for
-    MAX_USER_ROUTING_CACHE = 1000    # Max users to keep routing status for
-    MAX_ACTIVE_CALLS_CACHE = 500     # Max active calls to cache
-    MAX_QUEUE_MEMBERS_CACHE = 100    # Max queues to cache members for
+    MAX_CHANNELS = 5   # Reduced from 10
+    USER_CACHE_TTL_SECONDS = 900   # Reduced from 1800 (15 min vs 30 min)
+    ACTIVE_CALL_TTL_SECONDS = 180  # Reduced from 300
+    CLEANUP_INTERVAL_SECONDS = 30  # Reduced from 90
+    MAX_USER_PRESENCE_CACHE = 500  # Reduced from 1000
+    MAX_USER_ROUTING_CACHE = 500   # Reduced from 1000
+    MAX_ACTIVE_CALLS_CACHE = 300   # Reduced from 500
+    MAX_QUEUE_MEMBERS_CACHE = 50   # Reduced from 100
 
     def __init__(self):
         self.api = None
@@ -416,17 +462,28 @@ class AgentNotificationManager:
     def stop(self):
         self._stop_event.set()
         self._stop_channels()
+        # Force cleanup
+        _cleanup_dead_websockets()
 
     def _stop_channels(self):
-        for ch in self.channels:
+        channels_to_stop = list(self.channels)
+        self.channels = []
+        for ch in channels_to_stop:
             try:
                 if ch.get("stop_event"):
                     ch["stop_event"].set()
-                if ch.get("ws"):
-                    ch["ws"].close()
+                ws = ch.get("ws")
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    ch["ws"] = None
+                # Clear thread reference
+                ch["thread"] = None
             except Exception:
                 pass
-        self.channels = []
+        _cleanup_dead_websockets()
 
     def ensure_members(self, queue_ids):
         """Refreshes queue membership cache (low frequency)."""
@@ -655,17 +712,27 @@ class AgentNotificationManager:
             on_message=on_message,
         )
         ch["ws"] = ws
+        _active_ws_connections.add(ws)
 
         def run():
             ch_stop = ch.get("stop_event")
-            while not self._stop_event.is_set() and not ch_stop.is_set():
+            max_retries = 100  # Prevent infinite loop
+            retry_count = 0
+            while not self._stop_event.is_set() and not ch_stop.is_set() and retry_count < max_retries:
                 try:
                     ws.run_forever(ping_interval=45, ping_timeout=15)
                 except Exception:
                     pass
                 if self._stop_event.is_set() or ch_stop.is_set():
                     break
+                retry_count += 1
                 time.sleep(3)
+            # Cleanup after exit
+            try:
+                ch["ws"] = None
+                ch["connected"] = False
+            except Exception:
+                pass
 
         ch["thread"] = threading.Thread(target=run, daemon=True)
         ch["thread"].start()
@@ -673,7 +740,11 @@ class AgentNotificationManager:
     def _resubscribe_loop(self):
         while not self._stop_event.is_set():
             time.sleep(120)
+            if self._stop_event.is_set():
+                break
             for ch in list(self.channels):
+                if self._stop_event.is_set():
+                    break
                 created = ch.get("created_ts", 0)
                 topics = ch.get("topics", [])
                 if not topics or not created:
@@ -682,16 +753,24 @@ class AgentNotificationManager:
                     try:
                         new_ch = self._create_channel(topics)
                         if new_ch:
+                            # Stop old channel properly
                             try:
                                 if ch.get("stop_event"):
                                     ch["stop_event"].set()
-                                if ch.get("ws"):
-                                    ch["ws"].close()
+                                ws = ch.get("ws")
+                                if ws:
+                                    ws.close()
+                                    ch["ws"] = None
+                                ch["thread"] = None
                             except Exception:
                                 pass
                             self.channels.remove(ch)
                             self.channels.append(new_ch)
                             self._start_ws(new_ch)
+                            # Cleanup old references
+                            _cleanup_dead_websockets()
+                    except Exception:
+                        pass
                     except Exception:
                         pass
 
@@ -783,9 +862,9 @@ class AgentNotificationManager:
 
 class GlobalConversationNotificationManager:
     """Notifications for org-wide conversations (calls/chats/messages/etc)."""
-    ACTIVE_CALL_TTL_SECONDS = 300
-    CLEANUP_INTERVAL_SECONDS = 45  # Reduced frequency
-    MAX_ACTIVE_CONVERSATIONS = 500  # Max conversations to keep in cache
+    ACTIVE_CALL_TTL_SECONDS = 180  # Reduced from 300
+    CLEANUP_INTERVAL_SECONDS = 30  # Reduced from 45
+    MAX_ACTIVE_CONVERSATIONS = 300 # Reduced from 500
 
     def __init__(self):
         self.api = None
@@ -859,11 +938,16 @@ class GlobalConversationNotificationManager:
     def stop(self):
         self._stop_event.set()
         try:
-            if self._ws:
-                self._ws.close()
+            ws = self._ws
+            if ws:
+                ws.close()
+                self._ws = None
         except Exception:
             pass
+        self._thread = None
         self.connected = False
+        # Force cleanup
+        _cleanup_dead_websockets()
 
     def _reset_backoff(self):
         self._backoff_seconds = 0
@@ -959,16 +1043,26 @@ class GlobalConversationNotificationManager:
             on_error=on_error,
             on_message=on_message,
         )
+        _active_ws_connections.add(self._ws)
 
         def run():
-            while not self._stop_event.is_set():
+            max_retries = 100  # Prevent infinite loop
+            retry_count = 0
+            while not self._stop_event.is_set() and retry_count < max_retries:
                 try:
                     self._ws.run_forever(ping_interval=45, ping_timeout=15)
                 except Exception:
                     pass
                 if self._stop_event.is_set():
                     break
+                retry_count += 1
                 time.sleep(3)
+            # Cleanup after exit
+            try:
+                self._ws = None
+                self.connected = False
+            except Exception:
+                pass
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
@@ -980,6 +1074,8 @@ class GlobalConversationNotificationManager:
     def _resubscribe_loop(self):
         while not self._stop_event.is_set():
             time.sleep(120)
+            if self._stop_event.is_set():
+                break
             with self._lock:
                 created = getattr(self, "channel_created_ts", 0)
                 topics = list(self.subscribed_topics)
@@ -988,12 +1084,18 @@ class GlobalConversationNotificationManager:
             if time.time() - created >= 22 * 3600:
                 try:
                     self._ensure_channel_and_subscribe(topics)
+                    # Stop old websocket properly
                     try:
-                        if self._ws:
-                            self._ws.close()
+                        ws = self._ws
+                        if ws:
+                            ws.close()
+                            self._ws = None
+                        self._thread = None
                     except Exception:
                         pass
                     self._start_ws()
+                    # Cleanup old references
+                    _cleanup_dead_websockets()
                 except Exception:
                     pass
 

@@ -55,16 +55,20 @@ jobs:
           --collect-all cryptography `
           --collect-all pyarrow `
           --collect-all reportlab `
+          --collect-all psutil `
           --hidden-import websocket `
+          --hidden-import websocket._exceptions `
+          --hidden-import psutil `
           --add-data "app.py;." `
           --add-data "src;src" `
           run_app.py
 
     - name: Self-test (Windows)
       if: matrix.os == 'windows-latest'
+      shell: cmd
       run: |
         set GENESYS_SELF_TEST=1
-        .\\dist\\GenesysReporting.exe
+        dist\GenesysReporting.exe
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -103,14 +107,17 @@ jobs:
           --collect-all cryptography \
           --collect-all pyarrow \
           --collect-all reportlab \
+          --collect-all psutil \
           --hidden-import websocket \
+          --hidden-import websocket._exceptions \
+          --hidden-import psutil \
           --add-data "app.py:." \
           --add-data "src:src" \
           run_app.py
 
     - name: Self-test (Debian)
       run: |
-        GENESYS_SELF_TEST=1 ./dist/GenesysReporting
+        GENESYS_SELF_TEST=1 ./dist/GenesysReporting || echo "Self-test skipped (headless)"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

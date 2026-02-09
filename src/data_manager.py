@@ -10,11 +10,11 @@ class DataManager:
     Manages background data fetching from Genesys API.
     Designed to work with Streamlit's @st.cache_resource.
     """
-    MAX_QUEUE_MEMBERS_CACHE = 100  # Max queues to cache members for
-    MAX_AGENT_DETAILS_CACHE = 100  # Max queues for agent details
-    MAX_OBS_DATA_CACHE = 200       # Max queues for observations cache
-    MAX_DAILY_DATA_CACHE = 200     # Max queues for daily stats cache
-    CACHE_CLEANUP_INTERVAL = 300   # 5 minutes
+    MAX_QUEUE_MEMBERS_CACHE = 50   # Max queues to cache members for (reduced from 100)
+    MAX_AGENT_DETAILS_CACHE = 50   # Max queues for agent details (reduced from 100)
+    MAX_OBS_DATA_CACHE = 100       # Max queues for observations cache (reduced from 200)
+    MAX_DAILY_DATA_CACHE = 100     # Max queues for daily stats cache (reduced from 200)
+    CACHE_CLEANUP_INTERVAL = 120   # 2 minutes (reduced from 5 minutes)
     
     def __init__(self, api_client=None, presence_map=None):
         self.api = GenesysAPI(api_client) if api_client else None

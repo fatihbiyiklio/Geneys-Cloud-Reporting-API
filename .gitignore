@@ -1,27 +1,42 @@
+# Python
 .venv/
 venv/
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
-venv/
 .env
+
+# Build outputs
+dist/
+build/
+*.spec
+*.egg-info/
 
 # Secrets & Config
 credentials.enc
 .secret.key
 .session.enc
+.streamlit/secrets.toml
+users.json
+
+# Runtime files
 logs/
 orgs/
 .app.pid
 .app.lock
+.last_restart
 *.pid
 *.log
 .genesys_logged_out
 .dm_disabled
-.streamlit/secrets.toml
-users.json
+
+# User config files
 dashboard_config.json
 presets.json
-json
 debug_chat_dump.json
+app_startup.log
+
+# OS
+.DS_Store
+*.db
+Thumbs.db

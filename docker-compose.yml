@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  genesys-reporting:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: genesys-cloud-reporting
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      # Persistent data
+      - ./logs:/app/logs
+      - ./orgs:/app/orgs
+      # Optional: Mount config files if you want to persist them
+      # - ./dashboard_config.json:/app/dashboard_config.json
+      # - ./presets.json:/app/presets.json
+    environment:
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - STREAMLIT_SERVER_USAGE_STATS=false
+      - GENESYS_MEMORY_LIMIT_MB=800
+      - GENESYS_MEMORY_RESTART_LIMIT_MB=1024
+      - GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC=60
+      - GENESYS_MEMORY_RESTART_COOLDOWN_SEC=300
+      # Optional: Set timezone
+      - TZ=Europe/Istanbul
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
