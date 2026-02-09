@@ -1,5 +1,2 @@
 [browser]
 gatherUsageStats = false
-
-[server]
-usageStats = false

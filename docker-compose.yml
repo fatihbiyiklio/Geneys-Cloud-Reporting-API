@@ -11,7 +11,6 @@ services:
       - "8501:8501"
     volumes:
       # Persistent data
-      - ./logs:/app/logs
       - ./orgs:/app/orgs
       # Optional: Mount config files if you want to persist them
       # - ./dashboard_config.json:/app/dashboard_config.json
@@ -20,7 +19,7 @@ services:
       - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
       - STREAMLIT_SERVER_USAGE_STATS=false
       - GENESYS_MEMORY_LIMIT_MB=800
-      - GENESYS_MEMORY_RESTART_LIMIT_MB=1024
+      - GENESYS_MEMORY_HARD_LIMIT_MB=1024
       - GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC=60
       - GENESYS_MEMORY_RESTART_COOLDOWN_SEC=300
       # Optional: Set timezone

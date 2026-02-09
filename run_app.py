@@ -104,7 +104,7 @@ if __name__ == "__main__":
         """Finds and kills any process using the specified port."""
         for proc in psutil.process_iter(['pid', 'name']):
             try:
-                for conns in proc.connections(kind='inet'):
+                for conns in proc.net_connections(kind='inet'):
                     if conns.laddr.port == port:
                         print(f"🔪 Killing process {proc.info['name']} (PID: {proc.info['pid']}) on port {port}...")
                         proc.terminate()

@@ -362,6 +362,41 @@ class GenesysAPI:
             
         return {"conversations": all_conversations}
 
+    def iter_conversation_details(self, start_date, end_date, chunk_days=3, page_size=100, max_pages=200, order="asc"):
+        """Yields conversation detail pages to reduce memory usage.
+
+        Args:
+            start_date: datetime (UTC)
+            end_date: datetime (UTC)
+            chunk_days: days per interval chunk
+            page_size: items per page
+            max_pages: max pages per chunk
+            order: "asc" or "desc"
+        """
+        current_start = start_date
+        while current_start < end_date:
+            current_end = min(current_start + timedelta(days=chunk_days), end_date)
+            interval = f"{current_start.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{current_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+            try:
+                page_number = 1
+                while True:
+                    query = {
+                        "interval": interval,
+                        "paging": {"pageSize": page_size, "pageNumber": page_number},
+                        "order": order,
+                        "orderBy": "conversationStart"
+                    }
+                    data = self._post("/api/v2/analytics/conversations/details/query", query)
+                    page = data.get("conversations") or []
+                    if page:
+                        yield page
+                    if not page or len(page) < page_size or page_number >= max_pages:
+                        break
+                    page_number += 1
+            except Exception as e:
+                monitor.log_error("API_POST", f"Error streaming conversation details for chunk {interval}: {e}")
+            current_start = current_end
+
     def get_conversation_details_recent(self, start_date, end_date, page_size=100, max_pages=5, order="desc"):
         """Fetches recent conversation detail records for a short interval."""
         conversations = []
@@ -601,6 +636,53 @@ class GenesysAPI:
             duration_ms = int((time.monotonic() - start) * 1000)
             monitor.log_api_call(f"/api/v2/groups/{group_id}/members", method="DELETE", status_code=None, duration_ms=duration_ms)
             monitor.log_error("API_DELETE", f"Error removing group members: {e}")
+            raise e
+
+    def get_user_by_id(self, user_id, expand=None):
+        """Fetches a single user by ID from Genesys Cloud.
+        
+        Args:
+            user_id: The user ID (UUID) to fetch
+            expand: Optional list of expansions (e.g., ['presence', 'routingStatus', 'groups'])
+        
+        Returns:
+            User dict with details or None if not found
+        """
+        try:
+            params = {}
+            if expand:
+                params["expand"] = ",".join(expand) if isinstance(expand, list) else expand
+            
+            data = self._get(f"/api/v2/users/{user_id}", params=params if params else None)
+            if data and 'id' in data:
+                return {
+                    'id': data.get('id'),
+                    'name': data.get('name', ''),
+                    'email': data.get('email', ''),
+                    'username': data.get('username', ''),
+                    'state': data.get('state', ''),
+                    'department': data.get('department', ''),
+                    'title': data.get('title', ''),
+                    'manager': data.get('manager', {}).get('name') if data.get('manager') else None,
+                    'presence': data.get('presence', {}),
+                    'routingStatus': data.get('routingStatus', {}),
+                    'groups': data.get('groups', []),
+                    'skills': data.get('skills', []),
+                    'languages': data.get('languages', []),
+                    'primaryContactInfo': data.get('primaryContactInfo', []),
+                    'addresses': data.get('addresses', []),
+                    'divisionId': data.get('division', {}).get('id') if data.get('division') else None,
+                    'divisionName': data.get('division', {}).get('name') if data.get('division') else None,
+                    'version': data.get('version'),
+                    'dateModified': data.get('dateModified'),
+                    'raw': data  # Full raw response for advanced use
+                }
+            return None
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                return None  # User not found
+            monitor.log_error("API_GET", f"Error fetching user by ID {user_id}: {e}")
             raise e
 
     def get_users(self, page_size=100, max_pages=50):

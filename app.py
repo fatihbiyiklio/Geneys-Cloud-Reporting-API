@@ -35,25 +35,18 @@ auth_manager = AuthManager()
 # Disabled: do not auto-exit when sessions drop to zero.
 
 # --- LOGGING ---
-LOG_DIR = "logs"
-LOG_FILE = os.path.join(LOG_DIR, "app.log")
-MEMORY_LOG_FILE = os.path.join(LOG_DIR, "memory.jsonl")
-MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "1024"))
-MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "120"))
-MEMORY_HARD_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_HARD_LIMIT_MB", "1024"))  # Restart threshold
+MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "512"))  # Soft limit - trigger cleanup
+MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "60"))  # Reduced from 120
+MEMORY_HARD_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_HARD_LIMIT_MB", "768"))  # Hard limit - trigger restart
 
 def _setup_logging():
-    os.makedirs(LOG_DIR, exist_ok=True)
     logger = logging.getLogger("genesys_app")
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    file_handler.setFormatter(fmt)
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
     return logger
 
@@ -85,56 +78,28 @@ from src.processor import process_analytics_response, to_excel, to_csv, to_parqu
 
 # --- CONFIGURATION ---
 
-API_CALLS_LOG_PATH = os.path.join("logs", "api_calls.jsonl")
-API_CALLS_LOG_TAIL_LINES = 50000
-API_CALLS_LOG_TAIL_BYTES = 10 * 1024 * 1024
 SESSION_TTL_SECONDS = 120
 
-def _read_tail_lines(path, max_lines=API_CALLS_LOG_TAIL_LINES, max_bytes=API_CALLS_LOG_TAIL_BYTES):
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            end_pos = f.tell()
-            if end_pos == 0:
-                return []
-            data = b""
-            block_size = 8192
-            while end_pos > 0 and data.count(b"\n") <= max_lines and len(data) < max_bytes:
-                step = block_size if end_pos >= block_size else end_pos
-                end_pos -= step
-                f.seek(end_pos)
-                data = f.read(step) + data
-            lines = data.splitlines()[-max_lines:]
-            return [line.decode("utf-8", "ignore") for line in lines]
-    except Exception:
-        return []
-
-def _load_api_calls_log(path, max_lines=API_CALLS_LOG_TAIL_LINES):
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    entries = []
-    try:
-        lines = _read_tail_lines(path, max_lines=max_lines)
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except Exception:
-                continue
-    except Exception:
-        return pd.DataFrame()
-    if not entries:
-        return pd.DataFrame()
-    df = pd.DataFrame(entries)
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    if "duration_ms" in df.columns:
-        df["duration_ms"] = pd.to_numeric(df["duration_ms"], errors="coerce")
-    if "status_code" in df.columns:
-        df["status_code"] = pd.to_numeric(df["status_code"], errors="coerce")
-    return df
+def _iter_conversation_pages(api, start_date, end_date, max_records=5000, chunk_days=3, page_size=100):
+    """Yield conversation pages with an upper bound on total records to avoid OOM."""
+    total = 0
+    for page in api.iter_conversation_details(
+        start_date,
+        end_date,
+        chunk_days=chunk_days,
+        page_size=page_size,
+        max_pages=200,
+        order="asc",
+    ):
+        if not page:
+            continue
+        if max_records and total + len(page) > max_records:
+            page = page[: max_records - total]
+        if page:
+            yield page
+            total += len(page)
+        if max_records and total >= max_records:
+            break
 
 def _endpoint_reason(endpoint):
     if not endpoint:
@@ -1119,18 +1084,9 @@ def _shared_memory_store():
     return {"lock": threading.Lock(), "samples": [], "thread": None, "stop_event": threading.Event(), "last_cleanup_ts": 0, "restart_in_progress": False}
 
 def _silent_restart():
-    """Perform a silent restart of the Streamlit app when memory exceeds hard limit."""
+    """Perform a silent restart of the Streamlit app when memory exceeds hard limit.
+    Uses sys.exit(1) to trigger the restart loop in run_app.py."""
     logger.warning(f"Memory exceeded {MEMORY_HARD_LIMIT_MB}MB, initiating silent restart...")
-    try:
-        # Log the restart event
-        with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "event": "silent_restart",
-                "reason": "memory_limit_exceeded"
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
     
     # Full cleanup before restart
     _soft_memory_cleanup()
@@ -1142,19 +1098,13 @@ def _silent_restart():
     except Exception:
         pass
     
-    # Restart the process
-    try:
-        import sys
-        import os
-        python = sys.executable
-        os.execl(python, python, *sys.argv)
-    except Exception as e:
-        logger.error(f"Failed to restart: {e}")
-        # Fallback: exit and let the container/supervisor restart
-        try:
-            os._exit(1)
-        except Exception:
-            pass
+    # Exit with code 1 to trigger restart loop in run_app.py
+    # Using sys.exit(1) instead of os.execl() because:
+    # 1. os.execl() doesn't work properly inside Streamlit
+    # 2. sys.exit(1) raises SystemExit which is caught by run_app.py
+    # 3. run_app.py will restart the app when exit_code != 0
+    import sys
+    sys.exit(1)
 
 def _soft_memory_cleanup():
     """Best-effort cleanup to reduce memory without visible user impact."""
@@ -1255,11 +1205,12 @@ def _periodic_memory_cleanup():
         pass
     
     try:
-        # Trim seed store - prune old call_meta entries (>10min)
+        # Trim seed store - prune old call_meta entries (>10min) and limit data sizes
         seed = _shared_seed_store()
         now = pytime.time()
         with seed["lock"]:
             for org in seed.get("orgs", {}).values():
+                # Trim call_meta
                 meta = org.get("call_meta", {})
                 if len(meta) > 100:
                     stale = [k for k, v in meta.items() if (now - v.get("ts", 0)) > 600]
@@ -1270,6 +1221,25 @@ def _periodic_memory_cleanup():
                         sorted_items = sorted(meta.items(), key=lambda x: x[1].get("ts", 0))
                         for k, _ in sorted_items[:len(meta) - 100]:
                             meta.pop(k, None)
+                
+                # Trim call_seed_data to max 200 entries
+                call_seed = org.get("call_seed_data", [])
+                if len(call_seed) > 200:
+                    org["call_seed_data"] = call_seed[:200]
+                
+                # Trim ivr_calls_data to max 200 entries
+                ivr_calls = org.get("ivr_calls_data", [])
+                if len(ivr_calls) > 200:
+                    org["ivr_calls_data"] = ivr_calls[:200]
+                
+                # Trim agent_presence and agent_routing dicts
+                for cache_key in ["agent_presence", "agent_routing"]:
+                    cache = org.get(cache_key, {})
+                    if len(cache) > 100:
+                        # Keep only first 100 items
+                        keys_to_remove = list(cache.keys())[100:]
+                        for k in keys_to_remove:
+                            cache.pop(k, None)
     except Exception:
         pass
     
@@ -1323,35 +1293,12 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
 
         def run():
             import gc
-            os.makedirs(LOG_DIR, exist_ok=True)
             proc = psutil.Process(os.getpid())
             gc_counter = 0
-            log_write_counter = 0
             periodic_cleanup_counter = 0
-            MEMORY_LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB max
-            APP_LOG_MAX_BYTES = 20 * 1024 * 1024  # 20 MB max for app.log
-            PERIODIC_CLEANUP_INTERVAL = 60  # Every 60 samples = 10 min
-            
-            def _rotate_memory_log():
-                try:
-                    if os.path.exists(MEMORY_LOG_FILE) and os.path.getsize(MEMORY_LOG_FILE) > MEMORY_LOG_MAX_BYTES:
-                        backup = MEMORY_LOG_FILE + ".1"
-                        if os.path.exists(backup):
-                            os.remove(backup)
-                        os.rename(MEMORY_LOG_FILE, backup)
-                except Exception:
-                    pass
-            
-            def _rotate_app_log():
-                """Rotate app.log to prevent unbounded disk growth."""
-                try:
-                    if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > APP_LOG_MAX_BYTES:
-                        backup = LOG_FILE + ".1"
-                        if os.path.exists(backup):
-                            os.remove(backup)
-                        os.rename(LOG_FILE, backup)
-                except Exception:
-                    pass
+            full_cleanup_counter = 0
+            PERIODIC_CLEANUP_INTERVAL = 30  # Every 30 samples = 5 min (reduced from 10 min)
+            FULL_CLEANUP_INTERVAL = 180  # Every 180 samples = 30 min
             
             while not store["stop_event"].is_set():
                 try:
@@ -1384,6 +1331,20 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                     except Exception:
                         pass
                     periodic_cleanup_counter = 0
+
+                # Full cleanup every 30 minutes (regardless of memory)
+                full_cleanup_counter += 1
+                if full_cleanup_counter >= FULL_CLEANUP_INTERVAL:
+                    try:
+                        _soft_memory_cleanup()
+                    except Exception:
+                        pass
+                    try:
+                        gc.collect()
+                        gc.collect()
+                    except Exception:
+                        pass
+                    full_cleanup_counter = 0
                 
                 # Check if memory exceeds hard limit - trigger silent restart
                 if rss_mb >= MEMORY_HARD_LIMIT_MB:
@@ -1401,17 +1362,6 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                     _soft_memory_cleanup()
                     with store["lock"]:
                         store["last_cleanup_ts"] = pytime.time()
-                try:
-                    # Rotate logs periodically
-                    log_write_counter += 1
-                    if log_write_counter >= 100:
-                        _rotate_memory_log()
-                        _rotate_app_log()
-                        log_write_counter = 0
-                    with open(MEMORY_LOG_FILE, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(sample, ensure_ascii=False) + "\n")
-                except Exception:
-                    pass
                 for _ in range(max(1, int(sample_interval * 5))):
                     if store["stop_event"].is_set():
                         break
@@ -2183,6 +2133,25 @@ if page == get_text(lang, "menu_reports"):
             help=get_text(lang, "media_type_help")
         )
 
+        if r_type in ["interaction_search", "chat_detail", "missed_interactions"]:
+            st.session_state.rep_max_records = st.number_input(
+                "Maksimum kayıt (performans için)",
+                min_value=100,
+                max_value=20000,
+                value=int(st.session_state.get("rep_max_records", 5000)),
+                step=100,
+                help="Yüksek aralıklar bellek kullanımını artırır. Varsayılan 5000 kayıt ile sınırlandırılır."
+            )
+        if r_type == "chat_detail":
+            st.session_state.rep_enrich_limit = st.number_input(
+                "Zenginleştirilecek chat sayısı (attributes)",
+                min_value=50,
+                max_value=5000,
+                value=int(st.session_state.get("rep_enrich_limit", 500)),
+                step=50,
+                help="Her chat için ek API çağrısı yapılır. Limit yükseldikçe bellek ve süre artar."
+            )
+
         # Metrics Selection
         user_metrics = st.session_state.app_user.get('metrics', [])
         selection_options = user_metrics if user_metrics and role != "Admin" else ALL_METRICS
@@ -2205,19 +2174,25 @@ if page == get_text(lang, "menu_reports"):
                  end_date = datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
                  
                  api = GenesysAPI(st.session_state.api_client)
-                 # Fetch all, but we will filter for chats ideally or just process all with attributes
-                 # Interaction detail endpoint returns all types.
-                 raw_convs = api.get_conversation_details(start_date, end_date)
+                 max_records = int(st.session_state.get("rep_max_records", 5000))
+                 dfs = []
+                 total_rows = 0
                  u_offset = saved_creds.get("utc_offset", 3)
-                 # Process with attributes=True (Base structure)
-                 df = process_conversation_details(
-                     raw_convs, 
-                     st.session_state.users_info, 
-                     st.session_state.queues_map, 
-                     st.session_state.wrapup_map,
-                     include_attributes=True,
-                     utc_offset=u_offset
-                 )
+                 for page in _iter_conversation_pages(api, start_date, end_date, max_records=max_records, chunk_days=3):
+                     df_chunk = process_conversation_details(
+                         {"conversations": page},
+                         st.session_state.users_info,
+                         st.session_state.queues_map,
+                         st.session_state.wrapup_map,
+                         include_attributes=True,
+                         utc_offset=u_offset
+                     )
+                     if not df_chunk.empty:
+                         dfs.append(df_chunk)
+                         total_rows += len(df_chunk)
+                 df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+                 if max_records and total_rows >= max_records:
+                     st.warning(f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz.")
                  
                  if not df.empty:
                      # Filter for Chat/Message types FIRST to reduce API calls
@@ -2229,6 +2204,10 @@ if page == get_text(lang, "menu_reports"):
                          
                          # Create a progress bar
                          progress_bar = st.progress(0)
+                         enrich_limit = int(st.session_state.get("rep_enrich_limit", 500))
+                         if enrich_limit and len(df_chat) > enrich_limit:
+                             st.warning(f"Zenginleştirme limiti uygulandı: ilk {enrich_limit} kayıt.")
+                             df_chat = df_chat.head(enrich_limit).copy()
                          total_chats = len(df_chat)
                          
                          # Prepare a list to collect updated attributes
@@ -2293,6 +2272,11 @@ if page == get_text(lang, "menu_reports"):
                          st.warning(get_text(lang, "no_data"))
                  else:
                      st.warning(get_text(lang, "no_data"))
+                 try:
+                     import gc as _gc
+                     _gc.collect()
+                 except Exception:
+                     pass
 
     # --- MISSED INTERACTIONS REPORT ---
     if r_type == "missed_interactions":
@@ -2315,18 +2299,24 @@ if page == get_text(lang, "menu_reports"):
                  e_dt = datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
                  
                  # Get details
-                 raw_data = api.get_conversation_details(s_dt, e_dt)
-                 
-                 # (debug dump removed for build)
-                 
-                 df = process_conversation_details(
-                     raw_data, 
-                     user_map=st.session_state.users_info, 
-                     queue_map=st.session_state.queues_map, 
-                     wrapup_map=st.session_state.wrapup_map,
-                     include_attributes=True,
-                     utc_offset=saved_creds.get("utc_offset", 3)
-                 )
+                 max_records = int(st.session_state.get("rep_max_records", 5000))
+                 dfs = []
+                 total_rows = 0
+                 for page in _iter_conversation_pages(api, s_dt, e_dt, max_records=max_records, chunk_days=3):
+                     df_chunk = process_conversation_details(
+                         {"conversations": page},
+                         user_map=st.session_state.users_info,
+                         queue_map=st.session_state.queues_map,
+                         wrapup_map=st.session_state.wrapup_map,
+                         include_attributes=True,
+                         utc_offset=saved_creds.get("utc_offset", 3)
+                     )
+                     if not df_chunk.empty:
+                         dfs.append(df_chunk)
+                         total_rows += len(df_chunk)
+                 df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+                 if max_records and total_rows >= max_records:
+                     st.warning(f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz.")
                  
                  if not df.empty:
                      # Filter for MISSED Only
@@ -2379,6 +2369,11 @@ if page == get_text(lang, "menu_reports"):
                          st.warning("Seçilen kriterlere uygun kaçan çağrı/etkileşim bulunamadı.")
                  else:
                      st.warning(get_text(lang, "no_data"))
+                 try:
+                     import gc as _gc
+                     _gc.collect()
+                 except Exception:
+                     pass
 
     # --- INTERACTION SEARCH ---
     if r_type == "interaction_search":
@@ -2397,10 +2392,23 @@ if page == get_text(lang, "menu_reports"):
                  end_date = datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
                  # Fetch data
                  api = GenesysAPI(st.session_state.api_client)
-                 raw_convs = api.get_conversation_details(start_date, end_date)
-                 
-                 # Process with Wrapup Map
-                 df = process_conversation_details(raw_convs, st.session_state.users_info, st.session_state.queues_map, st.session_state.wrapup_map, utc_offset=saved_creds.get("utc_offset", 3))
+                 max_records = int(st.session_state.get("rep_max_records", 5000))
+                 dfs = []
+                 total_rows = 0
+                 for page in _iter_conversation_pages(api, start_date, end_date, max_records=max_records, chunk_days=3):
+                     df_chunk = process_conversation_details(
+                         {"conversations": page},
+                         st.session_state.users_info,
+                         st.session_state.queues_map,
+                         st.session_state.wrapup_map,
+                         utc_offset=saved_creds.get("utc_offset", 3)
+                     )
+                     if not df_chunk.empty:
+                         dfs.append(df_chunk)
+                         total_rows += len(df_chunk)
+                 df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+                 if max_records and total_rows >= max_records:
+                     st.warning(f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz.")
                  
                  if not df.empty:
                      # Rename columns first to internal keys then to display names
@@ -2435,6 +2443,11 @@ if page == get_text(lang, "menu_reports"):
                      render_downloads(final_df, f"interactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
                  else:
                      st.warning(get_text(lang, "no_data"))
+                 try:
+                     import gc as _gc
+                     _gc.collect()
+                 except Exception:
+                     pass
 
     # --- STANDARD REPORTS ---
     elif r_type not in ["chat_detail", "missed_interactions"] and st.button(get_text(lang, "fetch_report"), type="primary", width='stretch'):
@@ -2808,7 +2821,7 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
 elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
     st.title(f"🛡️ {get_text(lang, 'admin_panel')}")
     
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama"])
     
     with tab1:
         stats = monitor.get_stats()
@@ -2847,64 +2860,6 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
             st.info("Son 24 saatte trafik yok.")
 
         st.divider()
-        st.subheader("API Log Raporu")
-        df_calls = _load_api_calls_log(API_CALLS_LOG_PATH)
-        if df_calls.empty:
-            st.info("API logu bulunamadi. Loglama yeni etkinlestirildiyse veri olusmasi icin biraz zaman tanimlayin.")
-        else:
-            st.caption(f"Not: Rapor son {API_CALLS_LOG_TAIL_LINES} kaydi baz alir (tail okuma).")
-            ts_min = df_calls["timestamp"].min()
-            ts_max = df_calls["timestamp"].max()
-            st.caption(f"Kapsam: {ts_min} - {ts_max} | Toplam Kayit: {len(df_calls)}")
-
-            df_ts = df_calls.dropna(subset=["timestamp"]).copy()
-            if not df_ts.empty:
-                df_ts["minute"] = df_ts["timestamp"].dt.floor("min")
-                df_min = df_ts.groupby("minute").size().reset_index(name="Istek Adet")
-                st.line_chart(df_min.set_index("minute"))
-
-            def _pctl(series, p):
-                s = series.dropna()
-                if s.empty:
-                    return np.nan
-                return float(np.nanpercentile(s, p))
-
-            def _error_count(series):
-                s = pd.to_numeric(series, errors="coerce")
-                return int((s >= 400).sum())
-
-            agg = df_calls.groupby("endpoint").agg(
-                Adet=("endpoint", "size"),
-                Ortalama_ms=("duration_ms", "mean"),
-                p50_ms=("duration_ms", lambda s: _pctl(s, 50)),
-                p95_ms=("duration_ms", lambda s: _pctl(s, 95)),
-                Max_ms=("duration_ms", "max"),
-                Hata_Adet=("status_code", _error_count)
-            ).reset_index()
-            agg["Hata_Orani"] = (agg["Hata_Adet"] / agg["Adet"]).fillna(0.0)
-            agg["Neden"] = agg["endpoint"].apply(_endpoint_reason)
-            agg["Kaynak"] = agg["endpoint"].apply(_endpoint_source)
-            agg = agg.sort_values("Adet", ascending=False)
-
-            top_endpoint = agg.iloc[0] if not agg.empty else None
-            if top_endpoint is not None:
-                st.info(f"En cok cagrilan endpoint: {top_endpoint['endpoint']} | Adet: {int(top_endpoint['Adet'])} | Kaynak: {top_endpoint['Kaynak']} | Neden: {top_endpoint['Neden']}")
-
-            src_agg = agg.groupby("Kaynak").agg(
-                Adet=("Adet", "sum"),
-                Ortalama_ms=("Ortalama_ms", "mean"),
-                p50_ms=("p50_ms", "mean"),
-                p95_ms=("p95_ms", "mean"),
-                Max_ms=("Max_ms", "max"),
-                Hata_Adet=("Hata_Adet", "sum")
-            ).reset_index().sort_values("Adet", ascending=False)
-
-            if not src_agg.empty:
-                st.subheader("En Cok Neresi Kullaniliyor (Kaynak Bazli)")
-                st.dataframe(src_agg, width='stretch')
-
-            st.dataframe(agg, width='stretch')
-
     with tab2:
         st.subheader(get_text(lang, "system_errors"))
         errors = monitor.get_errors()
@@ -3149,14 +3104,14 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                 else:
                     st.success(f"✅ En büyük kaynak: **{top['Kaynak']}** - {top['Boyut (KB)']:.1f} KB ({pct:.1f}%)")
             
-            st.dataframe(df_breakdown, use_container_width=True, hide_index=True)
+            st.dataframe(df_breakdown, width='stretch', hide_index=True)
             
             # Show session state details if significant
             if session_details:
                 with st.expander("📦 Session State Detayları (>10 KB)"):
                     df_session = pd.DataFrame(session_details).sort_values("size_kb", ascending=False)
                     df_session["size_kb"] = df_session["size_kb"].round(1)
-                    st.dataframe(df_session, use_container_width=True, hide_index=True)
+                    st.dataframe(df_session, width='stretch', hide_index=True)
         else:
             st.info("Bellek analizi yapılamadı.")
 
@@ -3331,7 +3286,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                             if 'id' in df_members.columns:
                                 df_display = df_members[['name', 'email', 'state']].copy()
                                 df_display.columns = ['Ad', 'E-posta', 'Durum']
-                                st.dataframe(df_display, use_container_width=True, hide_index=True)
+                                st.dataframe(df_display, width='stretch', hide_index=True)
                             
                             # Remove members
                             with st.expander(f"🗑️ {get_text(lang, 'group_remove_members')}", expanded=False):
@@ -3484,6 +3439,120 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                             st.warning("Kuyruk bulunamadı.")
             except Exception as e:
                 st.error(f"❌ {get_text(lang, 'group_fetch_error')}: {e}")
+
+    with tab6:
+        st.subheader("🔍 Kullanıcı Arama (User ID)")
+        st.info("Genesys Cloud kullanıcı kimliği (UUID) ile kullanıcı bilgilerini sorgulayabilirsiniz.")
+        
+        if not st.session_state.get('api_client'):
+            st.error("Bu özellik için Genesys Cloud bağlantısı gereklidir.")
+        else:
+            import re as _re_user_search
+            _uuid_pattern_user = _re_user_search.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+            
+            search_col1, search_col2 = st.columns([3, 1])
+            with search_col1:
+                user_id_input = st.text_input(
+                    "Kullanıcı ID (UUID)",
+                    placeholder="e.g. 24331d74-80bf-4069-a67c-51bc851fdc3e",
+                    help="Genesys Cloud kullanıcı kimliğini (UUID formatında) girin",
+                    key="admin_user_search_id"
+                )
+            
+            with search_col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                search_clicked = st.button("🔍 Ara", type="primary", use_container_width=True, key="admin_user_search_btn")
+            
+            if search_clicked:
+                user_id_clean = user_id_input.strip() if user_id_input else ""
+                
+                if not user_id_clean:
+                    st.error("Lütfen bir kullanıcı ID girin.")
+                elif not _uuid_pattern_user.match(user_id_clean):
+                    st.error("Geçersiz UUID formatı. Örnek: 24331d74-80bf-4069-a67c-51bc851fdc3e")
+                else:
+                    try:
+                        api = GenesysAPI(st.session_state.api_client)
+                        with st.spinner("Kullanıcı bilgileri getiriliyor..."):
+                            user_data = api.get_user_by_id(
+                                user_id_clean, 
+                                expand=['presence', 'routingStatus', 'groups', 'skills', 'languages']
+                            )
+                        
+                        if user_data:
+                            st.success(f"✅ Kullanıcı bulundu: **{user_data.get('name', 'N/A')}**")
+                            
+                            # Basic Info
+                            st.markdown("### 👤 Temel Bilgiler")
+                            info_col1, info_col2 = st.columns(2)
+                            with info_col1:
+                                st.markdown(f"**Ad:** {user_data.get('name', 'N/A')}")
+                                st.markdown(f"**E-posta:** {user_data.get('email', 'N/A')}")
+                                st.markdown(f"**Kullanıcı Adı:** {user_data.get('username', 'N/A')}")
+                                st.markdown(f"**Durum:** {user_data.get('state', 'N/A')}")
+                            with info_col2:
+                                st.markdown(f"**Departman:** {user_data.get('department', 'N/A')}")
+                                st.markdown(f"**Ünvan:** {user_data.get('title', 'N/A')}")
+                                st.markdown(f"**Yönetici:** {user_data.get('manager', 'N/A')}")
+                                st.markdown(f"**Division:** {user_data.get('divisionName', 'N/A')}")
+                            
+                            # Presence & Routing Status
+                            presence = user_data.get('presence', {})
+                            routing = user_data.get('routingStatus', {})
+                            if presence or routing:
+                                st.divider()
+                                st.markdown("### 📍 Anlık Durum")
+                                status_col1, status_col2 = st.columns(2)
+                                with status_col1:
+                                    if presence:
+                                        pres_def = presence.get('presenceDefinition', {})
+                                        st.markdown(f"**Presence:** {pres_def.get('systemPresence', 'N/A')}")
+                                        st.markdown(f"**Presence ID:** `{pres_def.get('id', 'N/A')}`")
+                                        if presence.get('modifiedDate'):
+                                            st.markdown(f"**Son Değişiklik:** {presence.get('modifiedDate', 'N/A')}")
+                                with status_col2:
+                                    if routing:
+                                        st.markdown(f"**Routing Status:** {routing.get('status', 'N/A')}")
+                                        if routing.get('startTime'):
+                                            st.markdown(f"**Başlangıç:** {routing.get('startTime', 'N/A')}")
+                            
+                            # Groups
+                            groups = user_data.get('groups', [])
+                            if groups:
+                                st.divider()
+                                st.markdown(f"### 👥 Gruplar ({len(groups)})")
+                                group_names = [g.get('name', g.get('id', 'N/A')) for g in groups]
+                                st.write(", ".join(group_names) if group_names else "Grup yok")
+                            
+                            # Skills
+                            skills = user_data.get('skills', [])
+                            if skills:
+                                st.divider()
+                                st.markdown(f"### 🎯 Yetenekler ({len(skills)})")
+                                skill_info = [f"{s.get('name', 'N/A')} (Seviye: {s.get('proficiency', 'N/A')})" for s in skills]
+                                for s in skill_info[:10]:  # Show max 10
+                                    st.caption(s)
+                                if len(skills) > 10:
+                                    st.caption(f"... ve {len(skills) - 10} daha")
+                            
+                            # Languages
+                            languages = user_data.get('languages', [])
+                            if languages:
+                                st.divider()
+                                st.markdown(f"### 🌐 Diller ({len(languages)})")
+                                lang_info = [f"{l.get('name', 'N/A')} (Seviye: {l.get('proficiency', 'N/A')})" for l in languages]
+                                st.write(", ".join(lang_info) if lang_info else "Dil yok")
+                            
+                            # Raw JSON expander
+                            with st.expander("📄 Ham JSON Verisi"):
+                                raw = user_data.get('raw', user_data)
+                                # Remove 'raw' key to avoid recursion
+                                display_raw = {k: v for k, v in raw.items() if k != 'raw'} if isinstance(raw, dict) else raw
+                                st.json(display_raw)
+                        else:
+                            st.warning(f"⚠️ Kullanıcı bulunamadı: `{user_id_clean}`")
+                    except Exception as e:
+                        st.error(f"❌ Hata: {e}")
 
     # Logout moved to Organization Settings
     
@@ -3796,13 +3865,13 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         for idx, vis in enumerate(visuals):
                             with cols[idx]:
                                 if vis == "Service Level":
-                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Answer Rate":
                                     ar_val = (ans / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Abandon Rate":
                                     ab_val = (abn / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
                 
                 else:
                     # Historical mode (Yesterday/Date) - show daily stats with gauge
@@ -3828,13 +3897,13 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         for idx, vis in enumerate(visuals):
                             with cols[idx]:
                                 if vis == "Service Level":
-                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Answer Rate":
                                     ar_val = (ans / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
                                 elif vis == "Abandon Rate":
                                     ab_val = (abn / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), use_container_width=True, config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
+                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
 
     if to_del:
         for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]

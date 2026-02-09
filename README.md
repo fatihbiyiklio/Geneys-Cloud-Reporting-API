@@ -25,7 +25,7 @@ Bu uygulama, Genesys Cloud platformu için gerçek zamanlı dashboard ve geçmi�
 ### ⚡ Performans & Bellek Yönetimi
 - **Otomatik Cache Temizleme:** Tüm cache'ler için MAX boyut limitleri
 - **Background Thread Yönetimi:** DataManager, NotificationManager'lar
-- **Bellek İzleme:** Gerçek zamanlı RSS takibi ve otomatik cleanup
+- **Bellek İzleme:** Gerçek zamanlı RSS takibi ve otomatik cleanup (in-memory)
 - **Rate Limiting:** API çağrı hız kontrolü
 
 ---
@@ -63,7 +63,7 @@ GitHub Actions üzerinden her sürüm için otomatik olarak **Linux** ve **Windo
 
 ```
 ├── app.py                 # Ana Streamlit arayüzü (3800+ satır)
-├── run_app.py             # Başlatıcı script (port kontrolü, single instance)
+├── run_app.py             # Başlatıcı script (port kontrolü, auto-restart)
 ├── Dockerfile             # Container yapılandırması
 ├── requirements.txt       # Python bağımlılıkları
 │
@@ -82,11 +82,7 @@ GitHub Actions üzerinden her sürüm için otomatik olarak **Linux** ve **Windo
 │       ├── credentials.enc    # Şifrelenmiş API credentials
 │       ├── users.json         # Kullanıcı hesapları
 │       └── dashboard_config.json
-│
-└── logs/
-    ├── app.log            # Uygulama logları
-    ├── api_calls.jsonl    # API çağrı geçmişi
-    └── memory.jsonl       # Bellek kullanım trendi
+
 ```
 
 ---
@@ -137,10 +133,9 @@ graph TB
         WS[WebSocket<br/>Notifications]
     end
 
-    subgraph "📊 İzleme & Loglama"
+    subgraph "📊 İzleme (In-Memory)"
         Monitor[AppMonitor]
         MemStore[(memory_store)]
-        APILog[(api_calls.jsonl)]
     end
 
     %% Kullanıcı Akışı
@@ -180,7 +175,6 @@ graph TB
 
     %% Monitoring
     REST --> Monitor
-    Monitor --> APILog
     Monitor --> MemStore
 
     %% Styling

@@ -1,5 +1,3 @@
-import json
-import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -28,31 +26,10 @@ class AppMonitor:
         self.error_logs = [] # list of {timestamp, module, message, details}
         self.start_time = datetime.now()
         self._lock = threading.Lock()
-        self._log_path = os.path.join("logs", "api_calls.jsonl")
-        self._log_max_bytes = int(os.environ.get("API_LOG_MAX_BYTES", 50 * 1024 * 1024))
-        self._log_max_files = int(os.environ.get("API_LOG_MAX_FILES", 5))
         self._last_stats_prune = time.time()
         self.MAX_ENDPOINT_STATS = 200  # Max unique endpoints to track
         self.STATS_PRUNE_INTERVAL = 3600  # Prune every hour
-        os.makedirs(os.path.dirname(self._log_path), exist_ok=True)
         self._initialized = True
-
-    def _rotate_logs_if_needed(self):
-        try:
-            if not os.path.exists(self._log_path):
-                return
-            if os.path.getsize(self._log_path) < self._log_max_bytes:
-                return
-            # Rotate: api_calls.jsonl -> .1, .1 -> .2, etc.
-            for i in range(self._log_max_files - 1, 0, -1):
-                src = f"{self._log_path}.{i}"
-                dst = f"{self._log_path}.{i + 1}"
-                if os.path.exists(src):
-                    os.replace(src, dst)
-            os.replace(self._log_path, f"{self._log_path}.1")
-        except Exception:
-            # Avoid breaking logging on rotate failure
-            pass
 
     def log_api_call(self, endpoint, method=None, status_code=None, duration_ms=None):
         """Records an API call with timestamp, endpoint path, and optional timing metadata."""
@@ -84,13 +61,6 @@ class AppMonitor:
                 "duration_ms": duration_ms
             }
             self.api_calls_log.append(entry)
-            try:
-                self._rotate_logs_if_needed()
-                with open(self._log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            except Exception:
-                # Avoid crashing the app on logging issues
-                pass
             
             # Keep log manageable (last 200 calls instead of 1000)
             if len(self.api_calls_log) > 200:
