@@ -159,6 +159,17 @@ def _endpoint_source(endpoint):
         return "Init/Settings (presence haritasi)"
     return "Diger"
 
+def _resolve_resource_path(relative_path):
+    candidates = []
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(os.path.join(sys._MEIPASS, relative_path))
+    candidates.append(os.path.join(os.path.dirname(__file__), relative_path))
+    candidates.append(os.path.abspath(relative_path))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0] if candidates else relative_path
+
 def format_status_time(presence_ts, routing_ts):
     """Calculates duration since the most recent status change in HH:MM:SS format."""
     try:
@@ -2206,7 +2217,7 @@ if page == get_text(lang, "menu_reports") and not is_dm_enabled(org):
 # Now handle all pages
 if page == get_text(lang, "menu_metrics_guide"):
     st.title(f"📘 {get_text(lang, 'menu_metrics_guide')}")
-    ref_path = "METRICS_REFERENCE.md"
+    ref_path = _resolve_resource_path("METRICS_REFERENCE.md")
     if os.path.exists(ref_path):
         try:
             with open(ref_path, "r", encoding="utf-8") as f:

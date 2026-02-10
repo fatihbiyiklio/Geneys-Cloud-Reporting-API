@@ -27,6 +27,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy application files (selective - avoid secrets)
 COPY app.py run_app.py ./
+COPY METRICS_REFERENCE.md ./
 COPY src/ ./src/
 COPY .streamlit/ ./.streamlit/
 

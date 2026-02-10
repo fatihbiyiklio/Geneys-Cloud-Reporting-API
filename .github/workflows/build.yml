@@ -60,6 +60,7 @@ jobs:
           --hidden-import websocket._exceptions `
           --hidden-import psutil `
           --add-data "app.py;." `
+          --add-data "METRICS_REFERENCE.md;." `
           --add-data "src;src" `
           run_app.py
 
@@ -112,6 +113,7 @@ jobs:
           --hidden-import websocket._exceptions \
           --hidden-import psutil \
           --add-data "app.py:." \
+          --add-data "METRICS_REFERENCE.md:." \
           --add-data "src:src" \
           run_app.py
 
