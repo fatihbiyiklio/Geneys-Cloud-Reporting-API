@@ -254,15 +254,65 @@ def _extract_wait_seconds(conv):
 def _extract_media_type(conv):
     if not isinstance(conv, dict):
         return None
+    # Check for callback at conversation level first
     if conv.get("mediaType"):
+        mt = conv.get("mediaType").lower()
+        if mt == "callback":
+            return "callback"
+        # Check if this is a callback-originated voice call
+        if mt == "voice" and _is_callback_conversation(conv):
+            return "callback"
         return conv.get("mediaType")
     participants = conv.get("participants") or conv.get("participantsDetails") or []
+    found_media = None
     for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        # Check for callback purpose
+        if purpose == "outbound":
+            for s in p.get("sessions", []) or []:
+                mt = (s.get("mediaType") or "").lower()
+                if mt == "callback":
+                    return "callback"
         for s in p.get("sessions", []) or []:
             mt = s.get("mediaType")
             if mt:
-                return mt
-    return None
+                if mt.lower() == "callback":
+                    return "callback"
+                if not found_media:
+                    found_media = mt
+    # If voice but callback-originated
+    if found_media and found_media.lower() == "voice" and _is_callback_conversation(conv):
+        return "callback"
+    return found_media
+
+def _is_callback_conversation(conv):
+    """Check if conversation originated from a callback request."""
+    if not isinstance(conv, dict):
+        return False
+    # Check participants for callback indicators
+    participants = conv.get("participants") or conv.get("participantsDetails") or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose == "outbound":
+            # Outbound purpose with agent usually indicates callback
+            for s in p.get("sessions", []) or []:
+                if s.get("mediaType", "").lower() == "callback":
+                    return True
+        # Check session-level callback indicators
+        for s in p.get("sessions", []) or []:
+            if s.get("mediaType", "").lower() == "callback":
+                return True
+            # Check for callback direction
+            direction = s.get("direction", "").lower()
+            if direction == "outbound" and (p.get("purpose") or "").lower() in ["agent", "user"]:
+                # Agent making outbound call could be callback
+                pass
+    # Check attributes for callback origin
+    attributes = conv.get("attributes") or {}
+    for key in attributes:
+        if "callback" in key.lower():
+            return True
+    return False
 
 def _seconds_since(iso_str):
     if not iso_str:
@@ -3973,108 +4023,114 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             # Filter Text Input
             search_term = st.text_input("🔍 Agent Ara", "", label_visibility="collapsed", placeholder="Agent Ara...").lower()
             
-            # Card/Group Filter
-            group_options = ["Hepsi (All)"] + [card['title'] or f"Grup #{idx+1}" for idx, card in enumerate(st.session_state.dashboard_cards)]
+            # Group Filter (Genesys Groups)
+            now_ts = pytime.time()
+            groups_cache = st.session_state.get("dashboard_groups_cache", [])
+            groups_ts = st.session_state.get("dashboard_groups_ts", 0)
+            if (not groups_cache) or ((now_ts - groups_ts) > 600):
+                try:
+                    api = GenesysAPI(st.session_state.api_client)
+                    groups_cache = api.get_groups()
+                    st.session_state.dashboard_groups_cache = groups_cache
+                    st.session_state.dashboard_groups_ts = now_ts
+                except Exception:
+                    pass
+            group_options = ["Hepsi (All)"] + [g.get('name', '') for g in groups_cache if g.get('name')]
             selected_group = st.selectbox("📌 Grup Filtresi", group_options, index=0)
             
-            # Collect queues from selected group or all active cards
-            # OPTIMIZATION: Only take the FIRST queue of each card for agent list
-            all_queues = set()
-            if selected_group == "Hepsi (All)":
-                for card in st.session_state.dashboard_cards:
-                    if card.get('queues'): 
-                        all_queues.add(card['queues'][0]) # Primary only
-            else:
-                for card in st.session_state.dashboard_cards:
-                    if (card['title'] or f"Grup #{st.session_state.dashboard_cards.index(card)+1}") == selected_group:
-                        if card.get('queues'): 
-                            all_queues.add(card['queues'][0]) # Primary only
-                        break
-            
-            if not all_queues:
-                st.info("Kart seçilmedi.")
-            elif st.session_state.dashboard_mode != "Live":
+            if st.session_state.dashboard_mode != "Live":
                 st.warning("Agent detayları sadece CANLI modda görünür.")
+            elif not st.session_state.get('api_client'):
+                st.warning(get_text(lang, "genesys_not_connected"))
+            elif not st.session_state.get('users_info'):
+                st.info("Kullanıcı bilgileri yükleniyor...")
             else:
-                use_agent_notif = st.session_state.get('use_agent_notifications', True)
-                agent_notif = None
-                agent_data = {}
-                members_map = {}
-                tracked_ids = set()
+                agent_notif = ensure_agent_notifications_manager()
+                agent_notif.update_client(
+                    st.session_state.api_client,
+                    st.session_state.queues_map,
+                    st.session_state.get('users_info'),
+                    st.session_state.get('presence_map')
+                )
 
-                if use_agent_notif:
-                    if not st.session_state.get('api_client'):
-                        st.warning(get_text(lang, "genesys_not_connected"))
-                    else:
-                        agent_notif = ensure_agent_notifications_manager()
-                        agent_notif.update_client(
-                            st.session_state.api_client,
-                            st.session_state.queues_map,
-                            st.session_state.get('users_info'),
-                            st.session_state.get('presence_map')
-                        )
-                        queue_ids = [st.session_state.queues_map.get(q) for q in all_queues if st.session_state.queues_map.get(q)]
-                        union_queues_map, union_agent_map = _get_union_session_maps(org)
-                        notif_queue_ids = list(union_agent_map.values()) if union_agent_map else queue_ids
-                        members_map = agent_notif.ensure_members(notif_queue_ids)
-                        user_ids = sorted({m.get("id") for mems in members_map.values() for m in mems if m.get("id")})
-                        max_users = (agent_notif.MAX_TOPICS_PER_CHANNEL * agent_notif.MAX_CHANNELS) // 3
-                        if len(user_ids) > max_users:
-                            st.warning(get_text(lang, "agent_panel_topic_limit"))
-                            user_ids = user_ids[:max_users]
-                        tracked_ids = set(user_ids)
-                        if user_ids:
-                            agent_notif.start(user_ids)
-                            if not agent_notif.connected:
-                                st.info(get_text(lang, "agent_panel_notif_connecting"))
-
-                        # Seed from API if notifications cache is empty/stale
-                        now_ts = pytime.time()
-                        shared_ts, shared_presence, shared_routing = _get_shared_agent_seed(org)
-                        last_msg = getattr(agent_notif, "last_message_ts", 0)
-                        last_evt = getattr(agent_notif, "last_event_ts", 0)
-                        notif_stale = (not agent_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > 60)
-                        if user_ids:
-                            if (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {})) or notif_stale:
-                                if _reserve_agent_seed(org, now_ts, min_interval=60):
-                                    try:
-                                        api = GenesysAPI(st.session_state.api_client)
-                                        snap = api.get_users_status_scan(target_user_ids=user_ids)
-                                        pres = snap.get("presence") or {}
-                                        rout = snap.get("routing") or {}
-                                        agent_notif.seed_users(pres, rout)
-                                        _merge_agent_seed(org, pres, rout, now_ts)
-                                    except Exception:
-                                        pass
-                            else:
-                                if shared_presence or shared_routing:
-                                    pres = {uid: shared_presence.get(uid) for uid in user_ids if uid in shared_presence}
-                                    rout = {uid: shared_routing.get(uid) for uid in user_ids if uid in shared_routing}
-                                    if pres or rout:
-                                        agent_notif.seed_users_missing(pres, rout)
-                        for q_name in all_queues:
-                            q_id = st.session_state.queues_map.get(q_name)
-                            mems = members_map.get(q_id, [])
-                            items = []
-                            for m in mems:
-                                uid = m.get("id")
-                                if tracked_ids and uid not in tracked_ids:
-                                    continue
-                                name = m.get("name") or st.session_state.users_info.get(uid, {}).get("name", "Unknown")
-                                presence = agent_notif.get_user_presence(uid) if agent_notif else {}
-                                routing = agent_notif.get_user_routing(uid) if agent_notif else {}
-                                items.append({
-                                    "id": uid,
-                                    "user": {"id": uid, "name": name, "presence": presence},
-                                    "routingStatus": routing,
-                                })
-                            agent_data[q_name] = items
+                # Determine target user ids (group-based)
+                if selected_group != "Hepsi (All)":
+                    selected_group_obj = next((g for g in groups_cache if g.get('name') == selected_group), None)
+                    group_member_ids = set()
+                    if selected_group_obj and selected_group_obj.get("id"):
+                        group_id = selected_group_obj.get("id")
+                        members_cache = st.session_state.get("dashboard_group_members_cache", {})
+                        entry = members_cache.get(group_id, {})
+                        if (not entry) or ((now_ts - entry.get("ts", 0)) > 600):
+                            try:
+                                api = GenesysAPI(st.session_state.api_client)
+                                members = api.get_group_members(group_id)
+                                members_cache[group_id] = {"ts": now_ts, "members": members}
+                                st.session_state.dashboard_group_members_cache = members_cache
+                                entry = members_cache.get(group_id, {})
+                            except Exception:
+                                pass
+                        for m in (entry.get("members") or []):
+                            if m.get("id"):
+                                group_member_ids.add(m.get("id"))
+                    all_user_ids = sorted(group_member_ids)
                 else:
-                    # Get cached details from DataManager
-                    agent_data = st.session_state.data_manager.get_agent_details(all_queues)
+                    all_user_ids = sorted(st.session_state.users_info.keys())
 
-                if not agent_data:
-                    st.info("Veri bekleniyor...")
+                # Seed from API if notifications cache is empty/stale
+                shared_ts, shared_presence, shared_routing = _get_shared_agent_seed(org)
+                last_msg = getattr(agent_notif, "last_message_ts", 0)
+                last_evt = getattr(agent_notif, "last_event_ts", 0)
+                notif_stale = (not agent_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > 60)
+                if all_user_ids:
+                    if (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {})) or notif_stale:
+                        if _reserve_agent_seed(org, now_ts, min_interval=60):
+                            try:
+                                api = GenesysAPI(st.session_state.api_client)
+                                snap = api.get_users_status_scan(target_user_ids=all_user_ids)
+                                pres = snap.get("presence") or {}
+                                rout = snap.get("routing") or {}
+                                agent_notif.seed_users(pres, rout)
+                                _merge_agent_seed(org, pres, rout, now_ts)
+                            except Exception:
+                                pass
+                    else:
+                        if shared_presence or shared_routing:
+                            pres = {uid: shared_presence.get(uid) for uid in all_user_ids if uid in shared_presence}
+                            rout = {uid: shared_routing.get(uid) for uid in all_user_ids if uid in shared_routing}
+                            if pres or rout:
+                                agent_notif.seed_users_missing(pres, rout)
+
+                # Only keep non-OFFLINE users for websocket and display
+                active_user_ids = []
+                for uid in all_user_ids:
+                    presence = agent_notif.get_user_presence(uid) if agent_notif else {}
+                    sys_presence = (presence.get('presenceDefinition', {}).get('systemPresence', '')).upper()
+                    if sys_presence and sys_presence != "OFFLINE":
+                        active_user_ids.append(uid)
+
+                max_users = (agent_notif.MAX_TOPICS_PER_CHANNEL * agent_notif.MAX_CHANNELS) // 3
+                ws_user_ids = active_user_ids[:max_users]
+                if len(active_user_ids) > max_users:
+                    st.caption(f"⚠️ WebSocket limiti: {max_users}/{len(active_user_ids)} agent anlık takipte")
+                if ws_user_ids:
+                    agent_notif.start(ws_user_ids)
+
+                # Build agent_data from active users
+                agent_data = {"_all": []}
+                for uid in active_user_ids:
+                    user_info = st.session_state.users_info.get(uid, {})
+                    name = user_info.get("name", "Unknown")
+                    presence = agent_notif.get_user_presence(uid) if agent_notif else {}
+                    routing = agent_notif.get_user_routing(uid) if agent_notif else {}
+                    agent_data["_all"].append({
+                        "id": uid,
+                        "user": {"id": uid, "name": name, "presence": presence},
+                        "routingStatus": routing,
+                    })
+
+                if not agent_data.get("_all"):
+                    st.info("Aktif agent bulunamadı.")
                 else:
                     # Flatten, Deduplicate and Filter Offline
                     unique_members = {}
@@ -4440,6 +4496,13 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                 direction_label = "Inbound"
                             elif "outbound" in d:
                                 direction_label = "Outbound"
+                        # Show callback as media type label if applicable
+                        if media_type and media_type.lower() == "callback":
+                            media_type = "Callback"
+                            if not direction_label:
+                                direction_label = "Outbound"
+                        elif media_type and media_type.lower() == "voice":
+                            media_type = "Voice"
                         meta_parts = []
                         is_interacting = bool(agent_name) or bool(agent_id) or state_value == "interacting" or (state_label == get_text(lang, "interacting"))
                         state_label = "Bağlandı" if is_interacting else "Bekleyen"

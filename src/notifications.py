@@ -811,19 +811,31 @@ class AgentNotificationManager:
         active = False
         agent_name = None
         media_type = None
+        is_callback = False
         for p in participants:
-            if not agent_name and (p.get("purpose") or "").lower() in ["agent", "user"]:
+            purpose = (p.get("purpose") or "").lower()
+            if not agent_name and purpose in ["agent", "user"]:
                 agent_name = p.get("name") or p.get("user", {}).get("name")
+            # Check for callback purpose (outbound callback indicator)
+            if purpose == "outbound":
+                is_callback = True
             for s in p.get("sessions", []) or []:
-                if not media_type:
-                    mt = s.get("mediaType")
-                    if mt:
+                mt = s.get("mediaType")
+                if mt:
+                    mt_lower = mt.lower()
+                    if mt_lower == "callback":
+                        is_callback = True
+                        media_type = "callback"
+                    elif not media_type:
                         media_type = mt
                 if _session_is_active(s):
                     active = True
                     break
             if active:
                 break
+        # If callback detected but media_type is voice, mark as callback
+        if is_callback and media_type and media_type.lower() == "voice":
+            media_type = "callback"
         if event.get("conversationEnd") or not active:
             with self._lock:
                 self.active_calls.pop(conv_id, None)
