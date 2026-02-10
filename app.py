@@ -1856,7 +1856,13 @@ def _fetch_org_maps(api):
     wrapup = api.get_wrapup_codes()
     presence = api.get_presence_definitions()
     users_map = {u['name']: u['id'] for u in users}
-    users_info = {u['id']: {'name': u['name'], 'username': u.get('username', '')} for u in users}
+    users_info = {
+        u['id']: {
+            'name': u.get('name', ''),
+            'username': u.get('username', ''),
+            'email': u.get('email', '')
+        } for u in users
+    }
     queues_map = {q['name']: q['id'] for q in queues}
     return {
         "users": users,
@@ -2092,6 +2098,9 @@ if st.session_state.app_user:
                 st.session_state.api_client = client
                 api = GenesysAPI(client)
                 maps = get_shared_org_maps(org, api, ttl_seconds=300)
+                users_info_map = maps.get("users_info", {}) or {}
+                if users_info_map and not any((u.get("username") or "").strip() for u in users_info_map.values()):
+                    maps = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
                 st.session_state.users_map = maps.get("users_map", {})
                 st.session_state.users_info = maps.get("users_info", {})
                 st.session_state.queues_map = maps.get("queues_map", {})
@@ -2131,6 +2140,7 @@ with st.sidebar:
     # Define menu options based on role
     menu_options = []
     role = st.session_state.app_user['role']
+    menu_options.append(get_text(lang, "menu_metrics_guide"))
     if role in ["Admin", "Manager", "Reports User"]:
         menu_options.append(get_text(lang, "menu_reports"))
     if role in ["Admin", "Manager", "Dashboard User"]:
@@ -2194,7 +2204,19 @@ if page == get_text(lang, "menu_reports") and not is_dm_enabled(org):
     st.stop()
 
 # Now handle all pages
-if page == get_text(lang, "menu_reports"):
+if page == get_text(lang, "menu_metrics_guide"):
+    st.title(f"📘 {get_text(lang, 'menu_metrics_guide')}")
+    ref_path = "METRICS_REFERENCE.md"
+    if os.path.exists(ref_path):
+        try:
+            with open(ref_path, "r", encoding="utf-8") as f:
+                st.markdown(f.read())
+        except Exception as e:
+            st.error(f"Doküman okunamadı: {e}")
+    else:
+        st.warning(f"Referans dosyası bulunamadı: {ref_path}")
+
+elif page == get_text(lang, "menu_reports"):
     st.title(get_text(lang, "menu_reports"))
     # --- SAVED VIEWS (Compact) ---
     with st.expander(f"📂 {get_text(lang, 'saved_views')}", expanded=False):
@@ -2236,9 +2258,9 @@ if page == get_text(lang, "menu_reports"):
     with c1:
         role = st.session_state.app_user['role']
         if role == "Reports User":
-            rep_types = ["report_agent", "report_queue", "report_detailed", "interaction_search", "missed_interactions"]
+            rep_types = ["report_agent", "report_queue", "report_detailed", "report_agent_skill_detail", "interaction_search", "missed_interactions"]
         else: # Admin, Manager
-            rep_types = ["report_agent", "report_queue", "report_detailed", "interaction_search", "chat_detail", "missed_interactions"]
+            rep_types = ["report_agent", "report_queue", "report_detailed", "report_agent_skill_detail", "interaction_search", "chat_detail", "missed_interactions"]
         
         r_type = st.selectbox(
             get_text(lang, "report_type"), 
@@ -2246,7 +2268,7 @@ if page == get_text(lang, "menu_reports"):
             format_func=lambda x: get_text(lang, x),
             key="rep_typ", index=rep_types.index(def_p.get("type", "report_agent")) if def_p.get("type", "report_agent") in rep_types else 0)
     with c2:
-        is_agent = r_type == "report_agent" 
+        is_agent = r_type == "report_agent"
         opts = list(st.session_state.users_map.keys()) if is_agent else list(st.session_state.queues_map.keys())
         if "rep_nam" in st.session_state:
             st.session_state.rep_nam = [n for n in st.session_state.rep_nam if n in opts]
@@ -2310,6 +2332,8 @@ if page == get_text(lang, "menu_reports"):
         else:
             sel_mets = []
 
+    if r_type == "report_agent_skill_detail":
+        st.info(get_text(lang, "skill_report_info"))
 
     if r_type == "chat_detail":
             st.info(get_text(lang, "chat_detail_info"))
@@ -2323,6 +2347,14 @@ if page == get_text(lang, "menu_reports"):
                  dfs = []
                  total_rows = 0
                  u_offset = saved_creds.get("utc_offset", 3)
+                 skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
+                 st.session_state.skills_map = skill_lookup
+                 language_lookup = api.get_languages()
+                 if language_lookup:
+                     st.session_state.languages_map = language_lookup
+                 else:
+                     language_lookup = st.session_state.get("languages_map", {})
+
                  for page in _iter_conversation_pages(api, start_date, end_date, max_records=max_records, chunk_days=3):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
@@ -2330,7 +2362,9 @@ if page == get_text(lang, "menu_reports"):
                          st.session_state.queues_map,
                          st.session_state.wrapup_map,
                          include_attributes=True,
-                         utc_offset=u_offset
+                         utc_offset=u_offset,
+                         skill_map=skill_lookup,
+                         language_map=language_lookup
                      )
                      if not df_chunk.empty:
                          dfs.append(df_chunk)
@@ -2447,6 +2481,14 @@ if page == get_text(lang, "menu_reports"):
                  max_records = int(st.session_state.get("rep_max_records", 5000))
                  dfs = []
                  total_rows = 0
+                 skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
+                 st.session_state.skills_map = skill_lookup
+                 language_lookup = api.get_languages()
+                 if language_lookup:
+                     st.session_state.languages_map = language_lookup
+                 else:
+                     language_lookup = st.session_state.get("languages_map", {})
+
                  for page in _iter_conversation_pages(api, s_dt, e_dt, max_records=max_records, chunk_days=3):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
@@ -2454,7 +2496,9 @@ if page == get_text(lang, "menu_reports"):
                          queue_map=st.session_state.queues_map,
                          wrapup_map=st.session_state.wrapup_map,
                          include_attributes=True,
-                         utc_offset=saved_creds.get("utc_offset", 3)
+                         utc_offset=saved_creds.get("utc_offset", 3),
+                         skill_map=skill_lookup,
+                         language_map=language_lookup
                      )
                      if not df_chunk.empty:
                          dfs.append(df_chunk)
@@ -2498,7 +2542,9 @@ if page == get_text(lang, "menu_reports"):
                              "End": "end_time",
                              "Agent": "col_agent",
                              "Username": "col_username",
-                             "Queue": "col_workgroup"
+                             "Queue": "col_workgroup",
+                             "Skill": "col_skill",
+                             "Language": "col_language"
                          }
                          
                          final_cols = [k for k, v in col_map_internal.items() if v in selected_cols_keys]
@@ -2540,13 +2586,23 @@ if page == get_text(lang, "menu_reports"):
                  max_records = int(st.session_state.get("rep_max_records", 5000))
                  dfs = []
                  total_rows = 0
+                 skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
+                 st.session_state.skills_map = skill_lookup
+                 language_lookup = api.get_languages()
+                 if language_lookup:
+                     st.session_state.languages_map = language_lookup
+                 else:
+                     language_lookup = st.session_state.get("languages_map", {})
+
                  for page in _iter_conversation_pages(api, start_date, end_date, max_records=max_records, chunk_days=3):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
                          st.session_state.users_info,
                          st.session_state.queues_map,
                          st.session_state.wrapup_map,
-                         utc_offset=saved_creds.get("utc_offset", 3)
+                         utc_offset=saved_creds.get("utc_offset", 3),
+                         skill_map=skill_lookup,
+                         language_map=language_lookup
                      )
                      if not df_chunk.empty:
                          dfs.append(df_chunk)
@@ -2572,7 +2628,9 @@ if page == get_text(lang, "menu_reports"):
                          "End": "end_time",
                          "Agent": "col_agent",
                          "Username": "col_username",
-                         "Queue": "col_workgroup"
+                         "Queue": "col_workgroup",
+                         "Skill": "col_skill",
+                         "Language": "col_language"
                      }
                      
                      # Filter columns based on selection
@@ -2598,21 +2656,51 @@ if page == get_text(lang, "menu_reports"):
     elif r_type not in ["chat_detail", "missed_interactions"] and st.button(get_text(lang, "fetch_report"), type="primary", width='stretch'):
         if not sel_mets: st.warning("Lütfen metrik seçiniz.")
         else:
+            unsupported_aggregate_metrics = {"tOrganizationResponse", "tAcdWait", "nConsultConnected", "nConsultAnswered"}
+            dropped_metrics = [m for m in sel_mets if m in unsupported_aggregate_metrics]
+            sel_mets_effective = [m for m in sel_mets if m not in unsupported_aggregate_metrics]
+            if dropped_metrics:
+                st.warning(f"Bu metrikler aggregate endpoint tarafından desteklenmiyor ve çıkarıldı: {', '.join(dropped_metrics)}")
+            if not sel_mets_effective:
+                st.warning("Desteklenen bir metrik seçiniz.")
+                st.stop()
+
             # Auto-save last used metrics
             st.session_state.last_metrics = sel_mets
             with st.spinner(get_text(lang, "fetching_data")):
                 api = GenesysAPI(st.session_state.api_client)
                 s_dt, e_dt = datetime.combine(sd, st_) - timedelta(hours=saved_creds.get("utc_offset", 3)), datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
+                is_skill_detailed = r_type == "report_agent_skill_detail"
+                is_queue_skill = r_type == "report_queue"
                 r_kind = "Agent" if r_type == "report_agent" else ("Workgroup" if r_type == "report_queue" else "Detailed")
-                g_by = ['userId'] if r_kind == "Agent" else (['queueId'] if r_kind == "Workgroup" else ['userId', 'queueId'])
+                g_by = ['userId'] if r_kind == "Agent" else ((['queueId', 'requestedRoutingSkillId', 'requestedLanguageId'] if is_queue_skill else ['queueId']) if r_kind == "Workgroup" else (['userId', 'requestedRoutingSkillId', 'requestedLanguageId', 'queueId'] if is_skill_detailed else ['userId', 'queueId']))
                 f_type = 'user' if r_kind == "Agent" else 'queue'
                 
-                resp = api.get_analytics_conversations_aggregate(s_dt, e_dt, granularity=gran_opt[sel_gran], group_by=g_by, filter_type=f_type, filter_ids=sel_ids or None, metrics=sel_mets, media_types=sel_media_types or None)
+                resp = api.get_analytics_conversations_aggregate(s_dt, e_dt, granularity=gran_opt[sel_gran], group_by=g_by, filter_type=f_type, filter_ids=sel_ids or None, metrics=sel_mets_effective, media_types=sel_media_types or None)
                 q_lookup = {v: k for k, v in st.session_state.queues_map.items()}
+                skill_lookup = {}
+                language_lookup = {}
+                if is_skill_detailed or is_queue_skill:
+                    skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
+                    st.session_state.skills_map = skill_lookup
+                    language_lookup = api.get_languages()
+                    if language_lookup:
+                        st.session_state.languages_map = language_lookup
+                    else:
+                        language_lookup = st.session_state.get("languages_map", {})
                 
                 # For detailed report, we still need users_info for userId lookup, even though filter is queue
                 lookup_map = st.session_state.users_info if r_kind in ["Agent", "Detailed"] else q_lookup
-                df = process_analytics_response(resp, lookup_map, r_kind.lower(), queue_map=q_lookup, utc_offset=saved_creds.get("utc_offset", 3))
+                report_type_key = "detailed_skill" if is_skill_detailed and r_kind == "Detailed" else ("workgroup_skill" if is_queue_skill and r_kind == "Workgroup" else r_kind.lower())
+                df = process_analytics_response(
+                    resp,
+                    lookup_map,
+                    report_type_key,
+                    queue_map=q_lookup,
+                    utc_offset=saved_creds.get("utc_offset", 3),
+                    skill_map=skill_lookup,
+                    language_map=language_lookup
+                )
                 
                 if df.empty and is_agent:
                     agent_data = []
@@ -2625,25 +2713,30 @@ if page == get_text(lang, "menu_reports"):
                 
                 if not df.empty:
                     p_keys = ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "col_staffed_time", "nNotResponding"]
-                    if any(m in sel_mets for m in p_keys) and is_agent:
+                    if any(m in sel_mets_effective for m in p_keys) and is_agent:
                         p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
                         for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime", "nNotResponding"]:
                             df[pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")] = df["Id"].apply(lambda x: p_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0))
                     
-                    if any(m in sel_mets for m in ["col_login", "col_logout"]) and is_agent:
+                    if any(m in sel_mets_effective for m in ["col_login", "col_logout"]) and is_agent:
                         u_offset = saved_creds.get("utc_offset", 3)
                         d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), utc_offset=u_offset)
                         if "col_login" in sel_mets: df["col_login"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
                         if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
 
                     if do_fill and gran_opt[sel_gran] != "P1D": df = fill_interval_gaps(df, datetime.combine(sd, st_), datetime.combine(ed, et), gran_opt[sel_gran])
-                    
-                    base = (["AgentName", "Username", "WorkgroupName"] if r_kind == "Detailed" else (["Name", "Username"] if is_agent else ["Name"]))
+
+                    if is_skill_detailed and r_kind == "Detailed":
+                        base = ["AgentName", "Username", "SkillName", "LanguageName", "WorkgroupName"]
+                    elif is_queue_skill and r_kind == "Workgroup":
+                        base = ["Name", "SkillName", "LanguageName"]
+                    else:
+                        base = (["AgentName", "Username", "WorkgroupName"] if r_kind == "Detailed" else (["Name", "Username"] if is_agent else ["Name"]))
                     if "Interval" in df.columns: base = ["Interval"] + base
-                    for sm in sel_mets:
+                    for sm in sel_mets_effective:
                         if sm not in df.columns: df[sm] = 0
                     # Avoid duplicates if AvgHandle is already in sel_mets
-                    mets_to_show = [m for m in sel_mets if m in df.columns]
+                    mets_to_show = [m for m in sel_mets_effective if m in df.columns]
                     if "AvgHandle" in df.columns and "AvgHandle" not in mets_to_show:
                         mets_to_show.append("AvgHandle")
                     final_df = df[[c for c in base if c in df.columns] + mets_to_show]
@@ -2651,8 +2744,8 @@ if page == get_text(lang, "menu_reports"):
                     # Apply duration formatting
                     final_df = apply_duration_formatting(final_df)
 
-                    rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout")}
-                    rename.update({m: get_text(lang, m) for m in sel_mets if m not in rename})
+                    rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout"), "SkillName": get_text(lang, "col_skill"), "SkillId": get_text(lang, "col_skill_id"), "LanguageName": get_text(lang, "col_language"), "LanguageId": get_text(lang, "col_language_id")}
+                    rename.update({m: get_text(lang, m) for m in sel_mets_effective if m not in rename})
                     df_out = final_df.rename(columns=rename)
                     st.dataframe(df_out, width='stretch')
 
@@ -2993,7 +3086,18 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
             st.info("Henüz API çağrısı kaydedilmedi.")
         
         st.divider()
-        st.subheader(get_text(lang, "hourly_traffic"))
+        st.subheader(get_text(lang, "minutely_traffic"))
+        minutely = monitor.get_minutely_stats(minutes=60)
+        if minutely:
+            df_minutely = pd.DataFrame([
+                {"Zaman": k, "İstek Adet": v} for k, v in minutely.items()
+            ]).sort_values("Zaman")
+            df_minutely = sanitize_numeric_df(df_minutely)
+            st.line_chart(df_minutely.set_index("Zaman"))
+        else:
+            st.info("Son 60 dakikada trafik yok.")
+
+        st.subheader(get_text(lang, "hourly_traffic_24h"))
         hourly = monitor.get_hourly_stats()
         if hourly:
             df_hourly = pd.DataFrame([

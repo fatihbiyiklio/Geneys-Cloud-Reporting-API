@@ -131,6 +131,21 @@ class AppMonitor:
                     hourly[hour_key] = hourly.get(hour_key, 0) + 1
             return hourly
 
+    def get_minutely_stats(self, minutes=60):
+        """Returns API calls grouped by minute for the last N minutes."""
+        with self._lock:
+            cutoff = datetime.now() - timedelta(minutes=minutes)
+            per_minute = {}
+            for entry in self.api_calls_log:
+                try:
+                    ts = datetime.fromisoformat(entry.get("timestamp"))
+                except Exception:
+                    continue
+                if ts > cutoff:
+                    minute_key = ts.strftime("%Y-%m-%d %H:%M")
+                    per_minute[minute_key] = per_minute.get(minute_key, 0) + 1
+            return per_minute
+
     def get_errors(self, limit=50):
         """Returns recent error logs."""
         with self._lock:

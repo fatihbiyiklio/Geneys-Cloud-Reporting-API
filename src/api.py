@@ -511,6 +511,44 @@ class GenesysAPI:
             monitor.log_error("API_GET", f"Error fetching wrap-up codes: {e}")
         return codes
 
+    def get_routing_skills(self):
+        """Fetches all routing skills for id->name mapping."""
+        skills = {}
+        try:
+            page_number = 1
+            while True:
+                data = self._get("/api/v2/routing/skills", params={"pageNumber": page_number, "pageSize": 100})
+                entities = data.get('entities', []) if isinstance(data, dict) else []
+                for item in entities:
+                    sid = item.get('id')
+                    if sid:
+                        skills[sid] = item.get('name', sid)
+                if not data.get('nextUri'):
+                    break
+                page_number += 1
+        except Exception as e:
+            monitor.log_error("API_GET", f"Error fetching routing skills: {e}")
+        return skills
+
+    def get_languages(self):
+        """Fetches all languages for id->name mapping."""
+        languages = {}
+        try:
+            page_number = 1
+            while True:
+                data = self._get("/api/v2/routing/languages", params={"pageNumber": page_number, "pageSize": 100, "sortOrder": "ascending"})
+                entities = data.get('entities', []) if isinstance(data, dict) else []
+                for item in entities:
+                    lid = item.get('id')
+                    if lid:
+                        languages[lid] = item.get('name', lid)
+                if not data.get('nextUri'):
+                    break
+                page_number += 1
+        except Exception as e:
+            monitor.log_error("API_GET", f"Error fetching languages: {e}")
+        return languages
+
     def get_groups(self, page_size=100):
         """Fetches all groups from Genesys Cloud."""
         groups = []
@@ -707,6 +745,7 @@ class GenesysAPI:
                         users.append({
                             'id': u['id'],
                             'name': u.get('name', ''),
+                            'username': u.get('username', ''),
                             'email': u.get('email', ''),
                             'state': u.get('state', '')
                         })
@@ -754,34 +793,38 @@ class GenesysAPI:
                 elif m == "nWrapup": new_mets.append("tAcw") 
                 elif m == "nHandled": new_mets.append("tHandle")
                 elif m == "nOutbound": new_mets.extend(["nOutbound", "tTalk"])
+                elif m == "tOutbound": new_mets.append("tTalk")
                 elif m == "nNotResponding": new_mets.append("tNotResponding")
                 elif m == "nAlert": new_mets.append("tAlert")
-                elif m == "nConsultTransferred": new_mets.append("nTransferred")
+                elif m == "nConsultTransferred": new_mets.append("nConsultTransferred")
                 elif m == "AvgHandle": new_mets.append("tHandle")
                 else: new_mets.append(m)
             return list(set(new_mets))
+
+        # Official Genesys ConversationAggregationQuery metric enum
+        supported_aggregate_metrics = {
+            "nBlindTransferred", "nBotInteractions", "nCobrowseSessions", "nConnected", "nConsult",
+            "nConsultTransferred", "nConversations", "nError", "nOffered", "nOutbound",
+            "nOutboundAbandoned", "nOutboundAttempted", "nOutboundConnected", "nOverSla",
+            "nStateTransitionError", "nTransferred", "oAudioMessageCount", "oExternalAudioMessageCount",
+            "oExternalMediaCount", "oMediaCount", "oMessageCount", "oMessageSegmentCount",
+            "oMessageTurn", "oServiceLevel", "oServiceTarget", "tAbandon", "tAcd",
+            "tActiveCallback", "tActiveCallbackComplete", "tAcw", "tAgentResponseTime",
+            "tAgentVideoConnected", "tAlert", "tAnswered", "tAverageAgentResponseTime",
+            "tAverageCustomerResponseTime", "tBarging", "tCoaching", "tCoachingComplete",
+            "tConnected", "tContacting", "tDialing", "tFirstConnect", "tFirstDial",
+            "tFirstEngagement", "tFirstResponse", "tFlowOut", "tHandle", "tHeld",
+            "tHeldComplete", "tIvr", "tMonitoring", "tMonitoringComplete", "tNotResponding",
+            "tPark", "tParkComplete", "tScreenMonitoring", "tShortAbandon", "tSnippetRecord",
+            "tTalk", "tTalkComplete", "tUserResponseTime", "tVoicemail", "tWait"
+        }
 
         if not metrics:
             metrics = ["nOffered", "tAnswered", "tAbandon", "tTalk", "tHandle"]
         else:
             # Convert UI metrics to API metrics
             metrics = convert_metrics(metrics, dimension == "queueId")
-            
-            if dimension == "queueId":
-                queue_valid = {
-                    "nOffered", "nAbandon", "tAnswered", "tAbandon", "tTalk", "tHeld", "tAcw", 
-                    "tHandle", "tAlert", "tWait", "oServiceLevel", "nTransferred", "nConnected", 
-                    "nOutbound", "nBlindTransferred", "tDialing", "tContacting", "nError",
-                    "tFlowOut", "tVoicemail", "nOverSla", "tNotResponding"
-                }
-                metrics = [m for m in metrics if m in queue_valid]
-            else:
-                userId_safe = {
-                    "tTalk", "tHeld", "tAcw", "tHandle", "tAlert", "tAnswered", "tAbandon", "tWait", 
-                    "nTransferred", "nConnected", "nOutbound", "nBlindTransferred", "tDialing", "tContacting",
-                    "tNotResponding", "nOverSla", "tFlowOut", "tVoicemail", "tAcd", "tOrganizationResponse", "nError"
-                }
-                metrics = [m for m in metrics if m in userId_safe]
+            metrics = [m for m in metrics if m in supported_aggregate_metrics]
 
         combined_results = []
         chunk_days = 14

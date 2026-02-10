@@ -1,5 +1,13 @@
 import pandas as pd
 from datetime import datetime, timedelta
+def format_report_username(raw_username=None, fallback=None):
+    if raw_username:
+        local = str(raw_username).split("@")[0].strip()
+        if local:
+            return local
+    if fallback:
+        return str(fallback)
+    return ""
 
 def _get_val(obj, path, default=0):
     """Safely get a value from a nested dict."""
@@ -79,7 +87,7 @@ def process_daily_stats(response, lookup_map):
     
     return stats
 
-def process_analytics_response(response, lookup_map, report_type, queue_map=None, utc_offset=3):
+def process_analytics_response(response, lookup_map, report_type, queue_map=None, utc_offset=3, skill_map=None, language_map=None):
     """Processes dictionary-based analytics response into DataFrame."""
     data = []
     if not response or 'results' not in response:
@@ -89,24 +97,56 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         group = result_row.get('group', {})
         user_id = group.get("userId")
         queue_id = group.get("queueId")
+        requested_skill_id = group.get("requestedRoutingSkillId")
+        requested_language_id = group.get("requestedLanguageId")
         
         row_base = {}
         if report_type in ['user', 'agent', 'productivity']:
             user_info = lookup_map.get(user_id, {}) if user_id else {}
             name = user_info.get('name', user_id if user_id else "Unknown")
-            raw_username = user_info.get('username', "")
-            username = raw_username.split('@')[0] if raw_username else ""
+            raw_username = user_info.get('username') or user_info.get('email') or ""
+            username = format_report_username(raw_username, user_id)
             row_base = {"Name": name, "Username": username, "Id": user_id}
+        elif report_type == 'workgroup_skill':
+            name = lookup_map.get(queue_id, queue_id) if queue_id else "Unknown"
+            skill_name = skill_map.get(requested_skill_id, requested_skill_id) if skill_map and requested_skill_id else (requested_skill_id or "-")
+            language_name = language_map.get(requested_language_id, requested_language_id) if language_map and requested_language_id else (requested_language_id or "-")
+            row_base = {
+                "Name": name,
+                "SkillName": skill_name,
+                "LanguageName": language_name,
+                "Id": f"{queue_id}|{requested_skill_id if requested_skill_id else '-'}|{requested_language_id if requested_language_id else '-'}"
+            }
         elif report_type in ['queue', 'workgroup']:
             name = lookup_map.get(queue_id, queue_id) if queue_id else "Unknown"
             row_base = {"Name": name, "Id": queue_id}
         elif report_type == 'detailed':
             user_info = lookup_map.get(user_id, {}) if user_id else {}
             agent_name = user_info.get('name', user_id if user_id else "Unknown")
-            raw_username = user_info.get('username', "")
-            username = raw_username.split('@')[0] if raw_username else ""
+            raw_username = user_info.get('username') or user_info.get('email') or ""
+            username = format_report_username(raw_username, user_id)
             queue_name = queue_map.get(queue_id, queue_id) if queue_map and queue_id else (lookup_map.get(queue_id, queue_id) if queue_id else "Unknown")
             row_base = {"AgentName": agent_name, "Username": username, "WorkgroupName": queue_name, "Id": f"{user_id}|{queue_id}"}
+        elif report_type == 'detailed_skill':
+            if not user_id:
+                continue
+            user_info = lookup_map.get(user_id, {}) if user_id else {}
+            agent_name = user_info.get('name', user_id if user_id else "Unknown")
+            raw_username = user_info.get('username') or user_info.get('email') or ""
+            username = format_report_username(raw_username, user_id)
+            queue_name = queue_map.get(queue_id, queue_id) if queue_map and queue_id else (lookup_map.get(queue_id, queue_id) if queue_id else "Unknown")
+            skill_name = skill_map.get(requested_skill_id, requested_skill_id) if skill_map and requested_skill_id else (requested_skill_id or "-")
+            language_name = language_map.get(requested_language_id, requested_language_id) if language_map and requested_language_id else (requested_language_id or "-")
+            row_base = {
+                "AgentName": agent_name,
+                "Username": username,
+                "SkillName": skill_name,
+                "SkillId": requested_skill_id if requested_skill_id else "-",
+                "LanguageName": language_name,
+                "LanguageId": requested_language_id if requested_language_id else "-",
+                "WorkgroupName": queue_name,
+                "Id": f"{user_id}|{requested_skill_id if requested_skill_id else '-'}|{requested_language_id if requested_language_id else '-'}|{queue_id}"
+            }
 
         data_list = result_row.get('data', [])
         for interval_data in data_list:
@@ -127,7 +167,13 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 stats = metric.get('stats', {})
                 val = 0
                 
-                if m_name.startswith("t"):
+                if m_name == "oServiceLevel":
+                    numerator = stats.get('numerator', 0) or 0
+                    denominator = stats.get('denominator', 0) or 0
+                    row["_oServiceLevelNumerator"] = numerator
+                    row["_oServiceLevelDenominator"] = denominator
+                    val = (numerator / denominator * 100) if denominator > 0 else 0
+                elif m_name.startswith("t"):
                     val = stats.get('sum', 0) / 1000
                     count_metric_name = "n" + m_name[1:]
                     row[count_metric_name] = stats.get('count', 0)
@@ -156,6 +202,10 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
     if not df.empty:
         if report_type == 'detailed':
             group_cols = ["AgentName", "Username", "WorkgroupName", "Id"]
+        elif report_type == 'detailed_skill':
+            group_cols = ["AgentName", "Username", "SkillName", "SkillId", "LanguageName", "LanguageId", "WorkgroupName", "Id"]
+        elif report_type == 'workgroup_skill':
+            group_cols = ["Name", "SkillName", "LanguageName", "Id"]
         elif report_type in ['user', 'agent', 'productivity']:
             group_cols = ["Name", "Username", "Id"]
         else:
@@ -166,8 +216,15 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
         df = df.groupby(group_cols)[numeric_cols].sum().reset_index()
+
+        if "_oServiceLevelNumerator" in df.columns and "_oServiceLevelDenominator" in df.columns:
+            df["oServiceLevel"] = df.apply(
+                lambda x: (x["_oServiceLevelNumerator"] / x["_oServiceLevelDenominator"] * 100)
+                if x["_oServiceLevelDenominator"] > 0 else 0,
+                axis=1
+            )
         
-        if report_type in ['user', 'agent', 'detailed', 'productivity']:
+        if report_type in ['user', 'agent', 'detailed', 'detailed_skill', 'productivity']:
             # nOffered fix: Use nAlert as fallback, and ensure it's at least nAnswered
             if "nOffered" not in df.columns: df["nOffered"] = 0
             
@@ -176,7 +233,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         if "tHandle" in df.columns and "CountHandle" in df.columns:
             df["AvgHandle"] = df.apply(lambda x: x["tHandle"] / x["CountHandle"] if x["CountHandle"] > 0 else 0, axis=1).round(2)
 
-        helper_cols = ["ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle"]
+        helper_cols = ["ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 
@@ -263,7 +320,8 @@ def process_observations(resp, id_map, presence_map=None):
             sl_values = []
             for dp in data_points:
                 m = dp.get('metric')
-                val = dp.get('stats', {}).get('count', 0)
+                stats = dp.get('stats', {}) or {}
+                val = stats.get('count', 0)
                 qualifier = dp.get('qualifier', "")
                 
                 if m == "oWaiting": 
@@ -272,7 +330,11 @@ def process_observations(resp, id_map, presence_map=None):
                 elif m == "oInteracting": 
                     row["Interacting"][media_type] = row["Interacting"].get(media_type, 0) + val
                     row["Interacting"]["Total"] += val
-                elif m == "oServiceLevel": sl_values.append(val)
+                elif m == "oServiceLevel":
+                    numerator = stats.get('numerator', 0) or 0
+                    denominator = stats.get('denominator', 0) or 0
+                    if denominator > 0:
+                        sl_values.append((numerator / denominator) * 100)
                 elif m == "oMemberUsers": row["Members"] = max(row["Members"], val)
                 elif m == "oActiveUsers": row["ActiveUsers"] = max(row["ActiveUsers"], val)
                 elif m == "oOnQueueUsers":
@@ -300,8 +362,7 @@ def process_observations(resp, id_map, presence_map=None):
                     elif "on queue" in q_lower or "onqueue" in q_lower: row["Presences"]["On Queue"] += val
             
             if sl_values:
-                # Weighted average could be better but simple avg for now
-                row["ServiceLevel"] = round((sum(sl_values) / len(sl_values)) * 100, 1)
+                row["ServiceLevel"] = round((sum(sl_values) / len(sl_values)), 1)
 
     return list(data_map.values())
 
@@ -420,7 +481,7 @@ def process_user_details(resp, utc_offset=3):
             
     return results
 
-def process_conversation_details(response, user_map=None, queue_map=None, wrapup_map=None, include_attributes=False, utc_offset=3):
+def process_conversation_details(response, user_map=None, queue_map=None, wrapup_map=None, include_attributes=False, utc_offset=3, skill_map=None, language_map=None):
     """Flattens conversation detail JSON into a DataFrame."""
     rows = []
     if not response or 'conversations' not in response:
@@ -439,6 +500,18 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
         h, m = divmod(m, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
 
+    def map_skill_value(raw_value):
+        if raw_value is None or raw_value == "":
+            return ""
+        if isinstance(raw_value, list):
+            names = []
+            for item in raw_value:
+                key = str(item)
+                names.append(skill_map.get(key, key) if skill_map else key)
+            return ", ".join([n for n in names if n])
+        key = str(raw_value)
+        return skill_map.get(key, key) if skill_map else key
+
     for conv in response['conversations']:
         row = {
             "Id": conv.get("conversationId"),
@@ -450,6 +523,8 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
             "Queue": "",
             "Agent": "",
             "Username": "",
+            "Skill": "",
+            "Language": "",
             "Wrapup": "",
             "DisconnectType": "",
             "Duration": 0,
@@ -496,6 +571,57 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
                     if s.get("mediaType"):
                         row["MediaType"] = s.get("mediaType")
                         break
+
+            # Skill / Language (usually on segment-level requested fields)
+            if not row["Skill"] or not row["Language"]:
+                for s in p.get("sessions", []):
+                    if not row["Skill"]:
+                        skill_candidates = [
+                            s.get("requestedRoutingSkillId"),
+                            s.get("requestedRoutingSkillIds"),
+                            s.get("activeSkillId"),
+                            s.get("skillId")
+                        ]
+                        for candidate in skill_candidates:
+                            mapped = map_skill_value(candidate)
+                            if mapped:
+                                row["Skill"] = mapped
+                                break
+                    for segment in s.get("segments", []):
+                        if not row["Skill"]:
+                            skill_candidates = [
+                                segment.get("requestedRoutingSkillId"),
+                                segment.get("requestedRoutingSkillIds"),
+                                segment.get("activeSkillId"),
+                                segment.get("skillId")
+                            ]
+                            for candidate in skill_candidates:
+                                mapped = map_skill_value(candidate)
+                                if mapped:
+                                    row["Skill"] = mapped
+                                    break
+                        if not row["Language"]:
+                            lang_id = segment.get("requestedLanguageId")
+                            if lang_id:
+                                row["Language"] = language_map.get(lang_id, lang_id) if language_map else lang_id
+                        if row["Skill"] and row["Language"]:
+                            break
+                    if row["Skill"] and row["Language"]:
+                        break
+
+            # Fallback: participant attributes may carry routing skill info
+            if not row["Skill"]:
+                attrs = p.get("attributes") or {}
+                attr_skill = (
+                    attrs.get("requestedRoutingSkillId")
+                    or attrs.get("requestedRoutingSkillIds")
+                    or attrs.get("activeSkillId")
+                    or attrs.get("skillId")
+                    or attrs.get("skill")
+                )
+                mapped = map_skill_value(attr_skill)
+                if mapped:
+                    row["Skill"] = mapped
             
              # Disconnect Type (from peer/agent/external usually)
             if not row["DisconnectType"]:
@@ -559,7 +685,7 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
                          if isinstance(u_obj, dict):
                              row["Agent"] = u_obj.get("name", row["Agent"] or uid)
                              if u_obj.get("username"):
-                                 row["Username"] = u_obj.get("username").split("@")[0]
+                                 row["Username"] = format_report_username(u_obj.get("username"), uid)
                          else:
                              row["Agent"] = str(u_obj)
                 
@@ -686,7 +812,17 @@ def to_csv(df):
 def to_parquet(df):
     from io import BytesIO
     output = BytesIO()
-    df.to_parquet(output, index=False)
+    try:
+        df.to_parquet(output, index=False)
+    except Exception:
+        safe_df = df.copy()
+        for col in safe_df.select_dtypes(include=["object"]).columns:
+            non_null = safe_df[col].dropna()
+            has_non_text = non_null.map(lambda v: not isinstance(v, (str, bytes))).any() if not non_null.empty else False
+            if has_non_text:
+                safe_df[col] = safe_df[col].map(lambda v: None if pd.isna(v) else str(v))
+        output = BytesIO()
+        safe_df.to_parquet(output, index=False)
     return output.getvalue()
 
 def to_pdf(df, title="Report"):
