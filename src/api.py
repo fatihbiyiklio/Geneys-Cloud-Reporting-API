@@ -43,34 +43,44 @@ class GenesysAPI:
             monitor.log_error("API_GET", f"System Error on {path}", str(e))
             raise e
 
-    def _post(self, path, data):
+    def _post(self, path, data, timeout=10, retries=0, retry_sleep=0.4):
         start = time.monotonic()
         headers = self.headers
-        try:
-            response = _session.post(f"{self.api_host}{path}", headers=headers, json=data, timeout=10)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="POST", status_code=response.status_code, duration_ms=duration_ms)
-            response.raise_for_status()
-            if response.status_code == 204 or not response.content:
-                return {"status": response.status_code}
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
+        attempts = max(0, int(retries)) + 1
+        for attempt in range(attempts):
             try:
-                status_code = response.status_code
-            except Exception:
-                status_code = None
-            monitor.log_api_call(path, method="POST", status_code=status_code, duration_ms=duration_ms)
-            monitor.log_error("API_POST", f"HTTP {response.status_code} on {path}", str(e))
-            if response.status_code == 401:
-                 monitor.log_error("API_POST", "Token expired (401) on POST.")
-                 raise e
-            raise e
-        except Exception as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="POST", status_code=None, duration_ms=duration_ms)
-            monitor.log_error("API_POST", f"System Error on {path}", str(e))
-            raise e
+                response = _session.post(f"{self.api_host}{path}", headers=headers, json=data, timeout=timeout)
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="POST", status_code=response.status_code, duration_ms=duration_ms)
+                response.raise_for_status()
+                if response.status_code == 204 or not response.content:
+                    return {"status": response.status_code}
+                return response.json()
+            except requests.exceptions.ReadTimeout as e:
+                if attempt < (attempts - 1):
+                    time.sleep(retry_sleep * (attempt + 1))
+                    continue
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="POST", status_code=None, duration_ms=duration_ms)
+                monitor.log_error("API_POST", f"Read timeout on {path}", str(e))
+                raise e
+            except requests.exceptions.HTTPError as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                try:
+                    status_code = response.status_code
+                except Exception:
+                    status_code = None
+                monitor.log_api_call(path, method="POST", status_code=status_code, duration_ms=duration_ms)
+                monitor.log_error("API_POST", f"HTTP {response.status_code} on {path}", str(e))
+                if response.status_code == 401:
+                    monitor.log_error("API_POST", "Token expired (401) on POST.")
+                    raise e
+                raise e
+            except Exception as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="POST", status_code=None, duration_ms=duration_ms)
+                monitor.log_error("API_POST", f"System Error on {path}", str(e))
+                raise e
 
     def _put(self, path, data):
         start = time.monotonic()
@@ -410,7 +420,7 @@ class GenesysAPI:
                     "order": order,
                     "orderBy": "conversationStart"
                 }
-                data = self._post("/api/v2/analytics/conversations/details/query", query)
+                data = self._post("/api/v2/analytics/conversations/details/query", query, timeout=20, retries=1)
                 page = data.get("conversations") or []
                 if page:
                     conversations.extend(page)

@@ -817,7 +817,7 @@ st.markdown("""
         transition: none !important;
     }
 
-    /* Keep previous data fully visible during rerun/refresh */
+    /* Keep previous data visible during rerun on the same page */
     [data-stale="true"] {
         opacity: 1 !important;
         filter: none !important;
@@ -828,6 +828,7 @@ st.markdown("""
         filter: none !important;
         -webkit-filter: none !important;
     }
+
     .stSkeleton, [data-testid="stSkeleton"], [class*="skeleton"] {
         display: none !important;
         visibility: hidden !important;
@@ -1641,6 +1642,39 @@ def _get_session_id():
         st.session_state._session_id = str(uuid.uuid4())
     return st.session_state._session_id
 
+def _clear_live_panel_caches(org_code):
+    try:
+        # Clear page-local panel timers/caches
+        for k in [
+            "_call_panel_last_snapshot_ts",
+            "_call_panel_last_meta_poll_ts",
+            "_call_panel_last_reconcile_ts",
+            "_call_panel_last_reconcile_ids",
+        ]:
+            st.session_state.pop(k, None)
+
+        # Clear shared seed/meta for this org
+        store = _shared_seed_store()
+        with store["lock"]:
+            org_data = store.get("orgs", {}).get(org_code) or {}
+            org_data["call_seed_ts"] = 0
+            org_data["call_seed_data"] = []
+            org_data["call_meta"] = {}
+
+        # Clear notif manager caches for this org
+        notif_store = _shared_notif_store()
+        with notif_store["lock"]:
+            global_nm = notif_store.get("global", {}).get(org_code)
+            if global_nm and hasattr(global_nm, "active_conversations"):
+                with global_nm._lock:
+                    global_nm.active_conversations = {}
+            call_nm = notif_store.get("call", {}).get(org_code)
+            if call_nm and hasattr(call_nm, "waiting_calls"):
+                with call_nm._lock:
+                    call_nm.waiting_calls = {}
+    except Exception:
+        pass
+
 def _register_org_session_queues(org_code, queues_map, agent_queues_map, max_orgs=20):
     store = _shared_org_session_store()
     now = pytime.time()
@@ -2139,6 +2173,14 @@ lang = st.session_state.language
 org = st.session_state.app_user.get('org_code', 'default')
 page = st.session_state.page
 role = st.session_state.app_user.get('role', 'User')
+
+# On page change, clear live panel caches to avoid stale carry-over between pages.
+prev_page = st.session_state.get("_prev_page")
+if prev_page is None:
+    st.session_state["_prev_page"] = page
+elif prev_page != page:
+    _clear_live_panel_caches(org)
+    st.session_state["_prev_page"] = page
 
 # Block only reports/dashboard if API is missing
 if page in [get_text(lang, "menu_reports"), get_text(lang, "menu_dashboard")] and not st.session_state.api_client:
@@ -4394,8 +4436,9 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             elif not st.session_state.get('api_client'):
                 st.warning(get_text(lang, "genesys_not_connected"))
             else:
-                # Keep live updates on, but at a calmer interval to reduce visual flicker
-                _safe_autorefresh(interval=6000, key="call_panel_fast_refresh")
+                refresh_s = int(st.session_state.get('org_config', {}).get('refresh_interval', 15) or 15)
+                refresh_s = max(3, refresh_s)
+                _safe_autorefresh(interval=refresh_s * 1000, key="call_panel_fast_refresh")
                 now_ts = pytime.time()
                 queue_id_to_name = {v: k for k, v in st.session_state.queues_map.items()}
 
@@ -4417,14 +4460,14 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
                 # Basic model: WS is primary, periodic API snapshot fully replaces cache.
                 last_snapshot_ts = st.session_state.get("_call_panel_last_snapshot_ts", 0)
-                should_snapshot = notif_stale or (now_ts - last_snapshot_ts >= 20)
+                should_snapshot = notif_stale or (now_ts - last_snapshot_ts >= refresh_s)
                 if should_snapshot:
                     try:
                         snapshot_started_ts = pytime.time()
                         api = GenesysAPI(st.session_state.api_client)
                         end_dt = datetime.now(timezone.utc)
                         start_dt = end_dt - timedelta(minutes=15)
-                        convs = api.get_conversation_details_recent(start_dt, end_dt, page_size=100, max_pages=2, order="desc")
+                        convs = api.get_conversation_details_recent(start_dt, end_dt, page_size=50, max_pages=1, order="desc")
                         snapshot_calls = _build_active_calls(
                             [c for c in (convs or []) if not c.get("conversationEnd")],
                             lang,
@@ -4465,7 +4508,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     except Exception:
                         pass
 
-                active_conversations = global_notif.get_active_conversations(max_age_seconds=45)
+                active_conversations = global_notif.get_active_conversations(max_age_seconds=300)
                 for c in active_conversations:
                     if "state" not in c:
                         c["state"] = "waiting"
@@ -4490,11 +4533,11 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
                 if missing_ids:
                     meta_poll_last = st.session_state.get("_call_panel_last_meta_poll_ts", 0)
-                    if (now_ts - meta_poll_last) >= 2:
+                    if (now_ts - meta_poll_last) >= refresh_s:
                         try:
                             api = GenesysAPI(st.session_state.api_client)
                             users_info = st.session_state.get("users_info") or {}
-                            for cid in missing_ids[:3]:
+                            for cid in missing_ids[:2]:
                                 meta = _fetch_conversation_meta(api, cid, queue_id_to_name, users_info=users_info)
                                 if meta:
                                     if meta.get("ended"):
@@ -4517,7 +4560,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         combined.pop(cid, None)
                         continue
                     lu = item.get("last_update", 0) or 0
-                    if lu and (now_ts - lu) > 45:
+                    if lu and (now_ts - lu) > 300:
                         combined.pop(cid, None)
                         continue
 
