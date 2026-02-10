@@ -367,13 +367,31 @@ def _classify_conversation_state(conv):
 
 def _extract_direction_label(conv):
     direction = (conv or {}).get("originatingDirection") or (conv or {}).get("direction")
-    if not direction:
-        return None
-    direction = str(direction).lower()
-    if "inbound" in direction:
+    if direction:
+        direction = str(direction).lower()
+    if direction and "inbound" in direction:
         return "Inbound"
-    if "outbound" in direction:
+    if direction and "outbound" in direction:
         return "Outbound"
+    participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
+    has_external = False
+    has_agent = False
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose == "outbound":
+            return "Outbound"
+        if purpose in ["external", "customer"]:
+            has_external = True
+        if purpose in ["agent", "user"]:
+            has_agent = True
+        for s in p.get("sessions", []) or []:
+            sd = (s.get("direction") or "").lower()
+            if sd == "inbound":
+                return "Inbound"
+            if sd == "outbound":
+                return "Outbound"
+    if has_external and has_agent:
+        return "Inbound"
     return None
 
 def _extract_queue_name_from_conv(conv, queue_id_to_name=None):
@@ -506,6 +524,14 @@ def _merge_call(existing, incoming):
     for k, v in (incoming or {}).items():
         if v is None or v == "":
             continue
+        if k == "media_type":
+            existing_mt = str(existing.get("media_type") or "").lower()
+            incoming_mt = str(v).lower()
+            # Never downgrade callback to voice
+            if existing_mt == "callback" and incoming_mt == "voice":
+                continue
+            merged[k] = v
+            continue
         if k == "queue_name":
             if _is_generic_queue_name(v) and not _is_generic_queue_name(existing.get("queue_name")):
                 continue
@@ -529,16 +555,31 @@ def _fetch_conversation_meta(api, conv_id, queue_id_to_name, users_info=None):
         conv = None
     if not conv:
         return None
+    if conv.get("conversationEnd"):
+        return {
+            "conversation_id": conv_id,
+            "ended": True,
+        }
     queue_id = _extract_queue_id_from_conv(conv)
     queue_name = _extract_queue_name_from_conv(conv, queue_id_to_name)
     agent_id = _extract_agent_id_from_conv(conv)
     agent_name = _extract_agent_name_from_conv(conv)
     if not agent_name and agent_id and users_info:
         agent_name = users_info.get(agent_id, {}).get("name")
+    phone = _extract_phone_from_conv(conv)
+    direction_label = _extract_direction_label(conv)
+    ivr_attrs = _extract_ivr_attributes(conv)
+    wg = _extract_workgroup_from_attrs(ivr_attrs) or queue_name
     return {
         "conversation_id": conv_id,
         "queue_id": queue_id,
         "queue_name": queue_name,
+        "phone": phone,
+        "direction": conv.get("originatingDirection") or conv.get("direction"),
+        "direction_label": direction_label,
+        "wg": wg,
+        "media_type": _extract_media_type(conv),
+        "ended": False,
         "agent_id": agent_id,
         "agent_name": agent_name,
     }
@@ -622,6 +663,19 @@ def _format_ivr_display(ivr_attrs):
             display_key = key.split(".")[-1] if "." in key else key
             return f"{display_key}: {val}"
     
+    return None
+
+def _extract_workgroup_from_attrs(ivr_attrs):
+    if not isinstance(ivr_attrs, dict):
+        return None
+    priority_keys = ["workgroup", "wg", "departman", "department", "menu", "selection", "secim"]
+    for pkey in priority_keys:
+        for key, val in ivr_attrs.items():
+            if not val:
+                continue
+            key_l = str(key).lower()
+            if pkey in key_l:
+                return str(val)
     return None
 
 def _build_active_calls(conversations, lang, queue_id_to_name=None, users_info=None):
@@ -742,31 +796,10 @@ st.markdown("""
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     html, body, [data-testid="stAppViewContainer"] { font-family: 'Inter', sans-serif !important; background-color: #ffffff !important; }
     
-    /* Prevent flicker/blur during Streamlit rerun - comprehensive fix */
+    /* Keep rendering stable without forcing GPU/opacity hacks */
     [data-testid="stAppViewContainer"] {
-        backface-visibility: hidden !important;
-        -webkit-backface-visibility: hidden !important;
-        transform: translateZ(0);
-        -webkit-transform: translateZ(0);
-        -webkit-font-smoothing: subpixel-antialiased !important;
-    }
-    
-    /* Hide Streamlit running indicator that causes blur effect */
-    div[data-testid="stStatusWidget"] {
-        visibility: hidden !important;
-        opacity: 0 !important;
-        display: none !important;
-    }
-    
-    /* Prevent blur filter on any element during loading */
-    [data-testid="stAppViewContainer"] .main,
-    [data-testid="stAppViewContainer"] .block-container,
-    [data-testid="stVerticalBlock"],
-    [data-testid="stHorizontalBlock"],
-    [data-testid="column"] {
-        filter: none !important;
-        -webkit-filter: none !important;
-        opacity: 1 !important;
+        -webkit-font-smoothing: antialiased !important;
+        text-rendering: optimizeLegibility;
     }
     
     /* Disable ALL skeleton loading animations and transitions */
@@ -783,18 +816,26 @@ st.markdown("""
         animation: none !important;
         transition: none !important;
     }
-    
-    /* Disable streamlit's skeleton placeholder blur */
-    .stSkeleton, [data-testid="stSkeleton"] {
+
+    /* Keep previous data fully visible during rerun/refresh */
+    [data-stale="true"] {
+        opacity: 1 !important;
+        filter: none !important;
+        -webkit-filter: none !important;
+    }
+    [data-stale="true"] * {
+        opacity: 1 !important;
+        filter: none !important;
+        -webkit-filter: none !important;
+    }
+    .stSkeleton, [data-testid="stSkeleton"], [class*="skeleton"] {
         display: none !important;
         visibility: hidden !important;
+        opacity: 0 !important;
     }
-    
-    /* Prevent rerun blur overlay */
-    .stApp > div:first-child::before,
-    .stApp > div:first-child::after {
+    div[data-testid="stStatusWidget"] {
         display: none !important;
-        filter: none !important;
+        visibility: hidden !important;
     }
     
     [data-testid="stAppViewContainer"] > .main { padding-top: 0.5rem !important; }
@@ -1499,15 +1540,27 @@ def _update_call_meta(org_code, calls, now_ts, max_items=300):
                 continue
             qname = c.get("queue_name")
             qid = c.get("queue_id")
+            phone = c.get("phone")
+            direction = c.get("direction")
+            direction_label = c.get("direction_label")
+            wg = c.get("wg")
             agent_id = c.get("agent_id")
             agent_name = c.get("agent_name")
-            if not qname and not qid and not agent_id and not agent_name:
+            if not qname and not qid and not phone and not direction and not direction_label and not wg and not agent_id and not agent_name:
                 continue
             entry = meta.get(cid, {})
             if qname and not _is_generic_queue_name(qname):
                 entry["queue_name"] = qname
             if qid:
                 entry["queue_id"] = qid
+            if phone:
+                entry["phone"] = phone
+            if direction:
+                entry["direction"] = direction
+            if direction_label:
+                entry["direction_label"] = direction_label
+            if wg:
+                entry["wg"] = wg
             if agent_id:
                 entry["agent_id"] = agent_id
             if agent_name:
@@ -3657,9 +3710,9 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         if st.session_state.dashboard_mode == "Live":
             # DataManager is managed centrally by refresh_data_manager_queues()
             # which is called on login, hot-reload, and config changes.
-            # Get dynamic interval (default 10s)
             ref_int = st.session_state.get('org_config', {}).get('refresh_interval', 15)
-            if auto_ref: _safe_autorefresh(interval=ref_int * 1000, key="data_refresh")
+            if auto_ref:
+                _safe_autorefresh(interval=ref_int * 1000, key="data_refresh")
 
     # Available metric options
     # Available metric options
@@ -4275,18 +4328,6 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
             st.markdown("""
                 <style>
-                    /* Prevent panel flicker during refresh */
-                    [data-testid="column"]:has(.call-card) {
-                        content-visibility: auto;
-                        contain-intrinsic-size: auto 500px;
-                        backface-visibility: hidden;
-                        -webkit-backface-visibility: hidden;
-                    }
-                    .call-panel-container {
-                        min-height: 100px;
-                        will-change: auto;
-                        transform: translateZ(0);
-                    }
                     .call-card {
                         padding: 6px 10px !important;
                         margin-bottom: 6px !important;
@@ -4353,109 +4394,134 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             elif not st.session_state.get('api_client'):
                 st.warning(get_text(lang, "genesys_not_connected"))
             else:
+                # Keep live updates on, but at a calmer interval to reduce visual flicker
+                _safe_autorefresh(interval=6000, key="call_panel_fast_refresh")
                 now_ts = pytime.time()
                 queue_id_to_name = {v: k for k, v in st.session_state.queues_map.items()}
-                
+
                 # ========================================
-                # QUEUE-INDEPENDENT CALL PANEL
-                # Uses GlobalConversationNotificationManager
-                # Monitors ALL org conversations (not queue-specific)
-                # Hybrid: API seed + periodic refresh + WebSocket updates
+                # QUEUE-INDEPENDENT CALL PANEL (org-wide)
+                # Hybrid: API seed + WebSocket updates
+                # Seed/refresh logic aligned with agent panel
                 # ========================================
-                
-                # 1. Get/Create Global Conversation Manager (org-wide, queue-independent)
                 global_notif = ensure_global_conversation_manager()
                 global_notif.update_client(st.session_state.api_client, st.session_state.queues_map)
-                
-                # 2. Subscribe to ALL queue conversation topics
+
                 all_queue_ids = list(st.session_state.queues_map.values()) if st.session_state.get("queues_map") else []
                 global_topics = [f"v2.routing.queues.{qid}.conversations" for qid in all_queue_ids if qid]
                 global_notif.start(global_topics)
-                
-                # 3. Periodic API refresh (cold start + every 30s fallback)
-                # WebSocket may miss events with 500+ topics, so we supplement with API
-                CALL_PANEL_REFRESH_INTERVAL = 30  # seconds
-                last_seed_ts = st.session_state.get("_call_panel_last_seed_ts", 0)
-                time_since_seed = now_ts - last_seed_ts
-                needs_refresh = time_since_seed >= CALL_PANEL_REFRESH_INTERVAL or last_seed_ts == 0
-                
-                if needs_refresh:
+
+                last_msg = getattr(global_notif, "last_message_ts", 0)
+                last_evt = getattr(global_notif, "last_event_ts", 0)
+                notif_stale = (not global_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > 30)
+
+                # Basic model: WS is primary, periodic API snapshot fully replaces cache.
+                last_snapshot_ts = st.session_state.get("_call_panel_last_snapshot_ts", 0)
+                should_snapshot = notif_stale or (now_ts - last_snapshot_ts >= 20)
+                if should_snapshot:
                     try:
+                        snapshot_started_ts = pytime.time()
                         api = GenesysAPI(st.session_state.api_client)
                         end_dt = datetime.now(timezone.utc)
                         start_dt = end_dt - timedelta(minutes=15)
                         convs = api.get_conversation_details_recent(start_dt, end_dt, page_size=100, max_pages=2, order="desc")
-                        
-                        # Filter active conversations
-                        active_convs = [c for c in (convs or []) if not c.get("conversationEnd")]
-                        
-                        seed_calls = []
-                        for conv in active_convs:
-                            conv_id = conv.get("conversationId") or conv.get("id")
-                            if not conv_id:
-                                continue
-                            
-                            queue_id = _extract_queue_id_from_conv(conv)
-                            queue_name = _extract_queue_name_from_conv(conv, queue_id_to_name)
-                            if not queue_name and queue_id:
-                                queue_name = queue_id_to_name.get(queue_id)
-                            queue_name = queue_name or "-"
-                            
-                            wait_s = _extract_wait_seconds(conv)
-                            if wait_s is None:
-                                wait_s = _seconds_since(conv.get("conversationStart"))
-                            
-                            state = _classify_conversation_state(conv)
-                            agent_id = _extract_agent_id_from_conv(conv)
-                            agent_name = _extract_agent_name_from_conv(conv)
-                            if not agent_name and agent_id and st.session_state.get("users_info"):
-                                agent_name = st.session_state.users_info.get(agent_id, {}).get("name")
-                            
-                            ivr_attrs = _extract_ivr_attributes(conv)
-                            ivr_display = _format_ivr_display(ivr_attrs)
-                            
-                            seed_calls.append({
-                                "conversation_id": conv_id,
-                                "queue_id": queue_id,
-                                "queue_name": queue_name,
-                                "wait_seconds": wait_s,
-                                "phone": _extract_phone_from_conv(conv),
-                                "state": state,
-                                "agent_id": agent_id,
-                                "agent_name": agent_name,
-                                "media_type": _extract_media_type(conv),
-                                "direction": conv.get("originatingDirection"),
-                                "ivr_selection": ivr_display,
-                                "ivr_attrs": ivr_attrs,
-                            })
-                        
-                        # Upsert into manager (merge with WS data)
-                        if seed_calls:
-                            global_notif.seed_conversations(seed_calls)
-                        
-                        # Remove conversations that ended (API shows them as ended but WS may not have sent disconnect)
-                        active_conv_ids = {c["conversation_id"] for c in seed_calls}
+                        snapshot_calls = _build_active_calls(
+                            [c for c in (convs or []) if not c.get("conversationEnd")],
+                            lang,
+                            queue_id_to_name=queue_id_to_name,
+                            users_info=st.session_state.get("users_info"),
+                        )
+                        now_update = pytime.time()
+                        for c in snapshot_calls:
+                            c.setdefault("state", "waiting")
+                            c.setdefault("wg", c.get("queue_name"))
+                            c["last_update"] = now_update
+                            if not c.get("media_type"):
+                                c["media_type"] = _extract_media_type(c)
+                        new_map = {c.get("conversation_id"): c for c in snapshot_calls if c.get("conversation_id")}
                         with global_notif._lock:
-                            stale_ids = [k for k in global_notif.active_conversations if k not in active_conv_ids]
-                            for k in stale_ids:
-                                # Only remove if older than 60s (give WS time to update)
-                                entry = global_notif.active_conversations.get(k)
-                                if entry and (now_ts - entry.get("last_update", 0)) > 60:
-                                    global_notif.active_conversations.pop(k, None)
-                        
-                        st.session_state["_call_panel_last_seed_ts"] = now_ts
+                            existing_map = dict(global_notif.active_conversations or {})
+                            merged_map = {}
+
+                            # 1) Start from snapshot, but never overwrite fresher WS data.
+                            for cid, snap_item in new_map.items():
+                                ex = existing_map.get(cid) or {}
+                                ex_ts = ex.get("last_update", 0) or 0
+                                if ex and ex_ts > snapshot_started_ts:
+                                    merged_map[cid] = ex
+                                else:
+                                    merged_map[cid] = _merge_call(ex, snap_item) if ex else snap_item
+
+                            # 2) Keep very fresh WS-only items that may lag in analytics snapshot.
+                            for cid, ex in existing_map.items():
+                                if cid in merged_map:
+                                    continue
+                                ex_ts = ex.get("last_update", 0) or 0
+                                if ex_ts and (snapshot_started_ts - ex_ts) <= 30:
+                                    merged_map[cid] = ex
+
+                            global_notif.active_conversations = merged_map
+                        st.session_state["_call_panel_last_snapshot_ts"] = now_ts
                     except Exception:
                         pass
-                
-                # 4. Get merged data (API seed + WS updates)
-                active_conversations = global_notif.get_active_conversations()
-                
-                # 5. Ensure state field exists
+
+                active_conversations = global_notif.get_active_conversations(max_age_seconds=45)
                 for c in active_conversations:
                     if "state" not in c:
                         c["state"] = "waiting"
-                
-                waiting_calls = active_conversations
+                    if "wg" not in c or not c.get("wg"):
+                        c["wg"] = c.get("queue_name")
+
+                combined = {}
+                for c in active_conversations:
+                    cid = c.get("conversation_id")
+                    if cid:
+                        combined[cid] = dict(c)
+
+                # Small enrichment pass for missing queue/phone/direction fields.
+                missing_ids = []
+                for cid, item in combined.items():
+                    has_queue = bool(item.get("queue_name")) and not _is_generic_queue_name(item.get("queue_name"))
+                    has_wg = bool(item.get("wg"))
+                    has_phone = bool(item.get("phone"))
+                    has_direction = bool(item.get("direction_label")) or bool(item.get("direction"))
+                    if not (has_queue and has_wg and has_phone and has_direction):
+                        missing_ids.append(cid)
+
+                if missing_ids:
+                    meta_poll_last = st.session_state.get("_call_panel_last_meta_poll_ts", 0)
+                    if (now_ts - meta_poll_last) >= 2:
+                        try:
+                            api = GenesysAPI(st.session_state.api_client)
+                            users_info = st.session_state.get("users_info") or {}
+                            for cid in missing_ids[:3]:
+                                meta = _fetch_conversation_meta(api, cid, queue_id_to_name, users_info=users_info)
+                                if meta:
+                                    if meta.get("ended"):
+                                        combined.pop(cid, None)
+                                        try:
+                                            with global_notif._lock:
+                                                global_notif.active_conversations.pop(cid, None)
+                                        except Exception:
+                                            pass
+                                        continue
+                                    combined[cid] = _merge_call(combined.get(cid), meta)
+                        except Exception:
+                            pass
+                        st.session_state["_call_panel_last_meta_poll_ts"] = now_ts
+
+                # Final cleanup.
+                for cid in list(combined.keys()):
+                    item = combined.get(cid) or {}
+                    if item.get("ended"):
+                        combined.pop(cid, None)
+                        continue
+                    lu = item.get("last_update", 0) or 0
+                    if lu and (now_ts - lu) > 45:
+                        combined.pop(cid, None)
+                        continue
+
+                waiting_calls = list(combined.values())
 
                 if group_queues:
                     waiting_calls = [c for c in waiting_calls if c.get("queue_name") in group_queues]
@@ -4483,6 +4549,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         conv_id = item.get("conversation_id")
                         conv_short = conv_id[-6:] if conv_id and len(conv_id) > 6 else conv_id
                         phone = item.get("phone")
+                        wg = item.get("wg")
                         direction_label = item.get("direction_label")
                         state_label = item.get("state_label")
                         media_type = item.get("media_type")
@@ -4496,7 +4563,6 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                 direction_label = "Inbound"
                             elif "outbound" in d:
                                 direction_label = "Outbound"
-                        # Show callback as media type label if applicable
                         if media_type and media_type.lower() == "callback":
                             media_type = "Callback"
                             if not direction_label:
@@ -4508,6 +4574,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         state_label = "Bağlandı" if is_interacting else "Bekleyen"
                         if agent_name and is_interacting:
                             meta_parts.append(f"Agent: {agent_name}")
+                        if wg and str(wg).strip() and str(wg).strip().lower() != str(queue_display).strip().lower():
+                            meta_parts.append(f"WG: {wg}")
                         if ivr_selection:
                             meta_parts.append(f"🔢 {ivr_selection}")
                         if direction_label:

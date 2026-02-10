@@ -1173,6 +1173,9 @@ class GlobalConversationNotificationManager:
                     break
             if active:
                 break
+        if not active and _is_callback_event(event) and not event.get("conversationEnd"):
+            # Callback requests can be waiting without an active session state yet.
+            active = True
 
         if event.get("conversationEnd") or not active:
             with self._lock:
@@ -1182,7 +1185,7 @@ class GlobalConversationNotificationManager:
         queue_name = None
         queue_id = topic_queue_id  # From the topic itself
         wait_seconds = None
-        ivr_attrs = {}
+        ivr_attrs = _collect_ivr_attrs(event)
         ivr_name = None
         
         # If we got queue_id from topic, resolve its name immediately
@@ -1191,13 +1194,6 @@ class GlobalConversationNotificationManager:
         
         for p in event.get("participants", []) or []:
             purpose = (p.get("purpose") or "").lower()
-            
-            # Extract participant attributes (IVR/workgroup data)
-            p_attrs = p.get("attributes") or {}
-            if p_attrs:
-                for key, val in p_attrs.items():
-                    if val:
-                        ivr_attrs[key] = val
             
             # IVR participant name = IVR/flow name (workgroup bilgisi)
             if purpose == "ivr" and p.get("name"):
@@ -1223,6 +1219,18 @@ class GlobalConversationNotificationManager:
                     queue_name = p_name
                     
                 for s in p.get("sessions", []) or []:
+                    if not q_id:
+                        s_qid = s.get("queueId") or s.get("routingQueueId")
+                        if not s_qid:
+                            for seg in s.get("segments", []) or []:
+                                s_qid = seg.get("queueId") or ((seg.get("queue") or {}).get("id") if isinstance(seg.get("queue"), dict) else None)
+                                if s_qid:
+                                    break
+                        if s_qid:
+                            queue_id = s_qid
+                            queue_name = self.queue_id_to_name.get(s_qid) or s.get("queueName") or p_name or queue_name
+                    if not queue_name:
+                        queue_name = s.get("queueName") or queue_name
                     if wait_seconds is None:
                         wait_seconds = _parse_wait_seconds(s.get("connectedTime") or s.get("startTime"))
                     if _session_is_active(s):
@@ -1243,6 +1251,11 @@ class GlobalConversationNotificationManager:
         media_type = _extract_media_type(event)
         agent_id, agent_name = _extract_agent_identity(event)
         direction = event.get("originatingDirection") or event.get("direction")
+        direction_label = _direction_label(direction)
+        if not direction_label:
+            direction_label = _infer_direction_from_event(event)
+            if direction_label and not direction:
+                direction = direction_label.lower()
         state = _classify_conversation_state(event)
         
         # Format IVR display
@@ -1264,14 +1277,18 @@ class GlobalConversationNotificationManager:
                         ivr_display = f"{display_key}: {val}"
                         break
 
+        wg = _extract_workgroup(ivr_attrs) or queue_name
+
         with self._lock:
             self.active_conversations[conv_id] = {
                 "conversation_id": conv_id,
                 "queue_id": queue_id,
                 "queue_name": queue_name,
+                "wg": wg,
                 "wait_seconds": wait_seconds,
                 "phone": _extract_phone(event),
                 "direction": direction,
+                "direction_label": direction_label,
                 "state": state,
                 "agent_id": agent_id,
                 "agent_name": agent_name,
@@ -1302,36 +1319,164 @@ def _parse_wait_seconds(val):
     return None
 
 def _extract_phone(event):
+    def _clean(v):
+        return str(v).replace("tel:", "").replace("sip:", "").strip()
+
+    def _is_phone(v):
+        if not v:
+            return False
+        digits = "".join(ch for ch in _clean(v) if ch.isdigit())
+        return len(digits) >= 7
+
     try:
         participants = event.get("participants", []) or []
         for p in participants:
             purpose = (p.get("purpose") or "").lower()
             if purpose in ["external", "customer", "outbound"]:
-                for k in ["ani", "dnis", "address", "addressOther", "name"]:
+                for k in ["ani", "addressOther", "address", "name", "callerId"]:
                     v = p.get(k)
-                    if v:
-                        return str(v).replace("tel:", "").replace("sip:", "")
+                    if _is_phone(v):
+                        return _clean(v)
                 for s in p.get("sessions", []) or []:
-                    for k in ["ani", "dnis", "address", "addressOther"]:
+                    for k in ["ani", "addressOther", "address", "callerId"]:
                         v = s.get(k)
-                        if v:
-                            return str(v).replace("tel:", "").replace("sip:", "")
+                        if _is_phone(v):
+                            return _clean(v)
     except Exception:
         return None
+    return None
+
+def _extract_workgroup(attrs):
+    if not isinstance(attrs, dict):
+        return None
+    priority_keys = ["workgroup", "wg", "departman", "department", "menu", "selection", "secim"]
+    for pkey in priority_keys:
+        for key, val in attrs.items():
+            if not val:
+                continue
+            if pkey in str(key).lower():
+                return str(val)
+    return None
+
+def _collect_ivr_attrs(event):
+    attrs = {}
+    if not isinstance(event, dict):
+        return attrs
+
+    conv_attrs = event.get("attributes") or {}
+    if isinstance(conv_attrs, dict):
+        for key, val in conv_attrs.items():
+            if val is not None and str(val).strip() != "":
+                attrs[key] = val
+
+    participants = event.get("participants", []) or []
+    for p in participants:
+        p_attrs = p.get("attributes") or {}
+        if isinstance(p_attrs, dict):
+            for key, val in p_attrs.items():
+                if val is not None and str(val).strip() != "":
+                    attrs[key] = val
+        for s in p.get("sessions", []) or []:
+            s_attrs = s.get("attributes") or {}
+            if isinstance(s_attrs, dict):
+                for key, val in s_attrs.items():
+                    if val is not None and str(val).strip() != "":
+                        attrs[key] = val
+            for seg in s.get("segments", []) or []:
+                seg_attrs = seg.get("attributes") or {}
+                if isinstance(seg_attrs, dict):
+                    for key, val in seg_attrs.items():
+                        if val is not None and str(val).strip() != "":
+                            attrs[key] = val
+                if seg.get("flowOutcome"):
+                    attrs["flowOutcome"] = seg.get("flowOutcome")
+                if seg.get("flowOutcomeValue"):
+                    attrs["flowOutcomeValue"] = seg.get("flowOutcomeValue")
+    return attrs
+
+def _direction_label(direction):
+    if not direction:
+        return None
+    d = str(direction).lower()
+    if "inbound" in d:
+        return "Inbound"
+    if "outbound" in d:
+        return "Outbound"
+    return None
+
+def _infer_direction_from_event(event):
+    if not isinstance(event, dict):
+        return None
+    participants = event.get("participants", []) or []
+    has_external = False
+    has_agent = False
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose == "outbound":
+            return "Outbound"
+        if purpose in ["external", "customer"]:
+            has_external = True
+        if purpose in ["agent", "user"]:
+            has_agent = True
+        for s in p.get("sessions", []) or []:
+            sd = (s.get("direction") or "").lower()
+            if sd == "outbound":
+                return "Outbound"
+            if sd == "inbound":
+                return "Inbound"
+    if has_external and has_agent:
+        return "Inbound"
     return None
 
 def _extract_media_type(event):
     if not isinstance(event, dict):
         return None
-    if event.get("mediaType"):
-        return event.get("mediaType")
+    mt = event.get("mediaType")
+    if mt:
+        if str(mt).lower() == "voice" and _is_callback_event(event):
+            return "callback"
+        if str(mt).lower() == "callback":
+            return "callback"
+        return mt
+    if _is_callback_event(event):
+        return "callback"
     participants = event.get("participants", []) or []
     for p in participants:
         for s in p.get("sessions", []) or []:
             mt = s.get("mediaType")
             if mt:
+                if str(mt).lower() == "voice" and _is_callback_event(event):
+                    return "callback"
+                if str(mt).lower() == "callback":
+                    return "callback"
                 return mt
     return None
+
+def _is_callback_event(event):
+    if not isinstance(event, dict):
+        return False
+    attrs = _collect_ivr_attrs(event)
+    for key, val in attrs.items():
+        if "callback" in str(key).lower() and val is not None and str(val).strip() != "":
+            return True
+
+    participants = event.get("participants", []) or []
+    for p in participants:
+        purpose = (p.get("purpose") or "").lower()
+        if purpose == "outbound":
+            return True
+        p_attrs = p.get("attributes") or {}
+        for key, val in p_attrs.items():
+            if "callback" in str(key).lower() and val is not None and str(val).strip() != "":
+                return True
+        for s in p.get("sessions", []) or []:
+            mt = (s.get("mediaType") or "").lower()
+            if mt == "callback":
+                return True
+            direction = (s.get("direction") or "").lower()
+            if direction == "outbound" and purpose in ["agent", "user"]:
+                return True
+    return False
 
 def _extract_agent_name(event):
     participants = event.get("participants", []) or []
