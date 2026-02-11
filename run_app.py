@@ -5,6 +5,7 @@ import time
 import platform
 import subprocess
 import socket
+import streamlit.web.cli as stcli
 
 def resolve_path(path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
@@ -18,8 +19,27 @@ def resolve_path(path):
 
 PID_FILE = ".app.pid"
 LOCK_FILE = ".app.lock"
+CHILD_FLAG = "--streamlit-child"
 
 _lock_handle = None
+
+def run_streamlit_child():
+    """Run Streamlit in child mode inside this process."""
+    if len(sys.argv) < 3:
+        print("Missing app path for child mode.")
+        sys.exit(2)
+    app_path = sys.argv[2]
+    extra_args = sys.argv[3:]
+    argv = ["streamlit", "run", app_path] + extra_args
+    old_argv = sys.argv[:]
+    sys.argv = argv
+    try:
+        stcli.main()
+        return 0
+    except SystemExit as e:
+        return e.code or 0
+    finally:
+        sys.argv = old_argv
 
 def acquire_single_instance_lock():
     """Prevent multiple instances from running at the same time."""
@@ -83,6 +103,10 @@ def check_single_instance():
 
 if __name__ == "__main__":
     import psutil
+
+    # Child process mode: do not acquire single-instance lock.
+    if len(sys.argv) > 1 and sys.argv[1] == CHILD_FLAG:
+        sys.exit(run_streamlit_child())
 
     # Simple self-test hook for CI/debugging
     if os.environ.get("GENESYS_SELF_TEST") == "1":
@@ -162,12 +186,20 @@ if __name__ == "__main__":
     
     restart_count = 0
     last_restart = time.time()
+    restart_exit_code = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
+    restart_exit_codes = {1, restart_exit_code}
+
     def run_streamlit():
-        argv = [
-            sys.executable, "-m", "streamlit", "run", app_path,
-            "--server.port=8501", "--server.address=localhost",
-            "--server.headless=true", "--global.developmentMode=false"
+        common_args = [
+            "--server.port=8501",
+            "--server.address=localhost",
+            "--server.headless=true",
+            "--global.developmentMode=false",
         ]
+        if getattr(sys, "frozen", False):
+            argv = [sys.executable, CHILD_FLAG, app_path] + common_args
+        else:
+            argv = [sys.executable, os.path.abspath(__file__), CHILD_FLAG, app_path] + common_args
         proc = subprocess.Popen(argv)
         return proc.wait()
 
@@ -179,6 +211,11 @@ if __name__ == "__main__":
             log(f"Starting streamlit: {app_path}")
             exit_code = run_streamlit()
             
+            if exit_code == 0:
+                print("🛑 Application stopped gracefully (Exit Code 0).")
+                log("Exit code 0. Wrapper stopping.")
+                break
+
             restart_count += 1
             now = time.time()
             if now - last_restart > 60:
@@ -189,11 +226,13 @@ if __name__ == "__main__":
                 print("❌ Too many restarts. Exiting.")
                 log("Too many restarts. Exiting.")
                 break
-            if exit_code == 0:
-                print("ℹ️ Application exited with code 0. Restarting in 2 seconds...")
+
+            if exit_code in restart_exit_codes:
+                print(f"♻️ Restart requested (Exit Code {exit_code}). Restarting in 2 seconds...")
+                time.sleep(2)
             else:
-                print(f"⚠️ Application exited with code {exit_code}. Restarting in 2 seconds...")
-            time.sleep(2)
+                print(f"⚠️ Unexpected exit code {exit_code}. Restarting in 5 seconds...")
+                time.sleep(5)
         except KeyboardInterrupt:
             print("\n👋 Manual interruption. Exiting...")
             break

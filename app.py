@@ -67,6 +67,7 @@ auth_manager = AuthManager()
 MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "512"))  # Soft limit - trigger cleanup
 MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "60"))  # Reduced from 120
 MEMORY_HARD_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_HARD_LIMIT_MB", "768"))  # Hard limit - trigger restart
+RESTART_EXIT_CODE = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
 
 def _setup_logging():
     logger = logging.getLogger("genesys_app")
@@ -1248,8 +1249,8 @@ def _silent_restart():
         pass
     
     # Forcefully terminate process so wrapper can start a fresh Python process.
-    # sys.exit(1) only exits the current thread in some Streamlit paths.
-    os._exit(1)
+    # Use a dedicated non-zero code for intentional restart requests.
+    os._exit(RESTART_EXIT_CODE)
 
 def _soft_memory_cleanup():
     """Best-effort cleanup to reduce memory without visible user impact."""
