@@ -19,15 +19,36 @@ import warnings
 import psutil
 
 # Suppress st.cache deprecation warning from streamlit_cookies_manager
-warnings.filterwarnings("ignore", message=".*st.cache.*deprecated.*")
+warnings.filterwarnings("ignore", message=r".*st\.cache.*deprecated.*")
 
 class _SuppressStCacheDeprecationFilter(logging.Filter):
     def filter(self, record):
-        msg = record.getMessage()
+        msg = str(record.getMessage())
         return "`st.cache` is deprecated" not in msg
 
-for _logger_name in ("streamlit", "streamlit.runtime", "streamlit.runtime.caching"):
+for _logger_name in (
+    "streamlit",
+    "streamlit.runtime",
+    "streamlit.runtime.caching",
+    "streamlit.deprecation_util",
+):
     logging.getLogger(_logger_name).addFilter(_SuppressStCacheDeprecationFilter())
+
+try:
+    import streamlit.deprecation_util as _st_deprecation_util
+    _orig_show_deprecation_warning = _st_deprecation_util.show_deprecation_warning
+
+    def _patched_show_deprecation_warning(message, show_in_browser=True, show_once=False):
+        # streamlit_cookies_manager still imports @st.cache; skip only this known warning.
+        if "`st.cache` is deprecated" in str(message):
+            return
+        return _orig_show_deprecation_warning(
+            message, show_in_browser=show_in_browser, show_once=show_once
+        )
+
+    _st_deprecation_util.show_deprecation_warning = _patched_show_deprecation_warning
+except Exception:
+    pass
 
 from streamlit.runtime import Runtime
 from streamlit_cookies_manager import EncryptedCookieManager
@@ -52,6 +73,7 @@ def _setup_logging():
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)
@@ -64,10 +86,24 @@ def _log_exception(prefix, exc_type, exc_value, exc_tb):
     details = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     logger.error("%s: %s", prefix, details)
 
+def _is_expected_system_exit(exc_type, exc_value):
+    try:
+        if not issubclass(exc_type, SystemExit):
+            return False
+    except Exception:
+        return False
+    code = getattr(exc_value, "code", None)
+    # sys.exit(1) is used intentionally for app reboot flow.
+    return code in (None, 0, 1)
+
 def _sys_excepthook(exc_type, exc_value, exc_tb):
+    if _is_expected_system_exit(exc_type, exc_value):
+        return
     _log_exception("Unhandled exception", exc_type, exc_value, exc_tb)
 
 def _thread_excepthook(args):
+    if _is_expected_system_exit(args.exc_type, args.exc_value):
+        return
     _log_exception(f"Thread exception in {args.thread.name}", args.exc_type, args.exc_value, args.exc_traceback)
 
 sys.excepthook = _sys_excepthook
@@ -1196,7 +1232,7 @@ def _shared_memory_store():
 
 def _silent_restart():
     """Perform a silent restart of the Streamlit app when memory exceeds hard limit.
-    Uses sys.exit(1) to trigger the restart loop in run_app.py."""
+    Uses process exit to trigger the restart loop in run_app.py."""
     logger.warning(f"Memory exceeded {MEMORY_HARD_LIMIT_MB}MB, initiating silent restart...")
     
     # Full cleanup before restart
@@ -1209,13 +1245,9 @@ def _silent_restart():
     except Exception:
         pass
     
-    # Exit with code 1 to trigger restart loop in run_app.py
-    # Using sys.exit(1) instead of os.execl() because:
-    # 1. os.execl() doesn't work properly inside Streamlit
-    # 2. sys.exit(1) raises SystemExit which is caught by run_app.py
-    # 3. run_app.py will restart the app when exit_code != 0
-    import sys
-    sys.exit(1)
+    # Forcefully terminate process so wrapper can start a fresh Python process.
+    # sys.exit(1) only exits the current thread in some Streamlit paths.
+    os._exit(1)
 
 def _soft_memory_cleanup():
     """Best-effort cleanup to reduce memory without visible user impact."""
@@ -1246,6 +1278,10 @@ def _soft_memory_cleanup():
                         nm.stop()
                     except Exception:
                         pass
+            # Drop references so old manager instances can be garbage-collected.
+            notif["call"] = {}
+            notif["agent"] = {}
+            notif["global"] = {}
     except Exception:
         pass
 
@@ -1691,6 +1727,19 @@ def _clear_live_panel_caches(org_code):
             if call_nm and hasattr(call_nm, "waiting_calls"):
                 with call_nm._lock:
                     call_nm.waiting_calls = {}
+    except Exception:
+        pass
+
+def _prune_admin_group_member_cache(max_entries=40):
+    """Keep admin group member caches bounded in session_state."""
+    try:
+        keys = [k for k in st.session_state.keys() if k.startswith("admin_group_members_")]
+        if len(keys) <= max_entries:
+            return
+        remove_count = len(keys) - max_entries
+        for k in keys[:remove_count]:
+            st.session_state.pop(k, None)
+            st.session_state.pop(f"refresh_{k}", None)
     except Exception:
         pass
 
@@ -3145,6 +3194,16 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
 
     with tab3:
         _start_memory_monitor(sample_interval=10, max_samples=720)
+        st.subheader("Uygulama Kontrol")
+        st.warning("Bu işlem uygulamayı yeniden başlatır. Aktif kullanıcı oturumları kısa süreli kesilir.")
+        reboot_confirm = st.checkbox("Uygulamayı yeniden başlatmayı onaylıyorum", key="admin_reboot_confirm")
+        if st.button("🔄 Uygulamayı Reboot Et", type="primary", key="admin_reboot_btn", disabled=not reboot_confirm):
+            admin_user = st.session_state.get('app_user', {}).get('username', 'unknown')
+            logger.warning(f"[ADMIN REBOOT] Restart requested by {admin_user}")
+            _soft_memory_cleanup()
+            _silent_restart()
+
+        st.divider()
         st.subheader("Sistem Durumu")
         proc = psutil.Process(os.getpid())
         try:
@@ -3518,6 +3577,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                 if not groups:
                     st.info(get_text(lang, "group_no_groups"))
                 else:
+                    _prune_admin_group_member_cache(max_entries=40)
                     # Refresh button
                     if st.button("🔄 Grupları Yenile", key="refresh_groups_btn"):
                         st.session_state.admin_groups_refresh = True
@@ -4548,6 +4608,15 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     if selected_group_obj and selected_group_obj.get("id"):
                         group_id = selected_group_obj.get("id")
                         members_cache = st.session_state.get("dashboard_group_members_cache", {})
+                        if members_cache:
+                            stale_ids = [gid for gid, ent in members_cache.items() if (now_ts - ent.get("ts", 0)) > 1800]
+                            for gid in stale_ids:
+                                members_cache.pop(gid, None)
+                            if len(members_cache) > 40:
+                                oldest = sorted(members_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(members_cache) - 40]
+                                for gid, _ in oldest:
+                                    members_cache.pop(gid, None)
+                            st.session_state.dashboard_group_members_cache = members_cache
                         entry = members_cache.get(group_id, {})
                         if (not entry) or ((now_ts - entry.get("ts", 0)) > 600):
                             try:

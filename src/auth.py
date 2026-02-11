@@ -7,6 +7,7 @@ import streamlit as st
 
 _cache_lock = threading.Lock()
 _mem_cache = {}
+_MAX_MEM_CACHE_ENTRIES = 50
 
 def _cache_key(client_id, region):
     return f"{client_id}:{region}"
@@ -22,6 +23,10 @@ def _load_cached_token(client_id, region, org_code=None):
     key = _cache_key(client_id, region)
     now = time.time()
     with _cache_lock:
+        # Prune expired entries opportunistically.
+        expired = [k for k, v in _mem_cache.items() if v.get("expires_at", 0) <= (now + 60)]
+        for k in expired:
+            _mem_cache.pop(k, None)
         entry = _mem_cache.get(key)
         if entry and entry.get("expires_at", 0) > (now + 60):
             return entry
@@ -43,6 +48,11 @@ def _store_cached_token(client_id, region, entry, org_code=None):
     key = _cache_key(client_id, region)
     with _cache_lock:
         _mem_cache[key] = entry
+        if len(_mem_cache) > _MAX_MEM_CACHE_ENTRIES:
+            # Keep most recent-ish entries by expiry.
+            oldest = sorted(_mem_cache.items(), key=lambda kv: kv[1].get("expires_at", 0))[:len(_mem_cache) - _MAX_MEM_CACHE_ENTRIES]
+            for k, _ in oldest:
+                _mem_cache.pop(k, None)
     path = _org_token_cache_path(org_code)
     if not path:
         return

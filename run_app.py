@@ -1,9 +1,9 @@
-import streamlit.web.cli as stcli
 import os
 import sys
 import signal
 import time
 import platform
+import subprocess
 
 def resolve_path(path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
@@ -124,19 +124,12 @@ if __name__ == "__main__":
     last_restart = time.time()
     def run_streamlit():
         argv = [
-            "streamlit", "run", app_path,
+            sys.executable, "-m", "streamlit", "run", app_path,
             "--server.port=8501", "--server.address=localhost",
             "--server.headless=true", "--global.developmentMode=false"
         ]
-        old_argv = sys.argv[:]
-        sys.argv = argv
-        try:
-            stcli.main()
-            return 0
-        except SystemExit as e:
-            return e.code or 0
-        finally:
-            sys.argv = old_argv
+        proc = subprocess.Popen(argv)
+        return proc.wait()
 
     while True:
         try:
@@ -146,22 +139,21 @@ if __name__ == "__main__":
             log(f"Starting streamlit: {app_path}")
             exit_code = run_streamlit()
             
-            if exit_code == 0:
-                print("🛑 Application stopped gracefully (Exit Code 0).")
+            restart_count += 1
+            now = time.time()
+            if now - last_restart > 60:
+                restart_count = 1
+            last_restart = now
+            log(f"Exit code {exit_code}. Restart count: {restart_count}")
+            if restart_count >= 8:
+                print("❌ Too many restarts. Exiting.")
+                log("Too many restarts. Exiting.")
                 break
+            if exit_code == 0:
+                print("ℹ️ Application exited with code 0. Restarting in 2 seconds...")
             else:
-                restart_count += 1
-                now = time.time()
-                if now - last_restart > 60:
-                    restart_count = 1
-                last_restart = now
-                log(f"Exit code {exit_code}. Restart count: {restart_count}")
-                if restart_count >= 5:
-                    print("❌ Too many restarts. Exiting.")
-                    log("Too many restarts. Exiting.")
-                    break
                 print(f"⚠️ Application exited with code {exit_code}. Restarting in 2 seconds...")
-                time.sleep(2)
+            time.sleep(2)
         except KeyboardInterrupt:
             print("\n👋 Manual interruption. Exiting...")
             break

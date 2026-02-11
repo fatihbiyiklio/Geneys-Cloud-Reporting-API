@@ -279,7 +279,8 @@ def apply_duration_formatting(df):
     df = df.copy()
     target_cols = [c for c in df.columns if (c.startswith('t') or c.startswith('Avg') or c in ['col_staffed_time', 'Duration', 'col_duration']) and pd.api.types.is_numeric_dtype(df[c])]
     for col in target_cols:
-        df.loc[:, col] = df[col].apply(format_seconds_to_hms)
+        # Replace the full column so pandas can safely switch dtype from numeric to string.
+        df[col] = df[col].apply(format_seconds_to_hms).astype("object")
     return df
 
 def fill_interval_gaps(df, start_dt_local, end_dt_local, granularity):

@@ -146,7 +146,12 @@ class NotificationManager:
     def stop(self):
         self._stop_event.set()
         self._stop_channels()
-        self.connected = False
+        with self._lock:
+            self.connected = False
+            self.subscribed_topics = []
+            self.waiting_calls = {}
+            self.last_event_preview = ""
+            self.last_topic = ""
         # Force cleanup
         _cleanup_dead_websockets()
 
@@ -467,6 +472,17 @@ class AgentNotificationManager:
     def stop(self):
         self._stop_event.set()
         self._stop_channels()
+        with self._lock:
+            self.subscribed_topics = []
+            self.queue_members_cache = {}
+            self.last_member_refresh = {}
+            self.user_presence = {}
+            self.user_routing = {}
+            self._user_presence_ts = {}
+            self._user_routing_ts = {}
+            self.active_calls = {}
+            self.last_event_preview = ""
+            self.last_topic = ""
         # Force cleanup
         _cleanup_dead_websockets()
 
@@ -974,8 +990,13 @@ class GlobalConversationNotificationManager:
                 t.join(timeout=2)
             except Exception:
                 pass
-        self._thread = None
-        self.connected = False
+        with self._lock:
+            self._thread = None
+            self.connected = False
+            self.subscribed_topics = []
+            self.active_conversations = {}
+            self.last_event_preview = ""
+            self.last_topic = ""
         # Force cleanup
         _cleanup_dead_websockets()
 
