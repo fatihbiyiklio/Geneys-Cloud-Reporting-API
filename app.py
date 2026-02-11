@@ -3111,7 +3111,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
         
         st.divider()
         st.subheader(get_text(lang, "minutely_traffic"))
-        minutely = monitor.get_minutely_stats(minutes=60)
+        minutely = monitor.get_minutely_stats(minutes=1)
         if minutely:
             df_minutely = pd.DataFrame([
                 {"Zaman": k, "İstek Adet": v} for k, v in minutely.items()
@@ -3119,7 +3119,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
             df_minutely = sanitize_numeric_df(df_minutely)
             st.line_chart(df_minutely.set_index("Zaman"))
         else:
-            st.info("Son 60 dakikada trafik yok.")
+            st.info("Son 1 dakikada trafik yok.")
 
         st.subheader(get_text(lang, "hourly_traffic_24h"))
         hourly = monitor.get_hourly_stats()
@@ -3523,114 +3523,130 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                         st.session_state.admin_groups_refresh = True
                         st.rerun()
                     
-                    # Group selector
                     group_options = {g['id']: f"{g['name']} ({g['memberCount']} üye)" for g in groups}
-                    selected_group_id = st.selectbox(
-                        get_text(lang, "group_select"),
-                        options=list(group_options.keys()),
-                        format_func=lambda x: group_options.get(x, x),
-                        key="admin_group_select"
-                    )
-                    
-                    if selected_group_id:
-                        selected_group = next((g for g in groups if g['id'] == selected_group_id), None)
-                        
-                        if selected_group:
-                            st.markdown(f"**{selected_group['name']}**")
-                            if selected_group.get('description'):
-                                st.caption(selected_group['description'])
-                        
-                        # Fetch members of selected group
-                        members_cache_key = f"admin_group_members_{selected_group_id}"
-                        if members_cache_key not in st.session_state or st.session_state.get(f'refresh_{members_cache_key}'):
-                            with st.spinner("Üyeler yükleniyor..."):
-                                st.session_state[members_cache_key] = api.get_group_members(selected_group_id)
-                                st.session_state[f'refresh_{members_cache_key}'] = False
-                        
-                        members = st.session_state.get(members_cache_key, [])
-                        
-                        # --- Current Members ---
+                    if True:
+
+                        # --- Bulk Add Users to Multiple Groups ---
                         st.divider()
-                        st.markdown(f"### {get_text(lang, 'group_members')} ({len(members)})")
-                        
-                        if members:
-                            import pandas as _pd_grp
-                            df_members = _pd_grp.DataFrame(members)
-                            if 'id' in df_members.columns:
-                                df_display = df_members[['name', 'email', 'state']].copy()
-                                df_display.columns = ['Ad', 'E-posta', 'Durum']
-                                st.dataframe(df_display, width='stretch', hide_index=True)
-                            
-                            # Remove members
-                            with st.expander(f"🗑️ {get_text(lang, 'group_remove_members')}", expanded=False):
-                                member_options = {m['id']: f"{m['name']} ({m['email']})" for m in members}
-                                remove_ids = st.multiselect(
-                                    "Çıkarılacak üyeler",
-                                    options=list(member_options.keys()),
-                                    format_func=lambda x: member_options.get(x, x),
-                                    key=f"remove_members_{selected_group_id}"
-                                )
-                                if remove_ids and st.button(f"🗑️ {len(remove_ids)} Üyeyi Çıkar", type="primary", key=f"remove_btn_{selected_group_id}"):
-                                    try:
-                                        api.remove_group_members(selected_group_id, remove_ids)
-                                        st.success(get_text(lang, "group_remove_success"))
-                                        st.session_state[f'refresh_{members_cache_key}'] = True
-                                        st.session_state.admin_groups_refresh = True
-                                        logging.info(f"[ADMIN GROUP] Removed {len(remove_ids)} members from group {selected_group.get('name', selected_group_id)}")
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"❌ {get_text(lang, 'group_remove_error')}: {e}")
-                        else:
-                            st.info(get_text(lang, "group_no_members"))
-                        
-                        # --- Add Members ---
-                        st.divider()
-                        st.markdown(f"### ➕ {get_text(lang, 'group_add_members')}")
-                        
-                        # Fetch all users for selection
+                        st.markdown("### ⚡ Çoklu Gruba Toplu Üye Ekle")
+
+                        # Fetch all users for bulk selection
                         if 'admin_all_users_cache' not in st.session_state:
                             with st.spinner("Kullanıcılar yükleniyor..."):
                                 st.session_state.admin_all_users_cache = api.get_users()
-                        
                         all_users = st.session_state.get('admin_all_users_cache', [])
-                        existing_member_ids = {m['id'] for m in members}
-                        available_users = [u for u in all_users if u['id'] not in existing_member_ids and u.get('state') == 'active']
-                        
-                        if available_users:
-                            user_options = {u['id']: f"{u['name']} ({u['email']})" for u in available_users}
-                            
-                            # Search/filter
-                            search_term = st.text_input("🔍 Kullanıcı Ara", placeholder="İsim veya e-posta ile filtrele", key=f"user_search_{selected_group_id}")
-                            
-                            if search_term:
-                                filtered_options = {uid: label for uid, label in user_options.items() if search_term.lower() in label.lower()}
-                            else:
-                                filtered_options = user_options
-                            
-                            add_ids = st.multiselect(
-                                get_text(lang, "group_select_users"),
-                                options=list(filtered_options.keys()),
-                                format_func=lambda x: filtered_options.get(x, user_options.get(x, x)),
-                                key=f"add_members_{selected_group_id}"
-                            )
-                            
-                            if add_ids and st.button(f"➕ {len(add_ids)} Üye Ekle", type="primary", key=f"add_btn_{selected_group_id}"):
-                                try:
-                                    api.add_group_members(selected_group_id, add_ids)
-                                    st.success(get_text(lang, "group_add_success"))
-                                    st.session_state[f'refresh_{members_cache_key}'] = True
-                                    st.session_state.admin_groups_refresh = True
-                                    logging.info(f"[ADMIN GROUP] Added {len(add_ids)} members to group {selected_group.get('name', selected_group_id)}")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"❌ {get_text(lang, 'group_add_error')}: {e}")
+
+                        multi_group_options = {g['id']: f"{g['name']} ({g.get('memberCount', 0)} üye)" for g in groups}
+                        active_user_options = {
+                            u['id']: f"{u.get('name', '')} ({u.get('email', '')})"
+                            for u in all_users
+                            if u.get('id') and u.get('state') == 'active'
+                        }
+
+                        multi_group_search = st.text_input(
+                            "🔍 Toplu ekleme için kullanıcı ara",
+                            placeholder="İsim veya e-posta ile filtrele",
+                            key="admin_multi_group_user_search"
+                        )
+                        if multi_group_search:
+                            filtered_multi_user_options = {
+                                uid: label for uid, label in active_user_options.items()
+                                if multi_group_search.lower() in label.lower()
+                            }
                         else:
-                            st.info("Eklenebilecek kullanıcı bulunamadı.")
+                            filtered_multi_user_options = active_user_options
+
+                        selected_multi_user_ids = st.multiselect(
+                            "Eklenecek kullanıcılar (aktif)",
+                            options=list(filtered_multi_user_options.keys()),
+                            format_func=lambda x: filtered_multi_user_options.get(x, active_user_options.get(x, x)),
+                            key="admin_multi_group_user_ids"
+                        )
+                        selected_multi_group_ids = st.multiselect(
+                            "Eklenecek gruplar (birden fazla seçilebilir)",
+                            options=list(multi_group_options.keys()),
+                            format_func=lambda x: multi_group_options.get(x, x),
+                            key="admin_multi_group_group_ids"
+                        )
+
+                        preview_group_options = selected_multi_group_ids if selected_multi_group_ids else list(multi_group_options.keys())
+                        preview_group_id = st.selectbox(
+                            "Üyeleri listelenecek grup",
+                            options=preview_group_options,
+                            format_func=lambda x: multi_group_options.get(x, x),
+                            key="admin_multi_group_preview_group"
+                        )
+
+                        if preview_group_id:
+                            preview_cache_key = f"admin_group_members_{preview_group_id}"
+                            if preview_cache_key not in st.session_state or st.session_state.get(f'refresh_{preview_cache_key}'):
+                                st.session_state[preview_cache_key] = api.get_group_members(preview_group_id)
+                                st.session_state[f'refresh_{preview_cache_key}'] = False
+                            preview_members = st.session_state.get(preview_cache_key, [])
+                            st.caption(f"Seçilen grubun üye sayısı: {len(preview_members)}")
+                            if preview_members:
+                                preview_df = pd.DataFrame(preview_members)
+                                cols = [c for c in ["name", "email", "state"] if c in preview_df.columns]
+                                if cols:
+                                    preview_df = preview_df[cols].copy()
+                                    preview_df.columns = ["Ad", "E-posta", "Durum"][:len(cols)]
+                                st.dataframe(preview_df, width='stretch', hide_index=True)
+                            else:
+                                st.info("Seçilen grupta üye bulunamadı.")
+
+                        if selected_multi_user_ids and selected_multi_group_ids and st.button(
+                            "🚀 Seçili Kullanıcıları Seçili Gruplara Ekle",
+                            type="primary",
+                            key="admin_multi_group_add_submit_btn"
+                        ):
+                            with st.spinner("Toplu grup üyeliği ekleniyor..."):
+                                total_added = 0
+                                total_skipped_existing = 0
+                                failed_groups = []
+
+                                for gid in selected_multi_group_ids:
+                                    g_name = multi_group_options.get(gid, gid)
+                                    members_cache_key = f"admin_group_members_{gid}"
+                                    try:
+                                        group_members = api.get_group_members(gid)
+                                        st.session_state[members_cache_key] = group_members
+                                        existing_ids = {m.get("id") for m in group_members if m.get("id")}
+                                        to_add_ids = [uid for uid in selected_multi_user_ids if uid not in existing_ids]
+
+                                        total_skipped_existing += (len(selected_multi_user_ids) - len(to_add_ids))
+                                        if to_add_ids:
+                                            api.add_group_members(gid, to_add_ids)
+                                            total_added += len(to_add_ids)
+
+                                        st.session_state[f'refresh_{members_cache_key}'] = True
+                                    except Exception as e:
+                                        failed_groups.append((g_name, str(e)))
+
+                                if total_added:
+                                    st.success(f"✅ Toplam {total_added} yeni grup üyeliği eklendi.")
+                                if total_skipped_existing:
+                                    st.info(f"ℹ️ {total_skipped_existing} üyelik zaten mevcut olduğu için atlandı.")
+                                if failed_groups:
+                                    st.warning(f"⚠️ {len(failed_groups)} grupta hata oluştu.")
+                                    for g_name, err in failed_groups:
+                                        st.caption(f"❌ {g_name}: {err}")
+
+                                st.session_state.admin_groups_refresh = True
+                                if not failed_groups:
+                                    st.rerun()
                         
                         # --- Assign Group to Queues ---
                         st.divider()
                         st.markdown(f"### 📋 {get_text(lang, 'group_to_queue')}")
-                        st.info(f"**{selected_group['name']}** grubu, seçtiğiniz kuyruklara üye grup olarak eklenecek veya çıkarılacaktır.")
+                        selected_group_for_queue_id = st.selectbox(
+                            get_text(lang, "group_select"),
+                            options=list(group_options.keys()),
+                            format_func=lambda x: group_options.get(x, x),
+                            key="admin_group_select_for_queue"
+                        )
+                        selected_group_for_queue = next((g for g in groups if g['id'] == selected_group_for_queue_id), None)
+                        if selected_group_for_queue:
+                            st.info(f"**{selected_group_for_queue['name']}** grubu, seçtiğiniz kuyruklara üye grup olarak eklenecek veya çıkarılacaktır.")
                         
                         # Fetch queues
                         if 'admin_queues_cache' not in st.session_state:
@@ -3643,7 +3659,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                             queue_options = {q['id']: q['name'] for q in all_queues}
                             
                             # Search filter for queues
-                            queue_search = st.text_input("🔍 Kuyruk Ara", placeholder="Kuyruk adı ile filtrele", key=f"queue_search_{selected_group_id}")
+                            queue_search = st.text_input("🔍 Kuyruk Ara", placeholder="Kuyruk adı ile filtrele", key=f"queue_search_{selected_group_for_queue_id}")
                             
                             if queue_search:
                                 filtered_queues = {qid: qname for qid, qname in queue_options.items() if queue_search.lower() in qname.lower()}
@@ -3654,15 +3670,15 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                 get_text(lang, "group_queue_select"),
                                 options=list(filtered_queues.keys()),
                                 format_func=lambda x: filtered_queues.get(x, queue_options.get(x, x)),
-                                key=f"queue_assign_{selected_group_id}"
+                                key=f"queue_assign_{selected_group_for_queue_id}"
                             )
                             
                             col_add_q, col_remove_q = st.columns(2)
                             
                             with col_add_q:
-                                if selected_queue_ids and st.button(f"➕ {len(selected_queue_ids)} Kuyruğa Ekle", type="primary", key=f"add_to_queue_btn_{selected_group_id}"):
+                                if selected_queue_ids and st.button(f"➕ {len(selected_queue_ids)} Kuyruğa Ekle", type="primary", key=f"add_to_queue_btn_{selected_group_for_queue_id}"):
                                     with st.spinner("Grup kuyruklara ekleniyor..."):
-                                        results = api.add_group_to_queues(selected_group_id, selected_queue_ids)
+                                        results = api.add_group_to_queues(selected_group_for_queue_id, selected_queue_ids)
                                         success_count = sum(1 for r in results.values() if r['success'])
                                         fail_count = sum(1 for r in results.values() if not r['success'])
                                         
@@ -3682,12 +3698,12 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                             else:
                                                 st.caption(f"❌ {qname}: {result.get('error', '')}")
                                         
-                                        logging.info(f"[ADMIN GROUP] Added group '{selected_group['name']}' to {success_count}/{len(selected_queue_ids)} queues")
+                                        logging.info(f"[ADMIN GROUP] Added group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' to {success_count}/{len(selected_queue_ids)} queues")
                             
                             with col_remove_q:
-                                if selected_queue_ids and st.button(f"🗑️ {len(selected_queue_ids)} Kuyruktan Çıkar", type="secondary", key=f"remove_from_queue_btn_{selected_group_id}"):
+                                if selected_queue_ids and st.button(f"🗑️ {len(selected_queue_ids)} Kuyruktan Çıkar", type="secondary", key=f"remove_from_queue_btn_{selected_group_for_queue_id}"):
                                     with st.spinner("Grup kuyruklardan çıkarılıyor..."):
-                                        results = api.remove_group_from_queues(selected_group_id, selected_queue_ids)
+                                        results = api.remove_group_from_queues(selected_group_for_queue_id, selected_queue_ids)
                                         success_count = sum(1 for r in results.values() if r['success'])
                                         fail_count = sum(1 for r in results.values() if not r['success'])
                                         
@@ -3707,7 +3723,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                             else:
                                                 st.caption(f"❌ {qname}: {result.get('error', '')}")
                                         
-                                        logging.info(f"[ADMIN GROUP] Removed group '{selected_group['name']}' from {success_count}/{len(selected_queue_ids)} queues")
+                                        logging.info(f"[ADMIN GROUP] Removed group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' from {success_count}/{len(selected_queue_ids)} queues")
                         else:
                             st.warning("Kuyruk bulunamadı.")
 
