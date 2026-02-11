@@ -1264,7 +1264,9 @@ def _soft_memory_cleanup():
                 org["agent_presence"] = {}
                 org["agent_routing"] = {}
                 org["call_meta"] = {}
+                org["daily_stats_cache"] = {}
                 org["call_seed_ts"] = 0
+                org["call_meta_poll_ts"] = 0
                 org["ivr_calls_ts"] = 0
                 org["agent_seed_ts"] = 0
     except Exception:
@@ -1389,6 +1391,17 @@ def _periodic_memory_cleanup():
                         keys_to_remove = list(cache.keys())[100:]
                         for k in keys_to_remove:
                             cache.pop(k, None)
+
+                # Trim shared historical daily cache
+                daily_cache = org.get("daily_stats_cache", {})
+                if daily_cache:
+                    stale_daily = [k for k, v in daily_cache.items() if (now - v.get("ts", 0)) > 1800]
+                    for k in stale_daily:
+                        daily_cache.pop(k, None)
+                    if len(daily_cache) > 80:
+                        oldest_daily = sorted(daily_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(daily_cache) - 60]
+                        for k, _ in oldest_daily:
+                            daily_cache.pop(k, None)
     except Exception:
         pass
     
@@ -1532,22 +1545,26 @@ def _ensure_seed_org(store, org_code, max_orgs=20):
     org = store["orgs"].setdefault(org_code, {
         "call_seed_ts": 0,
         "call_seed_data": [],
+        "call_meta_poll_ts": 0,
         "ivr_calls_ts": 0,
         "ivr_calls_data": [],
         "agent_seed_ts": 0,
         "agent_presence": {},
         "agent_routing": {},
         "call_meta": {},
+        "daily_stats_cache": {},
     })
     # Ensure backward-compatible keys
     org.setdefault("call_seed_ts", 0)
     org.setdefault("call_seed_data", [])
+    org.setdefault("call_meta_poll_ts", 0)
     org.setdefault("ivr_calls_ts", 0)
     org.setdefault("ivr_calls_data", [])
     org.setdefault("agent_seed_ts", 0)
     org.setdefault("agent_presence", {})
     org.setdefault("agent_routing", {})
     org.setdefault("call_meta", {})
+    org.setdefault("daily_stats_cache", {})
     return org
 
 def _get_shared_call_seed(org_code):
@@ -1630,6 +1647,41 @@ def _update_call_meta(org_code, calls, now_ts, max_items=300):
             for cid, _ in oldest:
                 meta.pop(cid, None)
 
+def _reserve_call_meta_poll(org_code, now_ts, min_interval=10):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        last_ts = org.get("call_meta_poll_ts", 0)
+        if (now_ts - last_ts) < min_interval:
+            return False
+        org["call_meta_poll_ts"] = now_ts
+        return True
+
+def _get_shared_daily_stats(org_code, cache_key, max_age_seconds=300):
+    store = _shared_seed_store()
+    now = pytime.time()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        daily_cache = org.setdefault("daily_stats_cache", {})
+        stale = [k for k, v in daily_cache.items() if (now - v.get("ts", 0)) > max_age_seconds]
+        for k in stale:
+            daily_cache.pop(k, None)
+        entry = daily_cache.get(cache_key)
+        if not entry:
+            return None
+        return entry.get("data")
+
+def _set_shared_daily_stats(org_code, cache_key, data, now_ts, max_items=60):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        daily_cache = org.setdefault("daily_stats_cache", {})
+        daily_cache[cache_key] = {"ts": now_ts, "data": data}
+        if len(daily_cache) > max_items:
+            oldest = sorted(daily_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(daily_cache) - max_items]
+            for key, _ in oldest:
+                daily_cache.pop(key, None)
+
 def _get_shared_agent_seed(org_code):
     store = _shared_seed_store()
     with store["lock"]:
@@ -1699,7 +1751,7 @@ def _get_session_id():
         st.session_state._session_id = str(uuid.uuid4())
     return st.session_state._session_id
 
-def _clear_live_panel_caches(org_code):
+def _clear_live_panel_caches(org_code, clear_shared=False):
     try:
         # Clear page-local panel timers/caches
         for k in [
@@ -1710,25 +1762,27 @@ def _clear_live_panel_caches(org_code):
         ]:
             st.session_state.pop(k, None)
 
-        # Clear shared seed/meta for this org
-        store = _shared_seed_store()
-        with store["lock"]:
-            org_data = store.get("orgs", {}).get(org_code) or {}
-            org_data["call_seed_ts"] = 0
-            org_data["call_seed_data"] = []
-            org_data["call_meta"] = {}
+        if clear_shared:
+            # Optional hard cleanup for explicit restart/logout flows.
+            store = _shared_seed_store()
+            with store["lock"]:
+                org_data = store.get("orgs", {}).get(org_code) or {}
+                org_data["call_seed_ts"] = 0
+                org_data["call_seed_data"] = []
+                org_data["call_meta"] = {}
+                org_data["call_meta_poll_ts"] = 0
+                org_data["daily_stats_cache"] = {}
 
-        # Clear notif manager caches for this org
-        notif_store = _shared_notif_store()
-        with notif_store["lock"]:
-            global_nm = notif_store.get("global", {}).get(org_code)
-            if global_nm and hasattr(global_nm, "active_conversations"):
-                with global_nm._lock:
-                    global_nm.active_conversations = {}
-            call_nm = notif_store.get("call", {}).get(org_code)
-            if call_nm and hasattr(call_nm, "waiting_calls"):
-                with call_nm._lock:
-                    call_nm.waiting_calls = {}
+            notif_store = _shared_notif_store()
+            with notif_store["lock"]:
+                global_nm = notif_store.get("global", {}).get(org_code)
+                if global_nm and hasattr(global_nm, "active_conversations"):
+                    with global_nm._lock:
+                        global_nm.active_conversations = {}
+                call_nm = notif_store.get("call", {}).get(org_code)
+                if call_nm and hasattr(call_nm, "waiting_calls"):
+                    with call_nm._lock:
+                        call_nm.waiting_calls = {}
     except Exception:
         pass
 
@@ -4310,16 +4364,19 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     items_daily = []
                     if queue_ids:
                         try:
-                            api = GenesysAPI(st.session_state.api_client)
-                            # Use Genesys standard aggregate query
                             interval = f"{start_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                            resp = api.get_queue_daily_stats(queue_ids, interval=interval)
-                            
-                            if resp and resp.get('results'):
-                                id_map = {v: k for k, v in st.session_state.queues_map.items()}
-                                from src.processor import process_daily_stats
-                                daily_data = process_daily_stats(resp, id_map)
-                                items_daily = [daily_data.get(q) for q in card['queues'] if daily_data.get(q)]
+                            cache_key = f"{interval}|{','.join(sorted(queue_ids))}"
+                            daily_data = _get_shared_daily_stats(org, cache_key, max_age_seconds=300)
+                            if daily_data is None:
+                                api = GenesysAPI(st.session_state.api_client)
+                                resp = api.get_queue_daily_stats(queue_ids, interval=interval)
+                                daily_data = {}
+                                if resp and resp.get('results'):
+                                    id_map = {v: k for k, v in st.session_state.queues_map.items()}
+                                    from src.processor import process_daily_stats
+                                    daily_data = process_daily_stats(resp, id_map) or {}
+                                _set_shared_daily_stats(org, cache_key, daily_data, pytime.time(), max_items=60)
+                            items_daily = [daily_data.get(q) for q in card['queues'] if daily_data.get(q)]
                         except Exception as e:
                             st.warning(f"Veri çekilemedi: {e}")
                 
@@ -4923,9 +4980,24 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 notif_stale = (not global_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > 30)
 
                 # Basic model: WS is primary, periodic API snapshot fully replaces cache.
-                last_snapshot_ts = st.session_state.get("_call_panel_last_snapshot_ts", 0)
-                should_snapshot = notif_stale or (now_ts - last_snapshot_ts >= refresh_s)
-                if should_snapshot:
+                # Snapshot throttling is org-wide (shared), not per session.
+                shared_snapshot_ts, shared_snapshot_calls = _get_shared_call_seed(org)
+                if shared_snapshot_calls:
+                    with global_notif._lock:
+                        if not global_notif.active_conversations:
+                            seed_map = {}
+                            for c in shared_snapshot_calls:
+                                cid = c.get("conversation_id")
+                                if not cid:
+                                    continue
+                                item = dict(c)
+                                item.setdefault("last_update", shared_snapshot_ts or now_ts)
+                                seed_map[cid] = item
+                            if seed_map:
+                                global_notif.active_conversations = seed_map
+
+                should_snapshot = notif_stale or (now_ts - shared_snapshot_ts >= refresh_s)
+                if should_snapshot and _reserve_call_seed(org, now_ts, min_interval=refresh_s):
                     try:
                         snapshot_started_ts = pytime.time()
                         api = GenesysAPI(st.session_state.api_client)
@@ -4945,6 +5017,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             c["last_update"] = now_update
                             if not c.get("media_type"):
                                 c["media_type"] = _extract_media_type(c)
+                        _update_call_seed(org, snapshot_calls, now_update, max_items=300)
+                        _update_call_meta(org, snapshot_calls, now_update, max_items=300)
                         new_map = {c.get("conversation_id"): c for c in snapshot_calls if c.get("conversation_id")}
                         with global_notif._lock:
                             existing_map = dict(global_notif.active_conversations or {})
@@ -4968,7 +5042,6 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                     merged_map[cid] = ex
 
                             global_notif.active_conversations = merged_map
-                        st.session_state["_call_panel_last_snapshot_ts"] = now_ts
                     except Exception:
                         pass
 
@@ -4985,6 +5058,14 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     if cid:
                         combined[cid] = dict(c)
 
+                # Enrich from shared meta cache first (org-wide).
+                shared_meta = _get_shared_call_meta(org, max_age_seconds=600)
+                if shared_meta:
+                    for cid, item in list(combined.items()):
+                        meta = shared_meta.get(cid)
+                        if meta:
+                            combined[cid] = _merge_call(item, meta)
+
                 # Small enrichment pass for missing queue/phone/direction fields.
                 missing_ids = []
                 for cid, item in combined.items():
@@ -4995,27 +5076,24 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     if not (has_queue and has_wg and has_phone and has_direction):
                         missing_ids.append(cid)
 
-                if missing_ids:
-                    meta_poll_last = st.session_state.get("_call_panel_last_meta_poll_ts", 0)
-                    if (now_ts - meta_poll_last) >= refresh_s:
-                        try:
-                            api = GenesysAPI(st.session_state.api_client)
-                            users_info = st.session_state.get("users_info") or {}
-                            for cid in missing_ids[:2]:
-                                meta = _fetch_conversation_meta(api, cid, queue_id_to_name, users_info=users_info)
-                                if meta:
-                                    if meta.get("ended"):
-                                        combined.pop(cid, None)
-                                        try:
-                                            with global_notif._lock:
-                                                global_notif.active_conversations.pop(cid, None)
-                                        except Exception:
-                                            pass
-                                        continue
-                                    combined[cid] = _merge_call(combined.get(cid), meta)
-                        except Exception:
-                            pass
-                        st.session_state["_call_panel_last_meta_poll_ts"] = now_ts
+                if missing_ids and _reserve_call_meta_poll(org, now_ts, min_interval=refresh_s):
+                    try:
+                        api = GenesysAPI(st.session_state.api_client)
+                        users_info = st.session_state.get("users_info") or {}
+                        for cid in missing_ids[:2]:
+                            meta = _fetch_conversation_meta(api, cid, queue_id_to_name, users_info=users_info)
+                            if meta:
+                                if meta.get("ended"):
+                                    combined.pop(cid, None)
+                                    try:
+                                        with global_notif._lock:
+                                            global_notif.active_conversations.pop(cid, None)
+                                    except Exception:
+                                        pass
+                                    continue
+                                combined[cid] = _merge_call(combined.get(cid), meta)
+                    except Exception:
+                        pass
 
                 # Final cleanup.
                 for cid in list(combined.keys()):
@@ -5029,6 +5107,10 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         continue
 
                 waiting_calls = list(combined.values())
+                try:
+                    _update_call_meta(org, waiting_calls, now_ts, max_items=300)
+                except Exception:
+                    pass
 
                 if group_queues:
                     waiting_calls = [c for c in waiting_calls if c.get("queue_name") in group_queues]
