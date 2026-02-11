@@ -3770,7 +3770,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                         user_obj = users_by_id.get(uid, {})
                                         inventory_rows.append({
                                             "_user_id": uid or "",
-                                            "Username": user_obj.get("username", ""),
+                                            "Username": user_obj.get("name") or member.get("name", ""),
                                             "Email": user_obj.get("email") or member.get("email", ""),
                                             "State": user_obj.get("state") or member.get("state", ""),
                                             "Workgroup Name": group_name
@@ -3782,7 +3782,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                         if uid and uid not in grouped_user_ids:
                                             inventory_rows.append({
                                                 "_user_id": uid,
-                                                "Username": user_obj.get("username", ""),
+                                                "Username": user_obj.get("name", ""),
                                                 "Email": user_obj.get("email", ""),
                                                 "State": user_obj.get("state", ""),
                                                 "Workgroup Name": ""
