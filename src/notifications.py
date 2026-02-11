@@ -863,7 +863,7 @@ class AgentNotificationManager:
         for p in participants:
             purpose = (p.get("purpose") or "").lower()
             if purpose in ["acd", "queue"]:
-                q_id = p.get("queueId") or p.get("routingQueueId") or p.get("participantId")
+                q_id = p.get("queueId") or p.get("routingQueueId")
                 if q_id:
                     queue_id = q_id
                     queue_name = self.queue_id_to_name.get(q_id, queue_name) or p.get("name") or queue_name
@@ -877,6 +877,31 @@ class AgentNotificationManager:
                         break
             if wait_seconds is not None:
                 break
+
+        # Fallback for payloads where queue id/name is carried on non-acd participants.
+        if not queue_id or _is_generic_queue_name(queue_name):
+            for p in participants:
+                q_id = p.get("queueId") or p.get("routingQueueId")
+                if q_id:
+                    queue_id = queue_id or q_id
+                    mapped = self.queue_id_to_name.get(q_id)
+                    if mapped and not _is_generic_queue_name(mapped):
+                        queue_name = mapped
+                        break
+                for s in p.get("sessions", []) or []:
+                    s_qid = s.get("queueId") or s.get("routingQueueId")
+                    if s_qid:
+                        queue_id = queue_id or s_qid
+                        mapped = self.queue_id_to_name.get(s_qid)
+                        if mapped and not _is_generic_queue_name(mapped):
+                            queue_name = mapped
+                            break
+                    s_qname = s.get("queueName")
+                    if s_qname and not _is_generic_queue_name(s_qname):
+                        queue_name = s_qname
+                        break
+                if queue_name and not _is_generic_queue_name(queue_name):
+                    break
 
         if wait_seconds is None:
             wait_seconds = _parse_wait_seconds(event.get("conversationStart"))
@@ -1178,6 +1203,7 @@ class GlobalConversationNotificationManager:
         if not conv_id:
             return
         self.last_event_ts = time.time()
+        participants = event.get("participants", []) or []
 
         # Extract queue ID from topic (v2.routing.queues.{queueId}.conversations)
         topic_queue_id = None
@@ -1187,7 +1213,7 @@ class GlobalConversationNotificationManager:
                 topic_queue_id = parts[3]
 
         active = False
-        for p in event.get("participants", []) or []:
+        for p in participants:
             for s in p.get("sessions", []) or []:
                 if _session_is_active(s):
                     active = True
@@ -1213,7 +1239,7 @@ class GlobalConversationNotificationManager:
         if queue_id:
             queue_name = self.queue_id_to_name.get(queue_id)
         
-        for p in event.get("participants", []) or []:
+        for p in participants:
             purpose = (p.get("purpose") or "").lower()
             
             # IVR participant name = IVR/flow name (workgroup bilgisi)
@@ -1259,6 +1285,54 @@ class GlobalConversationNotificationManager:
                         break
             if wait_seconds is not None:
                 break
+
+        # Outbound/direct calls may carry queue data outside acd/queue participants.
+        if (not queue_id) or _is_generic_queue_name(queue_name):
+            for p in participants:
+                p_name = p.get("name")
+                q_id = p.get("queueId") or p.get("routingQueueId")
+                if not q_id:
+                    qobj = p.get("queue") or {}
+                    if isinstance(qobj, dict):
+                        q_id = qobj.get("id")
+                        if not p_name:
+                            p_name = qobj.get("name")
+                if q_id:
+                    queue_id = queue_id or q_id
+                    mapped = self.queue_id_to_name.get(q_id)
+                    if mapped and not _is_generic_queue_name(mapped):
+                        queue_name = mapped
+                        break
+                    if p_name and not _is_generic_queue_name(p_name):
+                        queue_name = p_name
+                elif p_name and (not queue_name or _is_generic_queue_name(queue_name)):
+                    if not _is_generic_queue_name(p_name):
+                        queue_name = p_name
+                        break
+
+                for s in p.get("sessions", []) or []:
+                    s_qid = s.get("queueId") or s.get("routingQueueId")
+                    if not s_qid:
+                        s_qobj = s.get("queue") or {}
+                        if isinstance(s_qobj, dict):
+                            s_qid = s_qobj.get("id")
+                    if not s_qid:
+                        for seg in s.get("segments", []) or []:
+                            s_qid = seg.get("queueId") or ((seg.get("queue") or {}).get("id") if isinstance(seg.get("queue"), dict) else None)
+                            if s_qid:
+                                break
+                    if s_qid:
+                        queue_id = queue_id or s_qid
+                        mapped = self.queue_id_to_name.get(s_qid)
+                        if mapped and not _is_generic_queue_name(mapped):
+                            queue_name = mapped
+                            break
+                    s_qname = s.get("queueName")
+                    if s_qname and not _is_generic_queue_name(s_qname):
+                        queue_name = s_qname
+                        break
+                if queue_name and not _is_generic_queue_name(queue_name):
+                    break
         
         # If no queue name found, use IVR name as fallback
         if not queue_name and ivr_name:
@@ -1339,30 +1413,62 @@ def _parse_wait_seconds(val):
         return None
     return None
 
-def _extract_phone(event):
-    def _clean(v):
-        return str(v).replace("tel:", "").replace("sip:", "").strip()
+def _is_generic_queue_name(name):
+    if not name:
+        return True
+    return str(name).strip().lower() in ["-", "aktif", "active"]
 
-    def _is_phone(v):
-        if not v:
-            return False
-        digits = "".join(ch for ch in _clean(v) if ch.isdigit())
-        return len(digits) >= 7
+def _extract_phone(event):
+    def _normalize_phone(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if "<" in s and ">" in s:
+            left = s.find("<")
+            right = s.rfind(">")
+            if left >= 0 and right > left:
+                s = s[left + 1:right].strip()
+        s_low = s.lower()
+        for prefix in ("tel:", "sip:", "sips:"):
+            if s_low.startswith(prefix):
+                s = s[len(prefix):].strip()
+                s_low = s.lower()
+                break
+        s = s.split(";", 1)[0].strip()
+        local = s.split("@", 1)[0].strip() if "@" in s else s
+        candidates = [local, s]
+        for c in candidates:
+            c = (c or "").strip().strip("\"").strip("'")
+            if not c:
+                continue
+            has_plus = c.startswith("+")
+            if any(ch.isalpha() for ch in c):
+                continue
+            digits = "".join(ch for ch in c if ch.isdigit())
+            if len(digits) >= 7:
+                return ("+" + digits) if has_plus else digits
+        return None
 
     try:
         participants = event.get("participants", []) or []
         for p in participants:
             purpose = (p.get("purpose") or "").lower()
             if purpose in ["external", "customer", "outbound"]:
-                for k in ["ani", "addressOther", "address", "name", "callerId"]:
-                    v = p.get(k)
-                    if _is_phone(v):
-                        return _clean(v)
+                for k in ["ani", "addressOther", "address", "callerId", "fromAddress", "toAddress", "dnis", "name"]:
+                    phone = _normalize_phone(p.get(k))
+                    if phone:
+                        return phone
                 for s in p.get("sessions", []) or []:
-                    for k in ["ani", "addressOther", "address", "callerId"]:
-                        v = s.get(k)
-                        if _is_phone(v):
-                            return _clean(v)
+                    for k in ["ani", "addressOther", "address", "callerId", "fromAddress", "toAddress", "dnis"]:
+                        phone = _normalize_phone(s.get(k))
+                        if phone:
+                            return phone
+        for k in ["ani", "addressOther", "fromAddress", "toAddress", "callerId", "dnis", "address"]:
+            phone = _normalize_phone(event.get(k))
+            if phone:
+                return phone
     except Exception:
         return None
     return None
@@ -1429,24 +1535,18 @@ def _infer_direction_from_event(event):
     if not isinstance(event, dict):
         return None
     participants = event.get("participants", []) or []
-    has_external = False
-    has_agent = False
     for p in participants:
         purpose = (p.get("purpose") or "").lower()
         if purpose == "outbound":
             return "Outbound"
-        if purpose in ["external", "customer"]:
-            has_external = True
-        if purpose in ["agent", "user"]:
-            has_agent = True
         for s in p.get("sessions", []) or []:
             sd = (s.get("direction") or "").lower()
             if sd == "outbound":
                 return "Outbound"
             if sd == "inbound":
                 return "Inbound"
-    if has_external and has_agent:
-        return "Inbound"
+    # Avoid guessing Inbound when direction is ambiguous; this can mislabel
+    # outbound interactions where explicit direction fields are absent.
     return None
 
 def _extract_media_type(event):

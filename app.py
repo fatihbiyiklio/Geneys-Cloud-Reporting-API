@@ -432,80 +432,212 @@ def _extract_direction_label(conv):
     if direction and "outbound" in direction:
         return "Outbound"
     participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
-    has_external = False
-    has_agent = False
     for p in participants:
         purpose = (p.get("purpose") or "").lower()
         if purpose == "outbound":
             return "Outbound"
-        if purpose in ["external", "customer"]:
-            has_external = True
-        if purpose in ["agent", "user"]:
-            has_agent = True
         for s in p.get("sessions", []) or []:
             sd = (s.get("direction") or "").lower()
             if sd == "inbound":
                 return "Inbound"
             if sd == "outbound":
                 return "Outbound"
-    if has_external and has_agent:
-        return "Inbound"
+    # Do not force Inbound on ambiguous payloads (external+agent) because outbound
+    # conversations can look similar when direction fields are missing.
     return None
 
 def _extract_queue_name_from_conv(conv, queue_id_to_name=None):
     queue_id_to_name = queue_id_to_name or {}
+    fallback_name = None
+    def _remember_name(name):
+        nonlocal fallback_name
+        if not name:
+            return
+        if not fallback_name:
+            fallback_name = name
+        if not _is_generic_queue_name(name):
+            fallback_name = name
+
     if isinstance(conv, dict):
         qname = conv.get("queueName")
         if qname:
-            return qname
+            if not _is_generic_queue_name(qname):
+                return qname
+            _remember_name(qname)
         qid = conv.get("queueId")
         if qid and qid in queue_id_to_name:
-            return queue_id_to_name.get(qid)
+            mapped = queue_id_to_name.get(qid)
+            if mapped and not _is_generic_queue_name(mapped):
+                return mapped
+            _remember_name(mapped)
     participants = (conv or {}).get("participants") or (conv or {}).get("participantsDetails") or []
     for p in participants:
         purpose = (p.get("purpose") or "").lower()
         if purpose in ["acd", "queue"]:
             q_id = p.get("queueId") or p.get("routingQueueId")
             if q_id and q_id in queue_id_to_name:
-                return queue_id_to_name.get(q_id)
+                mapped = queue_id_to_name.get(q_id)
+                if mapped and not _is_generic_queue_name(mapped):
+                    return mapped
+                _remember_name(mapped)
             name = p.get("name")
             if name:
-                return name
+                if not _is_generic_queue_name(name):
+                    return name
+                _remember_name(name)
             qobj = p.get("queue") or {}
             if isinstance(qobj, dict):
                 if qobj.get("name"):
-                    return qobj.get("name")
+                    qname = qobj.get("name")
+                    if not _is_generic_queue_name(qname):
+                        return qname
+                    _remember_name(qname)
                 qid = qobj.get("id")
                 if qid and qid in queue_id_to_name:
-                    return queue_id_to_name.get(qid)
+                    mapped = queue_id_to_name.get(qid)
+                    if mapped and not _is_generic_queue_name(mapped):
+                        return mapped
+                    _remember_name(mapped)
             for s in p.get("sessions", []) or []:
                 qid = s.get("queueId") or s.get("routingQueueId")
                 if qid and qid in queue_id_to_name:
-                    return queue_id_to_name.get(qid)
+                    mapped = queue_id_to_name.get(qid)
+                    if mapped and not _is_generic_queue_name(mapped):
+                        return mapped
+                    _remember_name(mapped)
                 qname = s.get("queueName")
                 if qname:
-                    return qname
+                    if not _is_generic_queue_name(qname):
+                        return qname
+                    _remember_name(qname)
                 # Analytics API: queueId is inside segments
                 for seg in s.get("segments", []) or []:
                     qid = seg.get("queueId")
                     if qid and qid in queue_id_to_name:
-                        return queue_id_to_name.get(qid)
+                        mapped = queue_id_to_name.get(qid)
+                        if mapped and not _is_generic_queue_name(mapped):
+                            return mapped
+                        _remember_name(mapped)
+                    qname = seg.get("queueName")
+                    if qname:
+                        if not _is_generic_queue_name(qname):
+                            return qname
+                        _remember_name(qname)
+                    qobj = seg.get("queue") or {}
+                    if isinstance(qobj, dict):
+                        qname = qobj.get("name")
+                        if qname:
+                            if not _is_generic_queue_name(qname):
+                                return qname
+                            _remember_name(qname)
+                        qid = qobj.get("id")
+                        if qid and qid in queue_id_to_name:
+                            mapped = queue_id_to_name.get(qid)
+                            if mapped and not _is_generic_queue_name(mapped):
+                                return mapped
+                            _remember_name(mapped)
+        # Outbound/direct calls may carry queue info on non-acd participants.
+        q_id = p.get("queueId") or p.get("routingQueueId")
+        if q_id and q_id in queue_id_to_name:
+            mapped = queue_id_to_name.get(q_id)
+            if mapped and not _is_generic_queue_name(mapped):
+                return mapped
+            _remember_name(mapped)
+        qobj = p.get("queue") or {}
+        if isinstance(qobj, dict):
+            qname = qobj.get("name")
+            if qname:
+                if not _is_generic_queue_name(qname):
+                    return qname
+                _remember_name(qname)
+            qid = qobj.get("id")
+            if qid and qid in queue_id_to_name:
+                mapped = queue_id_to_name.get(qid)
+                if mapped and not _is_generic_queue_name(mapped):
+                    return mapped
+                _remember_name(mapped)
+        qname = p.get("queueName")
+        if qname:
+            if not _is_generic_queue_name(qname):
+                return qname
+            _remember_name(qname)
+        for s in p.get("sessions", []) or []:
+            qid = s.get("queueId") or s.get("routingQueueId")
+            if qid and qid in queue_id_to_name:
+                mapped = queue_id_to_name.get(qid)
+                if mapped and not _is_generic_queue_name(mapped):
+                    return mapped
+                _remember_name(mapped)
+            qname = s.get("queueName")
+            if qname:
+                if not _is_generic_queue_name(qname):
+                    return qname
+                _remember_name(qname)
+            qobj = s.get("queue") or {}
+            if isinstance(qobj, dict):
+                qname = qobj.get("name")
+                if qname:
+                    if not _is_generic_queue_name(qname):
+                        return qname
+                    _remember_name(qname)
+                qid = qobj.get("id")
+                if qid and qid in queue_id_to_name:
+                    mapped = queue_id_to_name.get(qid)
+                    if mapped and not _is_generic_queue_name(mapped):
+                        return mapped
+                    _remember_name(mapped)
+            for seg in s.get("segments", []) or []:
+                qid = seg.get("queueId")
+                if qid and qid in queue_id_to_name:
+                    mapped = queue_id_to_name.get(qid)
+                    if mapped and not _is_generic_queue_name(mapped):
+                        return mapped
+                    _remember_name(mapped)
+                qname = seg.get("queueName")
+                if qname:
+                    if not _is_generic_queue_name(qname):
+                        return qname
+                    _remember_name(qname)
+                qobj = seg.get("queue") or {}
+                if isinstance(qobj, dict):
+                    qname = qobj.get("name")
+                    if qname:
+                        if not _is_generic_queue_name(qname):
+                            return qname
+                        _remember_name(qname)
+                    qid = qobj.get("id")
+                    if qid and qid in queue_id_to_name:
+                        mapped = queue_id_to_name.get(qid)
+                        if mapped and not _is_generic_queue_name(mapped):
+                            return mapped
+                        _remember_name(mapped)
     # Analytics segments
     for seg in (conv or {}).get("segments") or []:
         qname = seg.get("queueName")
         if qname:
-            return qname
+            if not _is_generic_queue_name(qname):
+                return qname
+            _remember_name(qname)
         qobj = seg.get("queue") or {}
         if isinstance(qobj, dict):
             if qobj.get("name"):
-                return qobj.get("name")
+                qname = qobj.get("name")
+                if not _is_generic_queue_name(qname):
+                    return qname
+                _remember_name(qname)
             qid = qobj.get("id")
             if qid and qid in queue_id_to_name:
-                return queue_id_to_name.get(qid)
+                mapped = queue_id_to_name.get(qid)
+                if mapped and not _is_generic_queue_name(mapped):
+                    return mapped
+                _remember_name(mapped)
         qid = seg.get("queueId")
         if qid and qid in queue_id_to_name:
-            return queue_id_to_name.get(qid)
-    return None
+            mapped = queue_id_to_name.get(qid)
+            if mapped and not _is_generic_queue_name(mapped):
+                return mapped
+            _remember_name(mapped)
+    return fallback_name
 
 def _extract_queue_id_from_conv(conv):
     if isinstance(conv, dict):
@@ -531,6 +663,39 @@ def _extract_queue_id_from_conv(conv):
                     return qid
                 for seg in s.get("segments", []) or []:
                     qid = seg.get("queueId")
+                    if qid:
+                        return qid
+                    qobj = seg.get("queue") or {}
+                    if isinstance(qobj, dict):
+                        qid = qobj.get("id")
+                        if qid:
+                            return qid
+    # Some outbound/direct payloads keep queue data on non-acd participants.
+    for p in participants:
+        qid = p.get("queueId") or p.get("routingQueueId")
+        if qid:
+            return qid
+        qobj = p.get("queue") or {}
+        if isinstance(qobj, dict):
+            qid = qobj.get("id")
+            if qid:
+                return qid
+        for s in p.get("sessions", []) or []:
+            qid = s.get("queueId") or s.get("routingQueueId")
+            if qid:
+                return qid
+            qobj = s.get("queue") or {}
+            if isinstance(qobj, dict):
+                qid = qobj.get("id")
+                if qid:
+                    return qid
+            for seg in s.get("segments", []) or []:
+                qid = seg.get("queueId")
+                if qid:
+                    return qid
+                qobj = seg.get("queue") or {}
+                if isinstance(qobj, dict):
+                    qid = qobj.get("id")
                     if qid:
                         return qid
     # Conversation-level segments
@@ -782,33 +947,56 @@ def _extract_phone_from_conv(conv):
     """Best-effort phone extraction from queue conversations payload."""
     if not isinstance(conv, dict):
         return None
-    def _clean(v):
-        return str(v).replace("tel:", "").replace("sip:", "").strip()
-    def _is_phone(v):
-        if not v:
-            return False
-        s = _clean(v)
-        digits = "".join(ch for ch in s if ch.isdigit())
-        return len(digits) >= 7
+    def _normalize_phone(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        if "<" in s and ">" in s:
+            left = s.find("<")
+            right = s.rfind(">")
+            if left >= 0 and right > left:
+                s = s[left + 1:right].strip()
+        s_low = s.lower()
+        for prefix in ("tel:", "sip:", "sips:"):
+            if s_low.startswith(prefix):
+                s = s[len(prefix):].strip()
+                s_low = s.lower()
+                break
+        s = s.split(";", 1)[0].strip()
+        local = s.split("@", 1)[0].strip() if "@" in s else s
+        candidates = [local, s]
+        for c in candidates:
+            c = (c or "").strip().strip("\"").strip("'")
+            if not c:
+                continue
+            has_plus = c.startswith("+")
+            if any(ch.isalpha() for ch in c):
+                continue
+            digits = "".join(ch for ch in c if ch.isdigit())
+            if len(digits) >= 7:
+                return ("+" + digits) if has_plus else digits
+        return None
 
     participants = conv.get("participants") or conv.get("participantsDetails") or []
     for p in participants:
         purpose = (p.get("purpose") or "").lower()
         if purpose in ["external", "customer", "outbound"]:
-            for k in ["ani", "addressOther", "address", "name"]:
-                v = p.get(k)
-                if _is_phone(v):
-                    return _clean(v)
+            for k in ["ani", "addressOther", "address", "callerId", "fromAddress", "toAddress", "dnis", "name"]:
+                phone = _normalize_phone(p.get(k))
+                if phone:
+                    return phone
             for s in p.get("sessions", []) or []:
-                for k in ["ani", "addressOther", "address"]:
-                    v = s.get(k)
-                    if _is_phone(v):
-                        return _clean(v)
-    # Fallback to conversation-level fields (avoid dnis/toAddress)
-    for k in ["ani", "addressOther", "fromAddress", "callerId"]:
-        v = conv.get(k)
-        if _is_phone(v):
-            return _clean(v)
+                for k in ["ani", "addressOther", "address", "callerId", "fromAddress", "toAddress", "dnis"]:
+                    phone = _normalize_phone(s.get(k))
+                    if phone:
+                        return phone
+    # Fallback to conversation-level fields.
+    for k in ["ani", "addressOther", "fromAddress", "toAddress", "callerId", "dnis", "address"]:
+        phone = _normalize_phone(conv.get(k))
+        if phone:
+            return phone
     return None
 
 st.set_page_config(page_title="Genesys Cloud Reporting", layout="wide")
@@ -5134,12 +5322,17 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             break
                         wait_str = format_duration_seconds(item.get("wait_seconds"))
                         q = item.get("queue_name", "")
-                        queue_display = "-" if _is_generic_queue_name(q) else q
+                        wg = item.get("wg")
+                        queue_display = q
+                        if _is_generic_queue_name(queue_display):
+                            if wg and not _is_generic_queue_name(wg):
+                                queue_display = wg
+                            else:
+                                queue_display = "-"
                         queue_text = f"{queue_display}"
                         conv_id = item.get("conversation_id")
                         conv_short = conv_id[-6:] if conv_id and len(conv_id) > 6 else conv_id
                         phone = item.get("phone")
-                        wg = item.get("wg")
                         direction_label = item.get("direction_label")
                         state_label = item.get("state_label")
                         media_type = item.get("media_type")
