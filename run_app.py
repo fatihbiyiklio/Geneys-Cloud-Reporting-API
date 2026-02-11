@@ -4,6 +4,7 @@ import signal
 import time
 import platform
 import subprocess
+import socket
 
 def resolve_path(path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
@@ -100,19 +101,58 @@ if __name__ == "__main__":
         except Exception:
             pass
     
+    def _is_port_busy(port, host="127.0.0.1", timeout=0.25):
+        """Fast port probe to skip expensive process scans when port is already free."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            return sock.connect_ex((host, port)) == 0
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
+    def _terminate_pid(pid):
+        try:
+            proc = psutil.Process(pid)
+            name = proc.name()
+            print(f"🔪 Killing process {name} (PID: {pid})...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return False
+
     def kill_proc_on_port(port):
         """Finds and kills any process using the specified port."""
+        if not _is_port_busy(port):
+            return False
+
+        candidate_pids = set()
+        try:
+            for conn in psutil.net_connections(kind='inet'):
+                laddr = getattr(conn, "laddr", None)
+                lport = getattr(laddr, "port", None) if laddr else None
+                if lport == port and conn.pid and conn.pid != os.getpid():
+                    candidate_pids.add(conn.pid)
+        except (psutil.AccessDenied, PermissionError):
+            pass
+
+        for pid in candidate_pids:
+            if _terminate_pid(pid):
+                return True
+
+        # Fallback path when global net_connections is restricted.
         for proc in psutil.process_iter(['pid', 'name']):
             try:
-                for conns in proc.net_connections(kind='inet'):
-                    if conns.laddr.port == port:
-                        print(f"🔪 Killing process {proc.info['name']} (PID: {proc.info['pid']}) on port {port}...")
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except psutil.TimeoutExpired:
-                            proc.kill()
-                        return True
+                for conn in proc.net_connections(kind='inet'):
+                    laddr = getattr(conn, "laddr", None)
+                    lport = getattr(laddr, "port", None) if laddr else None
+                    if lport == port and proc.info['pid'] != os.getpid():
+                        return _terminate_pid(proc.info['pid'])
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
         return False

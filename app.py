@@ -110,7 +110,9 @@ sys.excepthook = _sys_excepthook
 if hasattr(threading, "excepthook"):
     threading.excepthook = _thread_excepthook
 
-atexit.register(lambda: logger.info("App process exiting"))
+if not globals().get("_ATEEXIT_LOG_REGISTERED", False):
+    atexit.register(lambda: logger.info("App process exiting"))
+    _ATEEXIT_LOG_REGISTERED = True
 
 # --- IMPORTS & PATHS ---
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
