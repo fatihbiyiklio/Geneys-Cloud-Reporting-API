@@ -99,6 +99,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         queue_id = group.get("queueId")
         requested_skill_id = group.get("requestedRoutingSkillId")
         requested_language_id = group.get("requestedLanguageId")
+        dnis_value = group.get("dnis") or group.get("toAddress") or group.get("addressTo") or "-"
         
         row_base = {}
         if report_type in ['user', 'agent', 'productivity']:
@@ -146,6 +147,27 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 "LanguageId": requested_language_id if requested_language_id else "-",
                 "WorkgroupName": queue_name,
                 "Id": f"{user_id}|{requested_skill_id if requested_skill_id else '-'}|{requested_language_id if requested_language_id else '-'}|{queue_id}"
+            }
+        elif report_type == 'detailed_dnis_skill':
+            if not user_id:
+                continue
+            user_info = lookup_map.get(user_id, {}) if user_id else {}
+            agent_name = user_info.get('name', user_id if user_id else "Unknown")
+            raw_username = user_info.get('username') or user_info.get('email') or ""
+            username = format_report_username(raw_username, user_id)
+            queue_name = queue_map.get(queue_id, queue_id) if queue_map and queue_id else (lookup_map.get(queue_id, queue_id) if queue_id else "Unknown")
+            skill_name = skill_map.get(requested_skill_id, requested_skill_id) if skill_map and requested_skill_id else (requested_skill_id or "-")
+            language_name = language_map.get(requested_language_id, requested_language_id) if language_map and requested_language_id else (requested_language_id or "-")
+            row_base = {
+                "AgentName": agent_name,
+                "Username": username,
+                "Dnis": str(dnis_value).replace("tel:", "").replace("sip:", "") if dnis_value else "-",
+                "SkillName": skill_name,
+                "SkillId": requested_skill_id if requested_skill_id else "-",
+                "LanguageName": language_name,
+                "LanguageId": requested_language_id if requested_language_id else "-",
+                "WorkgroupName": queue_name,
+                "Id": f"{user_id}|{dnis_value if dnis_value else '-'}|{requested_skill_id if requested_skill_id else '-'}|{requested_language_id if requested_language_id else '-'}|{queue_id}"
             }
 
         data_list = result_row.get('data', [])
@@ -204,6 +226,8 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             group_cols = ["AgentName", "Username", "WorkgroupName", "Id"]
         elif report_type == 'detailed_skill':
             group_cols = ["AgentName", "Username", "SkillName", "SkillId", "LanguageName", "LanguageId", "WorkgroupName", "Id"]
+        elif report_type == 'detailed_dnis_skill':
+            group_cols = ["AgentName", "Username", "Dnis", "SkillName", "SkillId", "LanguageName", "LanguageId", "WorkgroupName", "Id"]
         elif report_type == 'workgroup_skill':
             group_cols = ["Name", "SkillName", "LanguageName", "Id"]
         elif report_type in ['user', 'agent', 'productivity']:
@@ -224,7 +248,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 axis=1
             )
         
-        if report_type in ['user', 'agent', 'detailed', 'detailed_skill', 'productivity']:
+        if report_type in ['user', 'agent', 'detailed', 'detailed_skill', 'detailed_dnis_skill', 'productivity']:
             # nOffered fix: Use nAlert as fallback, and ensure it's at least nAnswered
             if "nOffered" not in df.columns: df["nOffered"] = 0
             
@@ -251,11 +275,11 @@ def format_seconds_to_hms(val):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def apply_duration_formatting(df):
+    # Work on a copy to avoid chained-assignment warnings when callers pass slices.
+    df = df.copy()
     target_cols = [c for c in df.columns if (c.startswith('t') or c.startswith('Avg') or c in ['col_staffed_time', 'Duration', 'col_duration']) and pd.api.types.is_numeric_dtype(df[c])]
     for col in target_cols:
-        df[col] = df[col].apply(format_seconds_to_hms)
-    return df
-
+        df.loc[:, col] = df[col].apply(format_seconds_to_hms)
     return df
 
 def fill_interval_gaps(df, start_dt_local, end_dt_local, granularity):

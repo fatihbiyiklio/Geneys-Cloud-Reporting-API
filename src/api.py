@@ -8,6 +8,8 @@ _session = requests.Session()
 _session.headers.update({"Content-Type": "application/json"})
 
 class GenesysAPI:
+    ASSIGNMENT_BATCH_SIZE = 50
+
     def __init__(self, auth_data):
         self.access_token = auth_data['access_token']
         self.api_host = auth_data['api_host']
@@ -43,13 +45,19 @@ class GenesysAPI:
             monitor.log_error("API_GET", f"System Error on {path}", str(e))
             raise e
 
-    def _post(self, path, data, timeout=10, retries=0, retry_sleep=0.4):
+    def _post(self, path, data, timeout=10, retries=0, retry_sleep=0.4, params=None):
         start = time.monotonic()
         headers = self.headers
         attempts = max(0, int(retries)) + 1
         for attempt in range(attempts):
             try:
-                response = _session.post(f"{self.api_host}{path}", headers=headers, json=data, timeout=timeout)
+                response = _session.post(
+                    f"{self.api_host}{path}",
+                    headers=headers,
+                    json=data,
+                    params=params,
+                    timeout=timeout
+                )
                 duration_ms = int((time.monotonic() - start) * 1000)
                 monitor.log_api_call(path, method="POST", status_code=response.status_code, duration_ms=duration_ms)
                 response.raise_for_status()
@@ -326,6 +334,15 @@ class GenesysAPI:
         except Exception:
             pass
         return error_detail
+
+    def _chunk_list(self, values, chunk_size=None):
+        """Yield list chunks for safer bulk operations."""
+        items = values or []
+        size = int(chunk_size or self.ASSIGNMENT_BATCH_SIZE)
+        if size <= 0:
+            size = self.ASSIGNMENT_BATCH_SIZE
+        for i in range(0, len(items), size):
+            yield items[i:i + size]
 
     # ... (other methods remain unchanged) ...
 
@@ -604,7 +621,27 @@ class GenesysAPI:
         POST /api/v2/groups/{groupId}/members
         Body: {"memberIds": ["id1", "id2", ...], "version": 1}
         """
-        return self._post(f"/api/v2/groups/{group_id}/members", data={"memberIds": member_ids, "version": 1})
+        last_response = None
+        success_count = 0
+        failed_batches = []
+        for batch in self._chunk_list(member_ids, self.ASSIGNMENT_BATCH_SIZE):
+            try:
+                last_response = self._post(
+                    f"/api/v2/groups/{group_id}/members",
+                    data={"memberIds": batch, "version": 1}
+                )
+                success_count += len(batch)
+            except Exception as e:
+                failed_batches.append({
+                    "batch_size": len(batch),
+                    "error": self._extract_error_detail(e)
+                })
+        if failed_batches:
+            raise Exception(
+                f"Some member batches failed for group {group_id}. "
+                f"success={success_count}, failed_batches={failed_batches}"
+            )
+        return last_response or {"status": 204}
 
     def add_group_to_queues(self, group_id, queue_ids):
         """Add a group to one or more queues via PUT /api/v2/routing/queues/{queueId}.
@@ -614,25 +651,28 @@ class GenesysAPI:
         3) PUT queue with updated memberGroups
         """
         results = {}
-        for qid in queue_ids:
-            try:
-                queue_data = self._get(f"/api/v2/routing/queues/{qid}")
-                member_groups = queue_data.get("memberGroups") or []
-                existing_ids = {mg.get("id") for mg in member_groups}
-                if group_id in existing_ids:
-                    results[qid] = {"success": True, "already": True}
-                    continue
-                member_groups.append({"id": group_id, "type": "GROUP"})
-                queue_data["memberGroups"] = member_groups
-                # Remove read-only fields that cannot be sent in PUT
-                for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
-                                 "memberCount", "userMemberCount", "joinedMemberCount"]:
-                    queue_data.pop(ro_field, None)
-                self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
-                results[qid] = {"success": True}
-            except Exception as e:
-                results[qid] = {"success": False, "error": self._extract_error_detail(e)}
-                monitor.log_error("API_PUT", f"Error adding group {group_id} to queue {qid}: {e}")
+        for queue_batch in self._chunk_list(queue_ids, self.ASSIGNMENT_BATCH_SIZE):
+            for qid in queue_batch:
+                try:
+                    queue_data = self._get(f"/api/v2/routing/queues/{qid}")
+                    member_groups = queue_data.get("memberGroups") or []
+                    existing_ids = {mg.get("id") for mg in member_groups}
+                    if group_id in existing_ids:
+                        results[qid] = {"success": True, "already": True}
+                        continue
+                    member_groups.append({"id": group_id, "type": "GROUP"})
+                    queue_data["memberGroups"] = member_groups
+                    # Remove read-only fields that cannot be sent in PUT
+                    for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
+                                     "memberCount", "userMemberCount", "joinedMemberCount"]:
+                        queue_data.pop(ro_field, None)
+                    self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
+                    results[qid] = {"success": True}
+                except Exception as e:
+                    results[qid] = {"success": False, "error": self._extract_error_detail(e)}
+                    monitor.log_error("API_PUT", f"Error adding group {group_id} to queue {qid}: {e}")
+            # Keep assignment bursts controlled.
+            time.sleep(0.2)
         return results
 
     def remove_group_from_queues(self, group_id, queue_ids):
@@ -643,24 +683,137 @@ class GenesysAPI:
         3) PUT queue with updated memberGroups
         """
         results = {}
-        for qid in queue_ids:
-            try:
-                queue_data = self._get(f"/api/v2/routing/queues/{qid}")
-                member_groups = queue_data.get("memberGroups") or []
-                new_member_groups = [mg for mg in member_groups if mg.get("id") != group_id]
-                if len(new_member_groups) == len(member_groups):
-                    results[qid] = {"success": True, "not_found": True}
-                    continue
-                queue_data["memberGroups"] = new_member_groups
-                # Remove read-only fields that cannot be sent in PUT
-                for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
-                                 "memberCount", "userMemberCount", "joinedMemberCount"]:
-                    queue_data.pop(ro_field, None)
-                self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
-                results[qid] = {"success": True}
-            except Exception as e:
-                results[qid] = {"success": False, "error": self._extract_error_detail(e)}
-                monitor.log_error("API_PUT", f"Error removing group {group_id} from queue {qid}: {e}")
+        for queue_batch in self._chunk_list(queue_ids, self.ASSIGNMENT_BATCH_SIZE):
+            for qid in queue_batch:
+                try:
+                    queue_data = self._get(f"/api/v2/routing/queues/{qid}")
+                    member_groups = queue_data.get("memberGroups") or []
+                    new_member_groups = [mg for mg in member_groups if mg.get("id") != group_id]
+                    if len(new_member_groups) == len(member_groups):
+                        results[qid] = {"success": True, "not_found": True}
+                        continue
+                    queue_data["memberGroups"] = new_member_groups
+                    # Remove read-only fields that cannot be sent in PUT
+                    for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
+                                     "memberCount", "userMemberCount", "joinedMemberCount"]:
+                        queue_data.pop(ro_field, None)
+                    self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
+                    results[qid] = {"success": True}
+                except Exception as e:
+                    results[qid] = {"success": False, "error": self._extract_error_detail(e)}
+                    monitor.log_error("API_PUT", f"Error removing group {group_id} from queue {qid}: {e}")
+            # Keep assignment bursts controlled.
+            time.sleep(0.2)
+        return results
+
+    def add_users_to_queues(self, user_ids, queue_ids):
+        """Add users to one or more queues in batches.
+        Uses POST /api/v2/routing/queues/{queueId}/members with body: [{"id": "userId"}, ...]
+        """
+        results = {}
+        normalized_user_ids = [uid for uid in (user_ids or []) if uid]
+        normalized_queue_ids = [qid for qid in (queue_ids or []) if qid]
+
+        for queue_batch in self._chunk_list(normalized_queue_ids, self.ASSIGNMENT_BATCH_SIZE):
+            for qid in queue_batch:
+                try:
+                    existing_members = self.get_queue_members(qid) or []
+                    existing_ids = {
+                        m.get("id")
+                        for m in existing_members
+                        if isinstance(m, dict) and m.get("id")
+                    }
+                    to_add = [uid for uid in normalized_user_ids if uid not in existing_ids]
+                    skipped_existing = len(normalized_user_ids) - len(to_add)
+
+                    added = 0
+                    failed_batches = []
+                    for user_batch in self._chunk_list(to_add, self.ASSIGNMENT_BATCH_SIZE):
+                        try:
+                            body = [{"id": uid} for uid in user_batch]
+                            self._post(f"/api/v2/routing/queues/{qid}/members", data=body)
+                            added += len(user_batch)
+                        except Exception as e:
+                            failed_batches.append({
+                                "batch_size": len(user_batch),
+                                "error": self._extract_error_detail(e)
+                            })
+
+                    if failed_batches:
+                        results[qid] = {
+                            "success": False,
+                            "added": added,
+                            "skipped_existing": skipped_existing,
+                            "error": failed_batches
+                        }
+                    else:
+                        results[qid] = {
+                            "success": True,
+                            "added": added,
+                            "skipped_existing": skipped_existing
+                        }
+                except Exception as e:
+                    results[qid] = {"success": False, "error": self._extract_error_detail(e)}
+                    monitor.log_error("API_POST", f"Error adding users to queue {qid}: {e}")
+            # Keep assignment bursts controlled.
+            time.sleep(0.2)
+        return results
+
+    def remove_users_from_queues(self, user_ids, queue_ids):
+        """Remove users from one or more queues in batches.
+        Uses POST /api/v2/routing/queues/{queueId}/members?delete=true with body: [{"id": "userId"}, ...]
+        """
+        results = {}
+        normalized_user_ids = [uid for uid in (user_ids or []) if uid]
+        normalized_queue_ids = [qid for qid in (queue_ids or []) if qid]
+
+        for queue_batch in self._chunk_list(normalized_queue_ids, self.ASSIGNMENT_BATCH_SIZE):
+            for qid in queue_batch:
+                try:
+                    existing_members = self.get_queue_members(qid) or []
+                    existing_ids = {
+                        m.get("id")
+                        for m in existing_members
+                        if isinstance(m, dict) and m.get("id")
+                    }
+                    to_remove = [uid for uid in normalized_user_ids if uid in existing_ids]
+                    skipped_missing = len(normalized_user_ids) - len(to_remove)
+
+                    removed = 0
+                    failed_batches = []
+                    for user_batch in self._chunk_list(to_remove, self.ASSIGNMENT_BATCH_SIZE):
+                        try:
+                            body = [{"id": uid} for uid in user_batch]
+                            self._post(
+                                f"/api/v2/routing/queues/{qid}/members",
+                                data=body,
+                                params={"delete": "true"}
+                            )
+                            removed += len(user_batch)
+                        except Exception as e:
+                            failed_batches.append({
+                                "batch_size": len(user_batch),
+                                "error": self._extract_error_detail(e)
+                            })
+
+                    if failed_batches:
+                        results[qid] = {
+                            "success": False,
+                            "removed": removed,
+                            "skipped_missing": skipped_missing,
+                            "error": failed_batches
+                        }
+                    else:
+                        results[qid] = {
+                            "success": True,
+                            "removed": removed,
+                            "skipped_missing": skipped_missing
+                        }
+                except Exception as e:
+                    results[qid] = {"success": False, "error": self._extract_error_detail(e)}
+                    monitor.log_error("API_POST", f"Error removing users from queue {qid}: {e}")
+            # Keep assignment bursts controlled.
+            time.sleep(0.2)
         return results
 
     def remove_group_members(self, group_id, member_ids):
@@ -1132,6 +1285,32 @@ class GenesysAPI:
         except Exception as e:
             monitor.log_error("API_GET", f"Error fetching queue members for {queue_id}: {e}")
         return members
+
+    def get_user_queue_map(self, user_ids=None, queues=None):
+        """Build user->queue names map by scanning queue memberships."""
+        user_queue_map = {}
+        target_user_ids = {uid for uid in (user_ids or []) if uid}
+        queue_list = queues if queues is not None else self.get_queues()
+
+        for queue in queue_list:
+            qid = queue.get("id")
+            qname = queue.get("name", "")
+            if not qid:
+                continue
+            members = self.get_queue_members(qid) or []
+            for member in members:
+                uid = member.get("id")
+                if not uid:
+                    continue
+                if target_user_ids and uid not in target_user_ids:
+                    continue
+                if uid not in user_queue_map:
+                    user_queue_map[uid] = set()
+                if qname:
+                    user_queue_map[uid].add(qname)
+
+        # Convert sets to sorted lists for stable output
+        return {uid: sorted(list(names)) for uid, names in user_queue_map.items()}
 
     def create_notification_channel(self):
         """Creates a notifications channel for websocket events."""

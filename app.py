@@ -21,6 +21,14 @@ import psutil
 # Suppress st.cache deprecation warning from streamlit_cookies_manager
 warnings.filterwarnings("ignore", message=".*st.cache.*deprecated.*")
 
+class _SuppressStCacheDeprecationFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return "`st.cache` is deprecated" not in msg
+
+for _logger_name in ("streamlit", "streamlit.runtime", "streamlit.runtime.caching"):
+    logging.getLogger(_logger_name).addFilter(_SuppressStCacheDeprecationFilter())
+
 from streamlit.runtime import Runtime
 from streamlit_cookies_manager import EncryptedCookieManager
 from cryptography.fernet import Fernet
@@ -2269,9 +2277,9 @@ elif page == get_text(lang, "menu_reports"):
     with c1:
         role = st.session_state.app_user['role']
         if role == "Reports User":
-            rep_types = ["report_agent", "report_queue", "report_detailed", "report_agent_skill_detail", "interaction_search", "missed_interactions"]
+            rep_types = ["report_agent", "report_queue", "report_detailed", "report_agent_skill_detail", "report_agent_dnis_skill_detail", "interaction_search", "missed_interactions"]
         else: # Admin, Manager
-            rep_types = ["report_agent", "report_queue", "report_detailed", "report_agent_skill_detail", "interaction_search", "chat_detail", "missed_interactions"]
+            rep_types = ["report_agent", "report_queue", "report_detailed", "report_agent_skill_detail", "report_agent_dnis_skill_detail", "interaction_search", "chat_detail", "missed_interactions"]
         
         r_type = st.selectbox(
             get_text(lang, "report_type"), 
@@ -2345,6 +2353,8 @@ elif page == get_text(lang, "menu_reports"):
 
     if r_type == "report_agent_skill_detail":
         st.info(get_text(lang, "skill_report_info"))
+    if r_type == "report_agent_dnis_skill_detail":
+        st.info(get_text(lang, "dnis_skill_report_info"))
 
     if r_type == "chat_detail":
             st.info(get_text(lang, "chat_detail_info"))
@@ -2682,16 +2692,17 @@ elif page == get_text(lang, "menu_reports"):
                 api = GenesysAPI(st.session_state.api_client)
                 s_dt, e_dt = datetime.combine(sd, st_) - timedelta(hours=saved_creds.get("utc_offset", 3)), datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
                 is_skill_detailed = r_type == "report_agent_skill_detail"
+                is_dnis_skill_detailed = r_type == "report_agent_dnis_skill_detail"
                 is_queue_skill = r_type == "report_queue"
                 r_kind = "Agent" if r_type == "report_agent" else ("Workgroup" if r_type == "report_queue" else "Detailed")
-                g_by = ['userId'] if r_kind == "Agent" else ((['queueId', 'requestedRoutingSkillId', 'requestedLanguageId'] if is_queue_skill else ['queueId']) if r_kind == "Workgroup" else (['userId', 'requestedRoutingSkillId', 'requestedLanguageId', 'queueId'] if is_skill_detailed else ['userId', 'queueId']))
+                g_by = ['userId'] if r_kind == "Agent" else ((['queueId', 'requestedRoutingSkillId', 'requestedLanguageId'] if is_queue_skill else ['queueId']) if r_kind == "Workgroup" else (['userId', 'dnis', 'requestedRoutingSkillId', 'requestedLanguageId', 'queueId'] if is_dnis_skill_detailed else (['userId', 'requestedRoutingSkillId', 'requestedLanguageId', 'queueId'] if is_skill_detailed else ['userId', 'queueId'])))
                 f_type = 'user' if r_kind == "Agent" else 'queue'
                 
                 resp = api.get_analytics_conversations_aggregate(s_dt, e_dt, granularity=gran_opt[sel_gran], group_by=g_by, filter_type=f_type, filter_ids=sel_ids or None, metrics=sel_mets_effective, media_types=sel_media_types or None)
                 q_lookup = {v: k for k, v in st.session_state.queues_map.items()}
                 skill_lookup = {}
                 language_lookup = {}
-                if is_skill_detailed or is_queue_skill:
+                if is_skill_detailed or is_dnis_skill_detailed or is_queue_skill:
                     skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                     st.session_state.skills_map = skill_lookup
                     language_lookup = api.get_languages()
@@ -2702,7 +2713,7 @@ elif page == get_text(lang, "menu_reports"):
                 
                 # For detailed report, we still need users_info for userId lookup, even though filter is queue
                 lookup_map = st.session_state.users_info if r_kind in ["Agent", "Detailed"] else q_lookup
-                report_type_key = "detailed_skill" if is_skill_detailed and r_kind == "Detailed" else ("workgroup_skill" if is_queue_skill and r_kind == "Workgroup" else r_kind.lower())
+                report_type_key = "detailed_dnis_skill" if is_dnis_skill_detailed and r_kind == "Detailed" else ("detailed_skill" if is_skill_detailed and r_kind == "Detailed" else ("workgroup_skill" if is_queue_skill and r_kind == "Workgroup" else r_kind.lower()))
                 df = process_analytics_response(
                     resp,
                     lookup_map,
@@ -2737,7 +2748,9 @@ elif page == get_text(lang, "menu_reports"):
 
                     if do_fill and gran_opt[sel_gran] != "P1D": df = fill_interval_gaps(df, datetime.combine(sd, st_), datetime.combine(ed, et), gran_opt[sel_gran])
 
-                    if is_skill_detailed and r_kind == "Detailed":
+                    if is_dnis_skill_detailed and r_kind == "Detailed":
+                        base = ["AgentName", "Username", "Dnis", "SkillName", "LanguageName", "WorkgroupName"]
+                    elif is_skill_detailed and r_kind == "Detailed":
                         base = ["AgentName", "Username", "SkillName", "LanguageName", "WorkgroupName"]
                     elif is_queue_skill and r_kind == "Workgroup":
                         base = ["Name", "SkillName", "LanguageName"]
@@ -2755,7 +2768,7 @@ elif page == get_text(lang, "menu_reports"):
                     # Apply duration formatting
                     final_df = apply_duration_formatting(final_df)
 
-                    rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout"), "SkillName": get_text(lang, "col_skill"), "SkillId": get_text(lang, "col_skill_id"), "LanguageName": get_text(lang, "col_language"), "LanguageId": get_text(lang, "col_language_id")}
+                    rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout"), "SkillName": get_text(lang, "col_skill"), "SkillId": get_text(lang, "col_skill_id"), "LanguageName": get_text(lang, "col_language"), "LanguageId": get_text(lang, "col_language_id"), "Dnis": get_text(lang, "col_dnis")}
                     rename.update({m: get_text(lang, m) for m in sel_mets_effective if m not in rename})
                     df_out = final_df.rename(columns=rename)
                     st.dataframe(df_out, width='stretch')
@@ -3697,6 +3710,255 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                         logging.info(f"[ADMIN GROUP] Removed group '{selected_group['name']}' from {success_count}/{len(selected_queue_ids)} queues")
                         else:
                             st.warning("Kuyruk bulunamadı.")
+
+                        # --- User & Workgroup Inventory + Excel Export ---
+                        st.divider()
+                        st.markdown("### 📥 Kullanıcı & Workgroup Envanteri")
+                        st.caption("Genesys Cloud kullanıcılarını ve bağlı oldukları workgroup (grup) üyeliklerini listeleyip Excel olarak indirebilirsiniz.")
+
+                        export_group_options = {g['id']: g['name'] for g in groups}
+                        selected_export_group_ids = st.multiselect(
+                            "Envantere dahil edilecek workgroup'lar",
+                            options=list(export_group_options.keys()),
+                            format_func=lambda x: export_group_options.get(x, x),
+                            key="admin_inventory_group_filter"
+                        )
+                        include_users_without_group = st.checkbox(
+                            "Workgroup'u olmayan kullanıcıları da ekle",
+                            value=True,
+                            key="admin_inventory_include_unassigned"
+                        )
+
+                        if st.button("🔄 Envanteri Hazırla", key="admin_inventory_build_btn"):
+                            with st.spinner("Kullanıcı/workgroup envanteri hazırlanıyor..."):
+                                if 'admin_all_users_cache' not in st.session_state:
+                                    st.session_state.admin_all_users_cache = api.get_users()
+
+                                inventory_users = st.session_state.get('admin_all_users_cache', [])
+                                users_by_id = {u.get("id"): u for u in inventory_users if u.get("id")}
+                                target_group_ids = selected_export_group_ids or list(export_group_options.keys())
+                                inventory_rows = []
+                                grouped_user_ids = set()
+
+                                for gid in target_group_ids:
+                                    group_name = export_group_options.get(gid, gid)
+                                    members_cache_key = f"admin_group_members_{gid}"
+                                    if members_cache_key not in st.session_state:
+                                        st.session_state[members_cache_key] = api.get_group_members(gid)
+                                    group_members = st.session_state.get(members_cache_key, [])
+
+                                    for member in group_members:
+                                        uid = member.get("id")
+                                        if uid:
+                                            grouped_user_ids.add(uid)
+                                        user_obj = users_by_id.get(uid, {})
+                                        inventory_rows.append({
+                                            "_user_id": uid or "",
+                                            "Username": user_obj.get("username", ""),
+                                            "Email": user_obj.get("email") or member.get("email", ""),
+                                            "State": user_obj.get("state") or member.get("state", ""),
+                                            "Workgroup Name": group_name
+                                        })
+
+                                if include_users_without_group:
+                                    for user_obj in inventory_users:
+                                        uid = user_obj.get("id")
+                                        if uid and uid not in grouped_user_ids:
+                                            inventory_rows.append({
+                                                "_user_id": uid,
+                                                "Username": user_obj.get("username", ""),
+                                                "Email": user_obj.get("email", ""),
+                                                "State": user_obj.get("state", ""),
+                                                "Workgroup Name": ""
+                                            })
+
+                                if 'admin_queues_cache' not in st.session_state:
+                                    st.session_state.admin_queues_cache = api.get_queues()
+                                all_queues_for_inventory = st.session_state.get('admin_queues_cache', [])
+                                inventory_user_ids = {
+                                    row.get("_user_id")
+                                    for row in inventory_rows
+                                    if row.get("_user_id")
+                                }
+                                user_queue_map = api.get_user_queue_map(
+                                    user_ids=list(inventory_user_ids),
+                                    queues=all_queues_for_inventory
+                                )
+                                for row in inventory_rows:
+                                    uid = row.get("_user_id")
+                                    queues = user_queue_map.get(uid, []) if uid else []
+                                    row["Queue List"] = ", ".join(queues)
+
+                                inventory_df = pd.DataFrame(inventory_rows)
+                                if not inventory_df.empty:
+                                    if "_user_id" in inventory_df.columns:
+                                        inventory_df = inventory_df.drop(columns=["_user_id"])
+                                    sort_cols = [c for c in ["Workgroup Name", "Username"] if c in inventory_df.columns]
+                                    if sort_cols:
+                                        inventory_df = inventory_df.sort_values(sort_cols).reset_index(drop=True)
+                                st.session_state.admin_user_workgroup_inventory_df = inventory_df
+
+                        inventory_df = st.session_state.get("admin_user_workgroup_inventory_df")
+                        if isinstance(inventory_df, pd.DataFrame) and not inventory_df.empty:
+                            st.dataframe(inventory_df, width='stretch', hide_index=True)
+                            st.download_button(
+                                "📥 Kullanıcı-Workgroup Excel İndir",
+                                data=to_excel(inventory_df),
+                                file_name=f"user_workgroup_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="admin_inventory_download_btn"
+                            )
+                        elif isinstance(inventory_df, pd.DataFrame):
+                            st.info("Seçilen filtrelerle envanter sonucu bulunamadı.")
+
+                        # --- Bulk Assign Users to Queues ---
+                        st.divider()
+                        st.markdown("### ⚡ Toplu Kuyruk Atama")
+                        st.caption("Seçtiğiniz kullanıcıları, seçtiğiniz birden fazla kuyruğa tek seferde atar.")
+
+                        if 'admin_all_users_cache' not in st.session_state:
+                            st.session_state.admin_all_users_cache = api.get_users()
+                        bulk_all_users = st.session_state.get('admin_all_users_cache', [])
+                        bulk_active_users = [u for u in bulk_all_users if u.get("id") and u.get("state") == "active"]
+
+                        bulk_user_options = {u['id']: f"{u.get('name', '')} ({u.get('email', '')})" for u in bulk_active_users}
+                        if 'admin_queues_cache' not in st.session_state:
+                            st.session_state.admin_queues_cache = api.get_queues()
+                        bulk_all_queues = st.session_state.get('admin_queues_cache', [])
+                        bulk_queue_options = {q['id']: q.get('name', q['id']) for q in bulk_all_queues}
+
+                        bulk_search = st.text_input(
+                            "🔍 Toplu atama için kullanıcı ara",
+                            placeholder="İsim veya e-posta ile filtrele",
+                            key="admin_bulk_assign_user_search"
+                        )
+                        if bulk_search:
+                            filtered_bulk_user_options = {
+                                uid: label for uid, label in bulk_user_options.items()
+                                if bulk_search.lower() in label.lower()
+                            }
+                        else:
+                            filtered_bulk_user_options = bulk_user_options
+
+                        selected_bulk_user_ids = st.multiselect(
+                            "Atanacak kullanıcılar (aktif)",
+                            options=list(filtered_bulk_user_options.keys()),
+                            format_func=lambda x: filtered_bulk_user_options.get(x, bulk_user_options.get(x, x)),
+                            key="admin_bulk_assign_users"
+                        )
+                        bulk_group_options = {g['id']: g.get('name', g['id']) for g in groups}
+                        selected_source_group_ids = st.multiselect(
+                            "Agent çekilecek gruplar",
+                            options=list(bulk_group_options.keys()),
+                            format_func=lambda x: bulk_group_options.get(x, x),
+                            key="admin_bulk_assign_source_groups",
+                            help="Seçtiğiniz grupların üyeleri otomatik olarak kullanıcı listesine eklenir."
+                        )
+
+                        pulled_user_ids = set()
+                        pulled_inactive_count = 0
+                        if selected_source_group_ids:
+                            active_user_id_set = set(bulk_user_options.keys())
+                            for gid in selected_source_group_ids:
+                                members_cache_key = f"admin_group_members_{gid}"
+                                if members_cache_key not in st.session_state or st.session_state.get(f'refresh_{members_cache_key}'):
+                                    st.session_state[members_cache_key] = api.get_group_members(gid)
+                                    st.session_state[f'refresh_{members_cache_key}'] = False
+                                for member in st.session_state.get(members_cache_key, []) or []:
+                                    uid = member.get("id")
+                                    if not uid:
+                                        continue
+                                    if uid in active_user_id_set:
+                                        pulled_user_ids.add(uid)
+                                    else:
+                                        pulled_inactive_count += 1
+
+                        effective_bulk_user_ids = sorted(set(selected_bulk_user_ids) | pulled_user_ids)
+                        st.caption(
+                            f"Toplam hedef kullanıcı: {len(effective_bulk_user_ids)} "
+                            f"(manuel: {len(selected_bulk_user_ids)}, gruptan: {len(pulled_user_ids)})"
+                            + (f" | pasif atlanan: {pulled_inactive_count}" if pulled_inactive_count else "")
+                        )
+                        selected_bulk_queue_ids = st.multiselect(
+                            "Atanacak kuyruklar",
+                            options=list(bulk_queue_options.keys()),
+                            format_func=lambda x: bulk_queue_options.get(x, x),
+                            key="admin_bulk_assign_queues"
+                        )
+
+                        col_bulk_add, col_bulk_remove = st.columns(2)
+
+                        with col_bulk_add:
+                            if effective_bulk_user_ids and selected_bulk_queue_ids and st.button(
+                                "🚀 Toplu Kuyruk Ataması Yap",
+                                type="primary",
+                                key="admin_bulk_assign_submit_btn"
+                            ):
+                                with st.spinner("Toplu atama yapılıyor..."):
+                                    results = api.add_users_to_queues(
+                                        user_ids=effective_bulk_user_ids,
+                                        queue_ids=selected_bulk_queue_ids
+                                    )
+                                    success_count = sum(1 for r in results.values() if r.get("success"))
+                                    fail_count = sum(1 for r in results.values() if not r.get("success"))
+                                    total_added = sum(int(r.get("added", 0)) for r in results.values())
+                                    total_skipped = sum(int(r.get("skipped_existing", 0)) for r in results.values())
+
+                                    if fail_count == 0:
+                                        st.success(f"✅ Toplu kuyruk ataması tamamlandı. Kuyruk: {success_count}, yeni üyelik: {total_added}")
+                                    elif success_count == 0:
+                                        st.error("❌ Toplu kuyruk ataması başarısız oldu.")
+                                    else:
+                                        st.warning(f"⚠️ Kısmi başarı: ✅ {success_count} / ❌ {fail_count} kuyruk")
+
+                                    if total_skipped:
+                                        st.info(f"ℹ️ {total_skipped} üyelik zaten mevcut olduğu için atlandı.")
+
+                                    for qid, result in results.items():
+                                        qname = bulk_queue_options.get(qid, qid)
+                                        if result.get("success"):
+                                            st.caption(
+                                                f"✅ {qname}: +{result.get('added', 0)} eklendi"
+                                                + (f", {result.get('skipped_existing', 0)} zaten üyeydi" if result.get('skipped_existing', 0) else "")
+                                            )
+                                        else:
+                                            st.caption(f"❌ {qname}: {result.get('error', '')}")
+
+                        with col_bulk_remove:
+                            if effective_bulk_user_ids and selected_bulk_queue_ids and st.button(
+                                "🗑️ Toplu Kuyruk Çıkarma Yap",
+                                type="secondary",
+                                key="admin_bulk_remove_submit_btn"
+                            ):
+                                with st.spinner("Toplu kuyruk çıkarma yapılıyor..."):
+                                    results = api.remove_users_from_queues(
+                                        user_ids=effective_bulk_user_ids,
+                                        queue_ids=selected_bulk_queue_ids
+                                    )
+                                    success_count = sum(1 for r in results.values() if r.get("success"))
+                                    fail_count = sum(1 for r in results.values() if not r.get("success"))
+                                    total_removed = sum(int(r.get("removed", 0)) for r in results.values())
+                                    total_skipped = sum(int(r.get("skipped_missing", 0)) for r in results.values())
+
+                                    if fail_count == 0:
+                                        st.success(f"✅ Toplu kuyruk çıkarma tamamlandı. Kuyruk: {success_count}, silinen üyelik: {total_removed}")
+                                    elif success_count == 0:
+                                        st.error("❌ Toplu kuyruk çıkarma başarısız oldu.")
+                                    else:
+                                        st.warning(f"⚠️ Kısmi başarı: ✅ {success_count} / ❌ {fail_count} kuyruk")
+
+                                    if total_skipped:
+                                        st.info(f"ℹ️ {total_skipped} üyelik kuyruklarda bulunamadığı için atlandı.")
+
+                                    for qid, result in results.items():
+                                        qname = bulk_queue_options.get(qid, qid)
+                                        if result.get("success"):
+                                            st.caption(
+                                                f"✅ {qname}: -{result.get('removed', 0)} çıkarıldı"
+                                                + (f", {result.get('skipped_missing', 0)} kullanıcı zaten yoktu" if result.get('skipped_missing', 0) else "")
+                                            )
+                                        else:
+                                            st.caption(f"❌ {qname}: {result.get('error', '')}")
             except Exception as e:
                 st.error(f"❌ {get_text(lang, 'group_fetch_error')}: {e}")
 
