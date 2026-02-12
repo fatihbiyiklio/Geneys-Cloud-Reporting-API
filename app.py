@@ -3001,6 +3001,28 @@ elif page == get_text(lang, "menu_reports"):
         else:
             sel_mets = []
 
+        st.radio(
+            "Sure Gosterimi",
+            ["HH:MM:SS", "Saniye"],
+            horizontal=True,
+            key="rep_duration_mode",
+            help="Raporlardaki sure kolonlarini saat:dakika:saniye veya toplam saniye olarak gosterir.",
+        )
+
+    def _apply_selected_duration_view(df_in):
+        df_out = df_in.copy()
+        if st.session_state.get("rep_duration_mode", "HH:MM:SS") == "HH:MM:SS":
+            return apply_duration_formatting(df_out)
+        # Seconds mode: keep duration columns numeric and clean integer-like display
+        target_cols = [
+            c for c in df_out.columns
+            if (c.startswith('t') or c.startswith('Avg') or c in ['col_staffed_time', 'Duration', 'col_duration'])
+            and pd.api.types.is_numeric_dtype(df_out[c])
+        ]
+        for col in target_cols:
+            df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).round(0).astype("int64")
+        return df_out
+
     if r_type == "report_agent_skill_detail":
         st.info(get_text(lang, "skill_report_info"))
     if r_type == "report_agent_dnis_skill_detail":
@@ -3311,7 +3333,7 @@ elif page == get_text(lang, "menu_reports"):
                      # Rename to Display Names
                      rename_final = {k: get_text(lang, col_map_internal[k]) for k in final_cols}
                      
-                     df_filtered = apply_duration_formatting(df_filtered.copy())
+                     df_filtered = _apply_selected_duration_view(df_filtered)
                      final_df = df_filtered.rename(columns=rename_final)
                      st.dataframe(final_df, width='stretch')
                      render_downloads(final_df, f"interactions_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -3416,7 +3438,7 @@ elif page == get_text(lang, "menu_reports"):
                     final_df = df[[c for c in base if c in df.columns] + mets_to_show]
                     
                     # Apply duration formatting
-                    final_df = apply_duration_formatting(final_df)
+                    final_df = _apply_selected_duration_view(final_df)
 
                     rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout"), "SkillName": get_text(lang, "col_skill"), "SkillId": get_text(lang, "col_skill_id"), "LanguageName": get_text(lang, "col_language"), "LanguageId": get_text(lang, "col_language_id"), "Dnis": get_text(lang, "col_dnis")}
                     rename.update({m: get_text(lang, m) for m in sel_mets_effective if m not in rename})
