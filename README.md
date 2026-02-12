@@ -37,6 +37,28 @@ GitHub Actions üzerinden her sürüm için otomatik olarak **Linux** ve **Windo
 - Release sekmesinden indirip doğrudan çalıştırabilirsiniz
 - Python kurulumuna gerek yoktur
 
+### Windows + IIS Reverse Proxy
+Bu proje Streamlit tabanli oldugu icin IIS'te dogrudan host edilmez, reverse proxy olarak yayinlanir.
+
+1. Uygulamayi sunucuda calistirin (`python run_app.py` veya release binary).
+2. Windows sunucuda su bilesenleri kurulu olmali:
+   - IIS + WebSocket Protocol
+   - URL Rewrite
+   - Application Request Routing (ARR)
+3. Repo icindeki kurulum scriptini **Administrator PowerShell** ile calistirin:
+   ```powershell
+   cd deploy\iis
+   .\setup-iis-proxy.ps1 -SiteName "GeneysReporting" -HostName "rapor.sirket.com" -AppPort 8501 -OpenFirewall
+   ```
+4. HTTPS baglamak icin sertifika thumbprint ile:
+   ```powershell
+   .\setup-iis-proxy.ps1 -SiteName "GeneysReporting" -HostName "rapor.sirket.com" -AppPort 8501 -EnableHttps -CertThumbprint "THUMBPRINT"
+   ```
+
+Notlar:
+- IIS tarafinda olusan `web.config`, `deploy/iis/web.config.template` dosyasindan uretilir.
+- Uygulama `localhost:8501` uzerinde kalmali, disariya sadece IIS (80/443) acilmalidir.
+
 ---
 
 ## 🛠️ Yerel Geliştirme
@@ -66,6 +88,9 @@ GitHub Actions üzerinden her sürüm için otomatik olarak **Linux** ve **Windo
 ├── run_app.py             # Başlatıcı script (port kontrolü, auto-restart)
 ├── Dockerfile             # Container yapılandırması
 ├── requirements.txt       # Python bağımlılıkları
+├── deploy/iis/            # IIS reverse proxy entegrasyonu
+│   ├── setup-iis-proxy.ps1
+│   └── web.config.template
 │
 ├── src/
 │   ├── api.py             # Genesys Cloud REST API entegrasyonu

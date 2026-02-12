@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <rewrite>
+      <rules>
+        <rule name="ReverseProxyToStreamlit" stopProcessing="true">
+          <match url="(.*)" />
+          <action type="Rewrite" url="http://127.0.0.1:__APP_PORT__/{R:1}" />
+        </rule>
+      </rules>
+    </rewrite>
+    <webSocket enabled="true" />
+  </system.webServer>
+</configuration>
