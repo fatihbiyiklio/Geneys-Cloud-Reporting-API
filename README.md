@@ -48,16 +48,17 @@ Bu proje Streamlit tabanli oldugu icin IIS'te dogrudan host edilmez, reverse pro
 3. Repo icindeki kurulum scriptini **Administrator PowerShell** ile calistirin:
    ```powershell
    cd deploy\iis
-   .\setup-iis-proxy.ps1 -SiteName "GeneysReporting" -HostName "rapor.sirket.com" -AppPort 8501 -OpenFirewall
+   .\setup-iis-proxy.ps1 -SiteName "GeneysReporting" -HostName "rapor.sirket.com" -AppPort 8501 -ShowBindings
    ```
 4. HTTPS baglamak icin sertifika thumbprint ile:
    ```powershell
-   .\setup-iis-proxy.ps1 -SiteName "GeneysReporting" -HostName "rapor.sirket.com" -AppPort 8501 -EnableHttps -CertThumbprint "THUMBPRINT"
+   .\setup-iis-proxy.ps1 -SiteName "GeneysReporting" -HostName "rapor.sirket.com" -AppPort 8501 -EnableHttps -CertThumbprint "THUMBPRINT" -ShowBindings
    ```
 
 Notlar:
 - IIS tarafinda olusan `web.config`, `deploy/iis/web.config.template` dosyasindan uretilir.
 - Uygulama `localhost:8501` uzerinde kalmali, disariya sadece IIS (80/443) acilmalidir.
+- `-ShowBindings` tum IIS site bindinglerini listeler; port/host cakismasini tespit etmek icin kullanin.
 
 ---
 

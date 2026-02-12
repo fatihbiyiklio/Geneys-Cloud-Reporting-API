@@ -3,9 +3,12 @@ param(
     [string]$HostName = "",
     [string]$PhysicalPath = "C:\\inetpub\\geneys-proxy",
     [int]$AppPort = 8501,
+    [int]$HttpPort = 80,
+    [int]$HttpsPort = 443,
     [switch]$EnableHttps,
     [string]$CertThumbprint = "",
-    [switch]$OpenFirewall
+    [switch]$OpenFirewall,
+    [switch]$ShowBindings
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,19 +54,62 @@ function Ensure-AppPool([string]$PoolName) {
     Set-ItemProperty "IIS:\\AppPools\\$PoolName" -Name processModel.identityType -Value "ApplicationPoolIdentity"
 }
 
-function Ensure-Site([string]$Name, [string]$Path, [string]$Pool, [string]$HostHeader) {
+function Ensure-Site([string]$Name, [string]$Path, [string]$Pool, [string]$HostHeader, [int]$Port) {
     $existing = Get-Website -Name $Name -ErrorAction SilentlyContinue
     if ($null -eq $existing) {
         if ([string]::IsNullOrWhiteSpace($HostHeader)) {
-            New-Website -Name $Name -PhysicalPath $Path -Port 80 -ApplicationPool $Pool | Out-Null
+            New-Website -Name $Name -PhysicalPath $Path -Port $Port -ApplicationPool $Pool | Out-Null
         }
         else {
-            New-Website -Name $Name -PhysicalPath $Path -Port 80 -HostHeader $HostHeader -ApplicationPool $Pool | Out-Null
+            New-Website -Name $Name -PhysicalPath $Path -Port $Port -HostHeader $HostHeader -ApplicationPool $Pool | Out-Null
         }
     }
     else {
         Set-ItemProperty "IIS:\\Sites\\$Name" -Name physicalPath -Value $Path
         Set-ItemProperty "IIS:\\Sites\\$Name" -Name applicationPool -Value $Pool
+    }
+}
+
+function Get-SiteBindingSummary([string]$Name, [string]$Protocol) {
+    $bindings = @(Get-WebBinding -Name $Name -Protocol $Protocol -ErrorAction SilentlyContinue)
+    if ($bindings.Count -eq 0) {
+        return "(none)"
+    }
+    return ($bindings | ForEach-Object { $_.bindingInformation } | Sort-Object) -join ", "
+}
+
+function Ensure-HttpBinding([string]$Name, [string]$HostHeader, [int]$Port) {
+    $bindings = @(Get-WebBinding -Name $Name -Protocol "http" -ErrorAction SilentlyContinue)
+    $desired = "*:$Port:$HostHeader"
+
+    $hasDesired = $false
+    foreach ($b in $bindings) {
+        if ($b.bindingInformation -eq $desired) {
+            $hasDesired = $true
+            break
+        }
+    }
+
+    if (-not $hasDesired) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($HostHeader)) {
+                New-WebBinding -Name $Name -Protocol http -Port $Port | Out-Null
+            }
+            else {
+                New-WebBinding -Name $Name -Protocol http -Port $Port -HostHeader $HostHeader | Out-Null
+            }
+        }
+        catch {
+            $current = Get-SiteBindingSummary -Name $Name -Protocol "http"
+            throw "HTTP binding eklenemedi. Site: $Name, hedef: $desired, mevcut: $current"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($HostHeader)) {
+        $wildcard = @($bindings | Where-Object { $_.bindingInformation -eq "*:$Port:" })
+        if ($wildcard.Count -gt 0) {
+            Write-Warning "Site '$Name' icin wildcard http binding (*:$Port:) var. Host header bazli kullanim icin kaldirmayi degerlendirin."
+        }
     }
 }
 
@@ -80,27 +126,46 @@ function Ensure-WebConfig([string]$TargetPath, [int]$Port) {
     Set-Content -Path $webConfigPath -Value $content -Encoding UTF8
 }
 
-function Ensure-HttpsBinding([string]$Name, [string]$HostHeader, [string]$Thumbprint) {
+function Ensure-HttpsBinding([string]$Name, [string]$HostHeader, [string]$Thumbprint, [int]$Port) {
     if ([string]::IsNullOrWhiteSpace($Thumbprint)) {
         throw "-EnableHttps kullanildiginda -CertThumbprint zorunludur."
     }
 
-    $binding = Get-WebBinding -Name $Name -Protocol https -Port 443 -HostHeader $HostHeader -ErrorAction SilentlyContinue
+    $binding = Get-WebBinding -Name $Name -Protocol https -Port $Port -HostHeader $HostHeader -ErrorAction SilentlyContinue
     if ($null -eq $binding) {
-        New-WebBinding -Name $Name -Protocol https -Port 443 -HostHeader $HostHeader | Out-Null
-        $binding = Get-WebBinding -Name $Name -Protocol https -Port 443 -HostHeader $HostHeader
+        if ([string]::IsNullOrWhiteSpace($HostHeader)) {
+            New-WebBinding -Name $Name -Protocol https -Port $Port | Out-Null
+        }
+        else {
+            New-WebBinding -Name $Name -Protocol https -Port $Port -HostHeader $HostHeader -SslFlags 1 | Out-Null
+        }
+        $binding = Get-WebBinding -Name $Name -Protocol https -Port $Port -HostHeader $HostHeader
     }
 
     $binding.AddSslCertificate($Thumbprint, "My")
 }
 
-function Ensure-Firewall {
+function Ensure-Firewall([int]$Http, [int]$Https) {
     if (-not (Get-NetFirewallRule -DisplayName "Geneys IIS HTTP Inbound" -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -DisplayName "Geneys IIS HTTP Inbound" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 80 | Out-Null
+        New-NetFirewallRule -DisplayName "Geneys IIS HTTP Inbound" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Http | Out-Null
     }
 
     if (-not (Get-NetFirewallRule -DisplayName "Geneys IIS HTTPS Inbound" -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -DisplayName "Geneys IIS HTTPS Inbound" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 443 | Out-Null
+        New-NetFirewallRule -DisplayName "Geneys IIS HTTPS Inbound" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Https | Out-Null
+    }
+}
+
+function Show-IisBindings {
+    $appcmd = Join-Path $env:windir "System32\\inetsrv\\appcmd.exe"
+    if (Test-Path $appcmd) {
+        Write-Host ""
+        Write-Host "Tum IIS site bindingleri:"
+        & $appcmd list site /text:name,bindings
+        return
+    }
+
+    Get-Website | ForEach-Object {
+        Write-Host ("{0}: {1}" -f $_.Name, $_.Bindings.Collection.bindingInformation)
     }
 }
 
@@ -109,18 +174,25 @@ Assert-IisModule
 Ensure-PhysicalPath -Path $PhysicalPath
 Enable-ArrProxy
 Ensure-AppPool -PoolName $SiteName
-Ensure-Site -Name $SiteName -Path $PhysicalPath -Pool $SiteName -HostHeader $HostName
+Ensure-Site -Name $SiteName -Path $PhysicalPath -Pool $SiteName -HostHeader $HostName -Port $HttpPort
+Ensure-HttpBinding -Name $SiteName -HostHeader $HostName -Port $HttpPort
 Ensure-WebConfig -TargetPath $PhysicalPath -Port $AppPort
 
 if ($EnableHttps) {
-    Ensure-HttpsBinding -Name $SiteName -HostHeader $HostName -Thumbprint $CertThumbprint
+    Ensure-HttpsBinding -Name $SiteName -HostHeader $HostName -Thumbprint $CertThumbprint -Port $HttpsPort
 }
 
 if ($OpenFirewall) {
-    Ensure-Firewall
+    Ensure-Firewall -Http $HttpPort -Https $HttpsPort
+}
+
+if ($ShowBindings) {
+    Show-IisBindings
 }
 
 Write-Host "IIS reverse proxy kurulumu tamamlandi."
 Write-Host "Site: $SiteName"
 Write-Host "Host: $HostName"
+Write-Host "HTTP: $HttpPort"
+if ($EnableHttps) { Write-Host "HTTPS: $HttpsPort" }
 Write-Host "Target: http://127.0.0.1:$AppPort"
