@@ -9,6 +9,8 @@ _session.headers.update({"Content-Type": "application/json"})
 
 class GenesysAPI:
     ASSIGNMENT_BATCH_SIZE = 50
+    QUEUE_MEMBER_429_RETRY_SECONDS = 60
+    QUEUE_MEMBER_429_MAX_RETRIES = 1
 
     def __init__(self, auth_data):
         self.access_token = auth_data['access_token']
@@ -44,6 +46,19 @@ class GenesysAPI:
             monitor.log_api_call(path, method="GET", status_code=None, duration_ms=duration_ms)
             monitor.log_error("API_GET", f"System Error on {path}", str(e))
             raise e
+
+    @staticmethod
+    def _is_http_429(exc):
+        try:
+            resp = getattr(exc, "response", None)
+            if resp is not None and getattr(resp, "status_code", None) == 429:
+                return True
+        except Exception:
+            pass
+        try:
+            return "429" in str(exc)
+        except Exception:
+            return False
 
     def _post(self, path, data, timeout=10, retries=0, retry_sleep=0.4, params=None):
         start = time.monotonic()
@@ -729,11 +744,27 @@ class GenesysAPI:
                     added = 0
                     failed_batches = []
                     for user_batch in self._chunk_list(to_add, self.ASSIGNMENT_BATCH_SIZE):
+                        body = [{"id": uid} for uid in user_batch]
                         try:
-                            body = [{"id": uid} for uid in user_batch]
                             self._post(f"/api/v2/routing/queues/{qid}/members", data=body)
                             added += len(user_batch)
                         except Exception as e:
+                            if self._is_http_429(e):
+                                try:
+                                    monitor.log_error(
+                                        "API_POST",
+                                        f"HTTP 429 on /routing/queues/{qid}/members; retrying in {self.QUEUE_MEMBER_429_RETRY_SECONDS}s"
+                                    )
+                                    time.sleep(self.QUEUE_MEMBER_429_RETRY_SECONDS)
+                                    self._post(f"/api/v2/routing/queues/{qid}/members", data=body)
+                                    added += len(user_batch)
+                                    continue
+                                except Exception as retry_e:
+                                    failed_batches.append({
+                                        "batch_size": len(user_batch),
+                                        "error": self._extract_error_detail(retry_e)
+                                    })
+                                    continue
                             failed_batches.append({
                                 "batch_size": len(user_batch),
                                 "error": self._extract_error_detail(e)
@@ -782,8 +813,8 @@ class GenesysAPI:
                     removed = 0
                     failed_batches = []
                     for user_batch in self._chunk_list(to_remove, self.ASSIGNMENT_BATCH_SIZE):
+                        body = [{"id": uid} for uid in user_batch]
                         try:
-                            body = [{"id": uid} for uid in user_batch]
                             self._post(
                                 f"/api/v2/routing/queues/{qid}/members",
                                 data=body,
@@ -791,6 +822,26 @@ class GenesysAPI:
                             )
                             removed += len(user_batch)
                         except Exception as e:
+                            if self._is_http_429(e):
+                                try:
+                                    monitor.log_error(
+                                        "API_POST",
+                                        f"HTTP 429 on /routing/queues/{qid}/members?delete=true; retrying in {self.QUEUE_MEMBER_429_RETRY_SECONDS}s"
+                                    )
+                                    time.sleep(self.QUEUE_MEMBER_429_RETRY_SECONDS)
+                                    self._post(
+                                        f"/api/v2/routing/queues/{qid}/members",
+                                        data=body,
+                                        params={"delete": "true"}
+                                    )
+                                    removed += len(user_batch)
+                                    continue
+                                except Exception as retry_e:
+                                    failed_batches.append({
+                                        "batch_size": len(user_batch),
+                                        "error": self._extract_error_detail(retry_e)
+                                    })
+                                    continue
                             failed_batches.append({
                                 "batch_size": len(user_batch),
                                 "error": self._extract_error_detail(e)
@@ -1273,7 +1324,21 @@ class GenesysAPI:
                     "pageNumber": page_number, 
                     "pageSize": 100
                 }
-                data = self._get(f"/api/v2/routing/queues/{queue_id}/users", params=params)
+                retries_left = self.QUEUE_MEMBER_429_MAX_RETRIES
+                while True:
+                    try:
+                        data = self._get(f"/api/v2/routing/queues/{queue_id}/users", params=params)
+                        break
+                    except Exception as e:
+                        if self._is_http_429(e) and retries_left > 0:
+                            retries_left -= 1
+                            monitor.log_error(
+                                "API_GET",
+                                f"HTTP 429 on /routing/queues/{queue_id}/users; retrying in {self.QUEUE_MEMBER_429_RETRY_SECONDS}s"
+                            )
+                            time.sleep(self.QUEUE_MEMBER_429_RETRY_SECONDS)
+                            continue
+                        raise
                 
                 if 'entities' in data:
                     members.extend(data['entities'])
