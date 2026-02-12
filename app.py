@@ -1218,6 +1218,15 @@ def _get_cookie_manager():
         return None
     return _cookie_manager
 
+def _cookie_manager_initializing():
+    global _cookie_manager
+    if _cookie_manager is None:
+        return False
+    try:
+        return not _cookie_manager.ready()
+    except Exception:
+        return False
+
 def load_credentials(org_code):
     org_path = _org_dir(org_code)
     filename = os.path.join(org_path, CREDENTIALS_FILE)
@@ -1255,8 +1264,8 @@ def delete_org_files(org_code):
     try:
         if os.path.isdir(org_path):
             shutil.rmtree(org_path, ignore_errors=True)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to delete org files for %s: %s", org_code, e)
 
 def generate_password(length=12):
     """Generate a secure random password."""
@@ -1289,15 +1298,23 @@ def save_app_session(user_data):
     try:
         _cleanup_legacy_app_session_file()
         cookies = _get_cookie_manager()
-        if cookies is not None:
-            payload = {**user_data, "timestamp": pytime.time()}
-            cookies[APP_SESSION_COOKIE] = json.dumps(payload)
-            cookies.save()
+        if cookies is None:
+            return False
+        payload = {**user_data, "timestamp": pytime.time()}
+        cookies[APP_SESSION_COOKIE] = json.dumps(payload)
+        cookies.save()
+        return True
     except Exception:
-        pass
+        return False
 
 def delete_app_session():
     _cleanup_legacy_app_session_file()
+    try:
+        st.session_state.pop("_remember_me_pending_payload", None)
+        st.session_state.pop("_remember_me_pending_retries", None)
+        st.session_state["_cookie_init_retries"] = 0
+    except Exception:
+        pass
     
     # Delete cookie
     try:
@@ -1307,6 +1324,19 @@ def delete_app_session():
             cookies.save()
     except Exception:
         pass
+
+def _flush_pending_remember_me():
+    payload = st.session_state.get("_remember_me_pending_payload")
+    if not payload:
+        return
+    if save_app_session(payload):
+        st.session_state.pop("_remember_me_pending_payload", None)
+        st.session_state.pop("_remember_me_pending_retries", None)
+        return
+    retries = int(st.session_state.get("_remember_me_pending_retries", 0)) + 1
+    st.session_state["_remember_me_pending_retries"] = retries
+    if retries <= 3:
+        st.rerun()
 
 def _user_dir(org_code, username):
     base = _org_dir(org_code)
@@ -1329,7 +1359,9 @@ def load_dashboard_config(org_code):
     if not os.path.exists(filename): return {"layout": 1, "cards": []}
     try:
         with open(filename, "r", encoding='utf-8') as f: return json.load(f)
-    except: return {"layout": 1, "cards": []}
+    except Exception as e:
+        logger.warning("Failed to load dashboard config (%s): %s", filename, e)
+        return {"layout": 1, "cards": []}
 
 def save_dashboard_config(org_code, layout, cards):
     user = _current_user()
@@ -1339,7 +1371,8 @@ def save_dashboard_config(org_code, layout, cards):
         filename = os.path.join(_org_dir(org_code), CONFIG_FILE)
     try:
         with open(filename, "w", encoding='utf-8') as f: json.dump({"layout": layout, "cards": cards}, f, ensure_ascii=False)
-    except: pass
+    except Exception as e:
+        logger.warning("Failed to save dashboard config (%s): %s", filename, e)
 
 def load_presets(org_code):
     user = _current_user()
@@ -1353,7 +1386,9 @@ def load_presets(org_code):
         with open(filename, "r", encoding='utf-8') as f:
             data = json.load(f)
             return data if isinstance(data, list) else []
-    except: return []
+    except Exception as e:
+        logger.warning("Failed to load presets (%s): %s", filename, e)
+        return []
 
 def save_presets(org_code, presets):
     user = _current_user()
@@ -1363,7 +1398,8 @@ def save_presets(org_code, presets):
         filename = os.path.join(_org_dir(org_code), PRESETS_FILE)
     try:
         with open(filename, "w", encoding='utf-8') as f: json.dump(presets, f, ensure_ascii=False)
-    except: pass
+    except Exception as e:
+        logger.warning("Failed to save presets (%s): %s", filename, e)
 
 def get_all_configs_json():
     org = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
@@ -1378,7 +1414,9 @@ def import_all_configs(json_data):
         if "report_presets" in data:
             save_presets(org, data["report_presets"])
         return True
-    except: return False
+    except Exception as e:
+        logger.warning("Failed to import all configs: %s", e)
+        return False
 
 # --- SHARED DATA MANAGER (per org, cross-session) ---
 @st.cache_resource(show_spinner=False)
@@ -2322,6 +2360,9 @@ def init_session_state():
     if 'use_agent_notifications' not in st.session_state: st.session_state.use_agent_notifications = True
     if 'logged_in' not in st.session_state: st.session_state.logged_in = False
     if 'last_console_log_count' not in st.session_state: st.session_state.last_console_log_count = 0 # Track logged errors
+    if '_remember_me_pending_payload' not in st.session_state: st.session_state._remember_me_pending_payload = None
+    if '_remember_me_pending_retries' not in st.session_state: st.session_state._remember_me_pending_retries = 0
+    if '_cookie_init_retries' not in st.session_state: st.session_state._cookie_init_retries = 0
 
 def log_to_console(message, level='error'):
     """Injects JavaScript to log to browser console."""
@@ -2333,6 +2374,7 @@ def log_to_console(message, level='error'):
     st.markdown(js_code, unsafe_allow_html=True)
 
 init_session_state()
+_flush_pending_remember_me()
 
 # Ensure shared DataManager is available after login
 if st.session_state.app_user and 'data_manager' not in st.session_state:
@@ -2353,7 +2395,15 @@ if not st.session_state.app_user:
     if saved_session:
         st.session_state.app_user = saved_session
         ensure_data_manager()
+        st.session_state["_cookie_init_retries"] = 0
         st.rerun()
+    elif _cookie_manager_initializing():
+        retries = int(st.session_state.get("_cookie_init_retries", 0))
+        if retries < 3:
+            st.session_state["_cookie_init_retries"] = retries + 1
+            st.rerun()
+    else:
+        st.session_state["_cookie_init_retries"] = 0
 
     st.markdown("<h1 style='text-align: center;'>Genesys Reporting API</h1>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 2, 1])
@@ -2374,7 +2424,9 @@ if not st.session_state.app_user:
                     
                     # Handle Remember Me
                     if remember_me:
-                        save_app_session(full_user)
+                        if not save_app_session(full_user):
+                            st.session_state._remember_me_pending_payload = full_user
+                            st.session_state._remember_me_pending_retries = 0
                     else:
                         delete_app_session()
                         
@@ -3304,7 +3356,7 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                     st.session_state.queues_map = maps.get("queues_map", {})
                     st.session_state.wrapup_map = maps.get("wrapup", {})
                     st.session_state.presence_map = maps.get("presence", {})
-                    st.session_state.org_config = conf if conf else load_credentials(org)
+                    st.session_state.org_config = load_credentials(org)
                     
                     st.session_state.data_manager.update_api_client(client, st.session_state.presence_map)
                     st.session_state.data_manager.update_settings(cur_off, cur_ref)
@@ -4876,23 +4928,25 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 last_evt = getattr(agent_notif, "last_event_ts", 0)
                 notif_stale = (not agent_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > 60)
                 if all_user_ids:
-                    if (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {})) or notif_stale:
-                        if _reserve_agent_seed(org, now_ts, min_interval=60):
-                            try:
-                                api = GenesysAPI(st.session_state.api_client)
-                                snap = api.get_users_status_scan(target_user_ids=all_user_ids)
-                                pres = snap.get("presence") or {}
-                                rout = snap.get("routing") or {}
+                    seeded_from_api = False
+                    needs_seed = (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {})) or notif_stale
+                    if needs_seed and _reserve_agent_seed(org, now_ts, min_interval=60):
+                        try:
+                            api = GenesysAPI(st.session_state.api_client)
+                            snap = api.get_users_status_scan(target_user_ids=all_user_ids)
+                            pres = snap.get("presence") or {}
+                            rout = snap.get("routing") or {}
+                            if pres or rout:
                                 agent_notif.seed_users(pres, rout)
                                 _merge_agent_seed(org, pres, rout, now_ts)
-                            except Exception:
-                                pass
-                    else:
-                        if shared_presence or shared_routing:
-                            pres = {uid: shared_presence.get(uid) for uid in all_user_ids if uid in shared_presence}
-                            rout = {uid: shared_routing.get(uid) for uid in all_user_ids if uid in shared_routing}
-                            if pres or rout:
-                                agent_notif.seed_users_missing(pres, rout)
+                                seeded_from_api = True
+                        except Exception:
+                            pass
+                    if (not seeded_from_api) and (shared_presence or shared_routing):
+                        pres = {uid: shared_presence.get(uid) for uid in all_user_ids if uid in shared_presence}
+                        rout = {uid: shared_routing.get(uid) for uid in all_user_ids if uid in shared_routing}
+                        if pres or rout:
+                            agent_notif.seed_users_missing(pres, rout)
 
                 # Only keep non-OFFLINE users for websocket and display
                 active_user_ids = []
@@ -4993,6 +5047,24 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     # Sort members
                     all_members = list(filtered_mems) # Use filtered_mems here
                     all_members.sort(key=get_sort_score)
+
+                    # Short-lived fallback cache to avoid empty flashes between refresh cycles.
+                    agent_cache_key = f"{selected_group}|{search_term}"
+                    agent_cache = st.session_state.get("_agent_panel_last_by_filter", {})
+                    if not isinstance(agent_cache, dict):
+                        agent_cache = {}
+                    fallback_ttl = max(10, int(st.session_state.get('org_config', {}).get('refresh_interval', 15) or 15) * 3)
+                    if all_members:
+                        agent_cache[agent_cache_key] = {"ts": now_ts, "data": list(all_members)}
+                        if len(agent_cache) > 20:
+                            oldest = sorted(agent_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(agent_cache) - 20]
+                            for k, _ in oldest:
+                                agent_cache.pop(k, None)
+                        st.session_state["_agent_panel_last_by_filter"] = agent_cache
+                    else:
+                        cached = agent_cache.get(agent_cache_key) or {}
+                        if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
+                            all_members = list(cached.get("data") or [])
 
                     st.markdown(f'<p class="aktif-sayisi">Aktif: {len(all_members)}</p>', unsafe_allow_html=True)
                     
@@ -5295,6 +5367,24 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     waiting_calls = [c for c in waiting_calls if "mevcut" not in (c.get("queue_name") or "").lower()]
 
                 waiting_calls.sort(key=lambda x: x.get("wait_seconds") if x.get("wait_seconds") is not None else -1, reverse=True)
+
+                # Short-lived fallback cache to avoid empty flashes between refresh cycles.
+                call_cache_key = f"{selected_group}|{int(bool(hide_mevcut))}"
+                call_cache = st.session_state.get("_call_panel_last_by_filter", {})
+                if not isinstance(call_cache, dict):
+                    call_cache = {}
+                fallback_ttl = max(10, int(refresh_s) * 3)
+                if waiting_calls:
+                    call_cache[call_cache_key] = {"ts": now_ts, "data": list(waiting_calls)}
+                    if len(call_cache) > 20:
+                        oldest = sorted(call_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(call_cache) - 20]
+                        for k, _ in oldest:
+                            call_cache.pop(k, None)
+                    st.session_state["_call_panel_last_by_filter"] = call_cache
+                else:
+                    cached = call_cache.get(call_cache_key) or {}
+                    if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
+                        waiting_calls = list(cached.get("data") or [])
 
                 st.markdown('<div class="panel-top-spacer"></div>', unsafe_allow_html=True)
                 count_label = "Aktif"

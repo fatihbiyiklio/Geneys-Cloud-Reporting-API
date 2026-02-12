@@ -1,9 +1,13 @@
 import json
 import os
+import base64
+import hmac
 import hashlib
 
 ORG_BASE_DIR = "orgs"
 USERS_FILE = "users.json"
+PBKDF2_HASH_PREFIX = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 260000
 
 class AuthManager:
     def __init__(self):
@@ -66,17 +70,55 @@ class AuthManager:
                 users_path = os.path.join(org_path, USERS_FILE)
                 with open(users_path, "w") as f:
                     json.dump(org_users, f, indent=2)
+                try:
+                    os.chmod(users_path, 0o600)
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _hash_password(self, password):
-        return hashlib.sha256(password.encode()).hexdigest()
+        salt = os.urandom(16)
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            PBKDF2_ITERATIONS,
+        )
+        salt_b64 = base64.b64encode(salt).decode("ascii")
+        hash_b64 = base64.b64encode(derived).decode("ascii")
+        return f"{PBKDF2_HASH_PREFIX}${PBKDF2_ITERATIONS}${salt_b64}${hash_b64}"
+
+    def _verify_password(self, password, stored_hash):
+        if not stored_hash:
+            return False
+        if stored_hash.startswith(f"{PBKDF2_HASH_PREFIX}$"):
+            try:
+                _, iter_s, salt_b64, hash_b64 = stored_hash.split("$", 3)
+                iterations = int(iter_s)
+                salt = base64.b64decode(salt_b64.encode("ascii"))
+                expected = base64.b64decode(hash_b64.encode("ascii"))
+                actual = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    password.encode("utf-8"),
+                    salt,
+                    iterations,
+                )
+                return hmac.compare_digest(actual, expected)
+            except Exception:
+                return False
+        # Legacy format fallback: unsalted SHA-256 hex
+        legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(legacy, stored_hash)
 
     def authenticate(self, org_code, username, password):
         org_users = self.users.get(org_code, {})
         if username in org_users:
             stored_hash = org_users[username]["password"]
-            if stored_hash == self._hash_password(password):
+            if self._verify_password(password, stored_hash):
+                if not stored_hash.startswith(f"{PBKDF2_HASH_PREFIX}$"):
+                    self.users[org_code][username]["password"] = self._hash_password(password)
+                    self._save_users(self.users)
                 user_data = org_users[username].copy()
                 user_data["org_code"] = org_code
                 return user_data

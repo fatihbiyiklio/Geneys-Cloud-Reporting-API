@@ -1358,7 +1358,9 @@ class GenesysAPI:
         presence_map = {}
         routing_map = {}
         target_user_ids = set(target_user_ids or [])
+        ignored_user_ids = set(ignored_user_ids or [])
         remaining = set(target_user_ids)
+        max_pages = 200
         
         page_number = 1
         while True:
@@ -1369,6 +1371,10 @@ class GenesysAPI:
                 if 'entities' in data:
                     for user in data['entities']:
                         uid = user.get('id')
+                        if not uid:
+                            continue
+                        if uid in ignored_user_ids:
+                            continue
                         if target_user_ids and uid not in target_user_ids:
                             continue
                         # Extract expanded data directly
@@ -1387,7 +1393,9 @@ class GenesysAPI:
                 else:
                     break
                     
-                if page_number > 20: break # Safety break
+                if page_number > max_pages:
+                    monitor.log_error("API_GET", f"API: user scan reached safety cap ({max_pages} pages), results may be partial.")
+                    break
             except Exception as e:
                 monitor.log_error("API_GET", f"API: Error in user scan: {e}")
                 break
