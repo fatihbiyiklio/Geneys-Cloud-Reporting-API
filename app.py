@@ -78,6 +78,14 @@ def _setup_logging():
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)
     logger.addHandler(stream_handler)
+    try:
+        logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        file_handler = logging.FileHandler(os.path.join(logs_dir, "app.log"), encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        logger.addHandler(file_handler)
+    except Exception:
+        pass
     return logger
 
 logger = _setup_logging()
@@ -125,6 +133,11 @@ from src.processor import process_analytics_response, to_excel, to_csv, to_parqu
 # --- CONFIGURATION ---
 
 SESSION_TTL_SECONDS = 120
+DEBUG_REMEMBER_ME = os.environ.get("GENESYS_DEBUG_REMEMBER_ME", "0").strip().lower() in ("1", "true", "yes", "on")
+
+def _rm_debug(msg, *args):
+    if DEBUG_REMEMBER_ME:
+        logger.info("[remember-me] " + msg, *args)
 
 def _iter_conversation_pages(api, start_date, end_date, max_records=5000, chunk_days=3, page_size=100):
     """Yield conversation pages with an upper bound on total records to avoid OOM."""
@@ -1004,7 +1017,48 @@ CREDENTIALS_FILE = "credentials.enc"
 KEY_FILE = ".secret.key"
 CONFIG_FILE = "dashboard_config.json"
 PRESETS_FILE = "presets.json"
-ORG_BASE_DIR = "orgs"
+
+def _resolve_state_base_dir():
+    env_dir = os.environ.get("GENESYS_STATE_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+    if getattr(sys, "frozen", False):
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return os.path.join(appdata, "GenesysCloudReporting", "orgs")
+        return os.path.join(os.path.expanduser("~"), ".genesys_cloud_reporting", "orgs")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "orgs")
+
+ORG_BASE_DIR = _resolve_state_base_dir()
+
+def _migrate_legacy_state_dir():
+    try:
+        os.makedirs(ORG_BASE_DIR, exist_ok=True)
+        if os.listdir(ORG_BASE_DIR):
+            return
+    except Exception:
+        return
+    candidates = []
+    try:
+        candidates.append(os.path.join(os.getcwd(), "orgs"))
+    except Exception:
+        pass
+    try:
+        if getattr(sys, "frozen", False):
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "orgs"))
+    except Exception:
+        pass
+    for source in candidates:
+        try:
+            if not source or os.path.abspath(source) == os.path.abspath(ORG_BASE_DIR):
+                continue
+            if os.path.isdir(source) and os.listdir(source):
+                shutil.copytree(source, ORG_BASE_DIR, dirs_exist_ok=True)
+                return
+        except Exception:
+            continue
+
+_migrate_legacy_state_dir()
 
 def _org_dir(org_code):
     path = os.path.join(ORG_BASE_DIR, org_code)
@@ -1180,12 +1234,39 @@ def _cleanup_legacy_app_session_file():
         pass
     _legacy_app_session_cleaned = True
 
+def _get_secret_key_path():
+    base_dir = os.environ.get("GENESYS_STATE_DIR") or ORG_BASE_DIR
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(base_dir, ".secret.key")
+
 def _get_or_create_key():
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, "rb") as f: return f.read()
+    key_path = _get_secret_key_path()
+    legacy_path = KEY_FILE
+    if os.path.exists(key_path):
+        with open(key_path, "rb") as f:
+            return f.read()
+    if os.path.exists(legacy_path):
+        try:
+            with open(legacy_path, "rb") as f:
+                key = f.read()
+            if key:
+                try:
+                    with open(key_path, "wb") as wf:
+                        wf.write(key)
+                    os.chmod(key_path, 0o600)
+                except Exception:
+                    pass
+                return key
+        except Exception:
+            pass
     key = Fernet.generate_key()
-    with open(KEY_FILE, "wb") as f: f.write(key)
-    try: os.chmod(KEY_FILE, 0o600)
+    with open(key_path, "wb") as f:
+        f.write(key)
+    try:
+        os.chmod(key_path, 0o600)
     except: pass
     return key
 
@@ -1197,6 +1278,7 @@ _cookie_manager = None
 def _get_cookie_manager():
     global _cookie_manager
     if not Runtime.exists():
+        _rm_debug("runtime not ready; cookie manager unavailable")
         return None
     if _cookie_manager is None:
         key = _get_or_create_key()
@@ -1207,15 +1289,21 @@ def _get_cookie_manager():
         try:
             from streamlit_cookies_manager import EncryptedCookieManager
             _cookie_manager = EncryptedCookieManager(prefix="genesys", password=key_str)
+            _rm_debug("cookie manager created")
         except RuntimeError:
+            _rm_debug("cookie manager creation failed: runtime error")
             return None
-        except Exception:
+        except Exception as e:
+            _rm_debug("cookie manager creation failed: %s", e)
             return None
     try:
         if not _cookie_manager.ready():
+            _rm_debug("cookie manager not ready yet")
             return None
-    except Exception:
+    except Exception as e:
+        _rm_debug("cookie manager ready check failed: %s", e)
         return None
+    _rm_debug("cookie manager ready")
     return _cookie_manager
 
 def _cookie_manager_initializing():
@@ -1278,20 +1366,63 @@ def generate_password(length=12):
 def load_app_session():
     try:
         _cleanup_legacy_app_session_file()
-        # Cookie-only session: browser scoped remember-me
-        cookies = _get_cookie_manager()
-        if cookies is None:
+        session_data = _read_app_session_cookie()
+        if not session_data:
             return None
-        raw = cookies.get(APP_SESSION_COOKIE)
-        if not raw:
-            return None
-        session_data = json.loads(raw)
         timestamp = session_data.get("timestamp", 0)
         if pytime.time() - timestamp > APP_SESSION_TTL:
+            _rm_debug("load session: cookie expired")
             delete_app_session()
             return None
+        _rm_debug(
+            "load session: valid for user=%s org=%s",
+            session_data.get("username"),
+            session_data.get("org_code"),
+        )
         return session_data
-    except Exception:
+    except Exception as e:
+        _rm_debug("load session failed: %s", e)
+        return None
+
+def _read_app_session_cookie(with_status=False):
+    cookies = _get_cookie_manager()
+    if cookies is None:
+        _rm_debug("read cookie skipped: cookie manager missing")
+        return ("manager_missing", None) if with_status else None
+    raw = cookies.get(APP_SESSION_COOKIE)
+    if not raw:
+        _rm_debug("read cookie: not found")
+        return ("not_found", None) if with_status else None
+    _rm_debug("read cookie: found (%s chars)", len(str(raw)))
+    try:
+        data = json.loads(raw)
+        return ("found", data) if with_status else data
+    except Exception as e:
+        _rm_debug("read cookie parse failed: %s", e)
+        return ("invalid", None) if with_status else None
+
+def _hydrate_app_user_from_saved_session(session_data):
+    try:
+        username = (session_data or {}).get("username")
+        org_code = (session_data or {}).get("org_code", "default")
+        if not username:
+            _rm_debug("hydrate failed: missing username in saved session")
+            return None
+        org_users = auth_manager.get_all_users(org_code) or {}
+        db_user = org_users.get(username)
+        if not db_user:
+            _rm_debug("hydrate failed: user not found in users file user=%s org=%s", username, org_code)
+            return None
+        hydrated = {
+            "username": username,
+            "org_code": org_code,
+            "role": db_user.get("role", session_data.get("role", "Reports User")),
+            "metrics": db_user.get("metrics", session_data.get("metrics", [])),
+        }
+        _rm_debug("hydrate success for user=%s org=%s", username, org_code)
+        return hydrated
+    except Exception as e:
+        _rm_debug("hydrate failed: %s", e)
         return None
 
 def save_app_session(user_data):
@@ -1299,12 +1430,22 @@ def save_app_session(user_data):
         _cleanup_legacy_app_session_file()
         cookies = _get_cookie_manager()
         if cookies is None:
+            _rm_debug(
+                "save session failed: cookie manager missing for user=%s org=%s",
+                user_data.get("username"),
+                user_data.get("org_code"),
+            )
             return False
         payload = {**user_data, "timestamp": pytime.time()}
-        cookies[APP_SESSION_COOKIE] = json.dumps(payload)
-        cookies.save()
+        payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        _rm_debug("save session payload bytes=%s", len(payload_json.encode("utf-8")))
+        cookies[APP_SESSION_COOKIE] = payload_json
+        save_result = cookies.save()
+        _rm_debug("cookie save() returned: %s", save_result)
+        _rm_debug("save session success for user=%s org=%s", user_data.get("username"), user_data.get("org_code"))
         return True
-    except Exception:
+    except Exception as e:
+        _rm_debug("save session failed: %s", e)
         return False
 
 def delete_app_session():
@@ -1312,31 +1453,118 @@ def delete_app_session():
     try:
         st.session_state.pop("_remember_me_pending_payload", None)
         st.session_state.pop("_remember_me_pending_retries", None)
-        st.session_state["_cookie_init_retries"] = 0
     except Exception:
         pass
     
     # Delete cookie
     try:
         cookies = _get_cookie_manager()
-        if cookies is not None and APP_SESSION_COOKIE in cookies:
-            del cookies[APP_SESSION_COOKIE]
+        if cookies is not None:
+            # streamlit_cookies_manager can fail to remove reliably with only `del`;
+            # write an empty tombstone value as fallback.
+            try:
+                if APP_SESSION_COOKIE in cookies:
+                    del cookies[APP_SESSION_COOKIE]
+            except Exception:
+                pass
+            cookies[APP_SESSION_COOKIE] = ""
             cookies.save()
-    except Exception:
+            _rm_debug("delete session cookie removal requested")
+        else:
+            _rm_debug("delete session cookie skipped: cookie missing")
+    except Exception as e:
+        _rm_debug("delete session failed: %s", e)
         pass
+
+def _flush_pending_remember_me_delete():
+    if not st.session_state.get("_remember_me_pending_delete"):
+        return True
+    retries = int(st.session_state.get("_remember_me_pending_delete_retries", 0))
+    cookie_status, existing = _read_app_session_cookie(with_status=True)
+    if cookie_status == "manager_missing":
+        retries += 1
+        st.session_state["_remember_me_pending_delete_retries"] = retries
+        _rm_debug("pending remember-me delete waiting for cookie manager retry=%s", retries)
+        if retries <= 20:
+            _safe_autorefresh(interval=700, key=f"remember_delete_retry_{retries}")
+            st.info("Oturum çıkışı doğrulanıyor, lütfen bekleyin...")
+            st.stop()
+        _rm_debug("pending remember-me delete exceeded retries=%s while waiting manager", retries)
+        return False
+    if cookie_status == "not_found":
+        st.session_state["_remember_me_pending_delete"] = False
+        st.session_state["_remember_me_pending_delete_retries"] = 0
+        _rm_debug("pending remember-me delete verified")
+        return True
+    try:
+        cookies = _get_cookie_manager()
+        if cookies is not None:
+            try:
+                if APP_SESSION_COOKIE in cookies:
+                    del cookies[APP_SESSION_COOKIE]
+            except Exception:
+                pass
+            cookies[APP_SESSION_COOKIE] = ""
+            cookies.save()
+            _rm_debug("pending remember-me delete attempt=%s save issued", retries + 1)
+    except Exception as e:
+        _rm_debug("pending remember-me delete failed: %s", e)
+    retries += 1
+    st.session_state["_remember_me_pending_delete_retries"] = retries
+    if retries <= 20:
+        _safe_autorefresh(interval=700, key=f"remember_delete_retry_{retries}")
+        st.info("Oturum çıkışı doğrulanıyor, lütfen bekleyin...")
+        st.stop()
+    _rm_debug("pending remember-me delete exceeded retries=%s", retries)
+    return False
 
 def _flush_pending_remember_me():
     payload = st.session_state.get("_remember_me_pending_payload")
     if not payload:
-        return
-    if save_app_session(payload):
+        return True
+    _rm_debug(
+        "pending remember-me flush: retry=%s user=%s org=%s",
+        st.session_state.get("_remember_me_pending_retries", 0),
+        payload.get("username"),
+        payload.get("org_code"),
+    )
+    existing = _read_app_session_cookie()
+    if (
+        existing
+        and existing.get("username") == payload.get("username")
+        and existing.get("org_code", "default") == payload.get("org_code", "default")
+    ):
         st.session_state.pop("_remember_me_pending_payload", None)
         st.session_state.pop("_remember_me_pending_retries", None)
-        return
+        _rm_debug("pending remember-me flush verified")
+        return True
     retries = int(st.session_state.get("_remember_me_pending_retries", 0)) + 1
     st.session_state["_remember_me_pending_retries"] = retries
-    if retries <= 3:
-        st.rerun()
+    save_ok = save_app_session(payload)
+    _rm_debug("pending remember-me flush attempt=%s save_ok=%s", retries, save_ok)
+    # Give cookie component time to initialize and persist.
+    if retries <= 20:
+        _safe_autorefresh(interval=700, key=f"remember_flush_retry_{retries}")
+        st.info("Beni Hatırla kaydı doğrulanıyor, lütfen bekleyin...")
+        st.stop()
+    _rm_debug("pending remember-me flush failed after retries=%s", retries)
+    return False
+
+def _ensure_cookie_component_ready(max_retries=8):
+    retries = int(st.session_state.get("_cookie_boot_retries", 0))
+    cm = _get_cookie_manager()
+    if cm is not None:
+        st.session_state["_cookie_boot_retries"] = 0
+        _rm_debug("cookie component ready at retry=%s", retries)
+        return True
+    if retries < max_retries:
+        st.session_state["_cookie_boot_retries"] = retries + 1
+        _rm_debug("cookie component boot retry=%s/%s", retries + 1, max_retries)
+        _safe_autorefresh(interval=700, key=f"cookie_boot_retry_{retries}")
+        st.info("Oturum bileşeni hazırlanıyor, lütfen bekleyin...")
+        st.stop()
+    _rm_debug("cookie component not ready after max retries=%s", max_retries)
+    return False
 
 def _user_dir(org_code, username):
     base = _org_dir(org_code)
@@ -2294,15 +2522,39 @@ def create_gauge_chart(value, title, height=250):
     except Exception:
         value = 0
     value = float(value)
+    title_size = max(12, int(height * 0.15))
     fig = go.Figure(go.Indicator(
-        mode="gauge", value=value, title={'text': title},
-        gauge={'axis': {'range': [0, 100]}, 'bar': {'color': "#00AEC7"},
-               'steps': [{'range': [0, 50], 'color': "#ffebee"}, {'range': [50, 80], 'color': "#fff3e0"}, {'range': [80, 100], 'color': "#e8f5e9"}]}))
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=45, b=10), autosize=True)
-    # Scale number size with chart height
-    num_size = max(12, int(height * 0.12))
-    fig.add_annotation(x=0.5, y=0.05, text=f"{value:.0f}", showarrow=False,
-                       font=dict(size=num_size, color="#64748b"))
+        mode="gauge",
+        value=value,
+        title={"text": title, "font": {"size": title_size, "color": "#475569"}},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": "#00AEC7"},
+            "steps": [
+                {"range": [0, 50], "color": "#ffebee"},
+                {"range": [50, 80], "color": "#fff3e0"},
+                {"range": [80, 100], "color": "#e8f5e9"},
+            ],
+        },
+    ))
+    # Keep gauge dimensions and alignment stable across cards.
+    fig.update_layout(
+        height=height,
+        margin=dict(l=4, r=4, t=40, b=0),
+        autosize=True,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    # Center value: +50% size and bold.
+    num_size = max(18, int(height * 0.18))
+    fig.add_annotation(
+        x=0.5,
+        y=0.09,
+        text=f"<b>{value:.0f}</b>",
+        showarrow=False,
+        font=dict(size=num_size, color="#334155"),
+        align="center",
+    )
     return fig
 
 def create_donut_chart(data_dict, title, height=300):
@@ -2362,7 +2614,10 @@ def init_session_state():
     if 'last_console_log_count' not in st.session_state: st.session_state.last_console_log_count = 0 # Track logged errors
     if '_remember_me_pending_payload' not in st.session_state: st.session_state._remember_me_pending_payload = None
     if '_remember_me_pending_retries' not in st.session_state: st.session_state._remember_me_pending_retries = 0
-    if '_cookie_init_retries' not in st.session_state: st.session_state._cookie_init_retries = 0
+    if '_remember_me_pending_delete' not in st.session_state: st.session_state._remember_me_pending_delete = False
+    if '_remember_me_pending_delete_retries' not in st.session_state: st.session_state._remember_me_pending_delete_retries = 0
+    if '_cookie_boot_retries' not in st.session_state: st.session_state._cookie_boot_retries = 0
+    if 'remember_me_enabled' not in st.session_state: st.session_state.remember_me_enabled = False
 
 def log_to_console(message, level='error'):
     """Injects JavaScript to log to browser console."""
@@ -2374,7 +2629,11 @@ def log_to_console(message, level='error'):
     st.markdown(js_code, unsafe_allow_html=True)
 
 init_session_state()
-_flush_pending_remember_me()
+if not _flush_pending_remember_me_delete():
+    st.stop()
+if not _flush_pending_remember_me() and _cookie_manager_initializing():
+    st.info("Oturum bileşeni hazırlanıyor, lütfen bekleyin...")
+    st.stop()
 
 # Ensure shared DataManager is available after login
 if st.session_state.app_user and 'data_manager' not in st.session_state:
@@ -2383,27 +2642,39 @@ data_manager = st.session_state.get('data_manager')
 
 # Dashboard Config and Credentials will be loaded after login
 if st.session_state.app_user and 'dashboard_config_loaded' not in st.session_state:
+    st.session_state.dashboard_config_loaded = False
+
+if st.session_state.app_user:
     org = st.session_state.app_user.get('org_code', 'default')
-    config = load_dashboard_config(org)
-    st.session_state.dashboard_layout, st.session_state.dashboard_cards = config.get("layout", 1), config.get("cards", [{"id": 0, "title": "", "queues": [], "size": "medium"}])
-    st.session_state.dashboard_config_loaded = True
+    owner_key = f"{org}:{st.session_state.app_user.get('username', '')}"
+    if (not st.session_state.get('dashboard_config_loaded')) or (st.session_state.get('_dashboard_config_owner') != owner_key):
+        config = load_dashboard_config(org)
+        st.session_state.dashboard_layout = config.get("layout", 1)
+        st.session_state.dashboard_cards = config.get("cards", [{"id": 0, "title": "", "queues": [], "size": "medium"}])
+        st.session_state.dashboard_config_loaded = True
+        st.session_state._dashboard_config_owner = owner_key
 
 # --- APP LOGIN ---
 if not st.session_state.app_user:
+    _ensure_cookie_component_ready(max_retries=8)
     # Try Auto-Login from Encrypted Session File
     saved_session = load_app_session()
     if saved_session:
-        st.session_state.app_user = saved_session
-        ensure_data_manager()
-        st.session_state["_cookie_init_retries"] = 0
-        st.rerun()
-    elif _cookie_manager_initializing():
-        retries = int(st.session_state.get("_cookie_init_retries", 0))
-        if retries < 3:
-            st.session_state["_cookie_init_retries"] = retries + 1
+        hydrated_user = _hydrate_app_user_from_saved_session(saved_session)
+        if not hydrated_user:
+            _rm_debug("auto-login rejected: saved session could not be hydrated, deleting cookie")
+            delete_app_session()
+        else:
+            _rm_debug(
+                "auto-login success from cookie for user=%s org=%s",
+                hydrated_user.get("username"),
+                hydrated_user.get("org_code"),
+            )
+            st.session_state.app_user = hydrated_user
+            st.session_state.remember_me_enabled = True
+            ensure_data_manager()
             st.rerun()
-    else:
-        st.session_state["_cookie_init_retries"] = 0
+    _rm_debug("auto-login did not find valid cookie session")
 
     st.markdown("<h1 style='text-align: center;'>Genesys Reporting API</h1>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 2, 1])
@@ -2424,16 +2695,30 @@ if not st.session_state.app_user:
                     
                     # Handle Remember Me
                     if remember_me:
-                        if not save_app_session(full_user):
-                            st.session_state._remember_me_pending_payload = full_user
-                            st.session_state._remember_me_pending_retries = 0
+                        _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name, u_org)
+                        remember_payload = {
+                            "username": u_name,
+                            "org_code": full_user.get("org_code", u_org),
+                        }
+                        st.session_state.remember_me_enabled = True
+                        st.session_state._remember_me_pending_payload = remember_payload
+                        st.session_state._remember_me_pending_retries = 0
+                        _rm_debug("remember-me queued for verified write")
                     else:
+                        _rm_debug("login submit with remember-me OFF for user=%s org=%s", u_name, u_org)
+                        st.session_state.remember_me_enabled = False
+                        st.session_state._remember_me_pending_delete = True
+                        st.session_state._remember_me_pending_delete_retries = 0
                         delete_app_session()
                         
                     st.session_state.app_user = full_user
+                    st.session_state.genesys_logged_out = False
+                    st.session_state.dashboard_config_loaded = False
+                    st.session_state.pop("_dashboard_config_owner", None)
                     ensure_data_manager()
                     st.rerun()
                 else:
+                    _rm_debug("login failed for user=%s org=%s", u_name, u_org)
                     st.error("Hatalı organizasyon, kullanıcı adı veya şifre!")
     st.stop()
 
@@ -2442,8 +2727,7 @@ if st.session_state.app_user:
     org = st.session_state.app_user.get('org_code', 'default')
     saved_creds = load_credentials(org)
     
-    logged_out_flag = os.path.exists(_org_flag_path(org))
-    if not st.session_state.api_client and saved_creds and not st.session_state.get('genesys_logged_out') and not logged_out_flag:
+    if not st.session_state.api_client and saved_creds and not st.session_state.get('genesys_logged_out'):
         cid, csec, reg = saved_creds.get("client_id"), saved_creds.get("client_secret"), saved_creds.get("region", "mypurecloud.ie")
         if cid and csec:
             client, err = authenticate(cid, csec, reg, org_code=org)
@@ -2477,14 +2761,18 @@ with st.sidebar:
         except Exception:
             pass
         # Clear session file and cookie FIRST
+        st.session_state._remember_me_pending_delete = True
+        st.session_state._remember_me_pending_delete_retries = 0
         delete_app_session()
+        st.session_state.remember_me_enabled = False
         # Clear all session state
         st.session_state.app_user = None
         st.session_state.api_client = None
         st.session_state.logged_in = False
-        st.session_state.genesys_logged_out = True
+        st.session_state.genesys_logged_out = False
         if 'dashboard_config_loaded' in st.session_state:
             del st.session_state.dashboard_config_loaded
+        st.session_state.pop("_dashboard_config_owner", None)
         if 'data_manager' in st.session_state:
             del st.session_state.data_manager
         st.rerun()
@@ -3329,7 +3617,7 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
     c_sec = st.text_input("Client Secret", value=conf.get("client_secret", ""), type="password")
     regions = ["mypurecloud.ie", "mypurecloud.com", "mypurecloud.de"]
     region = st.selectbox("Region", regions, index=regions.index(conf.get("region", "mypurecloud.ie")) if conf.get("region") in regions else 0)
-    remember = st.checkbox(get_text(lang, "remember_me"), value=bool(conf))
+    st.caption("API bilgileri organizasyon için şifreli saklanır ve aynı organizasyondaki tüm kullanıcılar için kullanılır.")
     
     if st.button(get_text(lang, "login_genesys")):
         if c_id and c_sec:
@@ -3338,16 +3626,10 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                 if client:
                     st.session_state.api_client = client
                     st.session_state.genesys_logged_out = False
-                    try:
-                        if os.path.exists(_org_flag_path(org)):
-                            os.remove(_org_flag_path(org))
-                    except Exception:
-                        pass
                     # Use existing offsets/intervals if available
                     cur_off = conf.get("utc_offset", 3)
                     cur_ref = conf.get("refresh_interval", 10)
-                    if remember: save_credentials(org, c_id, c_sec, region, utc_offset=cur_off, refresh_interval=cur_ref)
-                    else: delete_credentials(org)
+                    save_credentials(org, c_id, c_sec, region, utc_offset=cur_off, refresh_interval=cur_ref)
                     
                     api = GenesysAPI(client)
                     maps = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
@@ -3386,32 +3668,14 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
             with _org_maps_lock:
                 _org_maps_cache.pop(org, None)
             try:
-                token_cache = os.path.join("orgs", org, ".token_cache.json")
+                token_cache = os.path.join(_org_dir(org), ".token_cache.json")
                 if os.path.exists(token_cache):
                     os.remove(token_cache)
             except Exception:
                 pass
             st.session_state.genesys_logged_out = True
             set_dm_enabled(org, False)
-            try:
-                with open(_org_flag_path(org), "w", encoding="utf-8") as f:
-                    f.write("1")
-            except Exception:
-                pass
-            
-            # Also logout from app profile
-            try:
-                _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
-            except Exception:
-                pass
-            delete_app_session()
-            st.session_state.app_user = None
-            st.session_state.logged_in = False
-            if 'dashboard_config_loaded' in st.session_state:
-                del st.session_state.dashboard_config_loaded
-            if 'data_manager' in st.session_state:
-                del st.session_state.data_manager
-            
+            # Keep app profile session intact; this only logs out Genesys API for current browser session.
             st.rerun()
 
 elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
@@ -4523,10 +4787,11 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
     show_agent = st.session_state.get('show_agent_panel', False)
     show_call = st.session_state.get('show_call_panel', False)
     if show_agent and show_call:
-        # 4-column grid: 2 parts dashboard, 1 part agent, 1 part call
-        main_c, agent_c, call_c = st.columns([2, 1, 1])
+        # Agent panel +10%, call panel +20% relative to current widths.
+        main_c, agent_c, call_c = st.columns([6, 1.1, 1.2])
     elif show_agent or show_call:
-        main_c, side_c = st.columns([3, 1])
+        side_weight = 1.1 if show_agent else 1.2
+        main_c, side_c = st.columns([7, side_weight])
         agent_c = side_c if show_agent else None
         call_c = side_c if show_call else None
     else:
@@ -4542,31 +4807,47 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             c_size = card.get('size', 'medium')
             # Base heights: xsmall=300, Small=500, Medium=650, Large=800 (Adjusted for content)
             c_height = 300 if c_size == 'xsmall' else (500 if c_size == 'small' else (650 if c_size == 'medium' else 800))
-            
+
             with st.container(height=c_height, border=True):
                 card_title = card['title'] if card['title'] else f"Grup #{card['id']+1}"
                 st.markdown(f"### {card_title}")
                 with st.expander(f"⚙️ Settings", expanded=False):
+                    prev_card = dict(card)
                     card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
                     size_opts = ["xsmall", "small", "medium", "large"]
                     card['size'] = st.selectbox("Size", size_opts, index=size_opts.index(card.get('size', 'medium')), key=f"sz_{card['id']}")
                     card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
-                    queue_options = list(st.session_state.queues_map.keys())
-                    queue_defaults = [q for q in card.get('queues', []) if q in queue_options]
-                    card['queues'] = st.multiselect("Queues", queue_options, default=queue_defaults, key=f"q_{card['id']}")
+                    queue_options_live = list(st.session_state.queues_map.keys())
+                    saved_queues = [q for q in card.get('queues', []) if isinstance(q, str)]
+                    missing_saved_queues = [q for q in saved_queues if q not in queue_options_live]
+                    queue_options = queue_options_live + missing_saved_queues
+                    selected_queues = st.multiselect(
+                        "Queues",
+                        queue_options,
+                        default=saved_queues,
+                        key=f"q_{card['id']}",
+                        format_func=lambda q: f"{q} (not loaded)" if q in missing_saved_queues else q,
+                    )
+                    # Keep previously saved queues when live queue-map is temporarily partial/unavailable.
+                    if queue_options_live:
+                        card['queues'] = selected_queues
                     card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
-                    
+
                     st.write("---")
                     st.caption("📡 Canlı Metrikler")
                     card['live_metrics'] = st.multiselect("Live Metrics", LIVE_METRIC_OPTIONS, default=card.get('live_metrics', ["Waiting", "Interacting", "On Queue"]), format_func=lambda x: live_labels.get(x, x), key=f"lm_{card['id']}")
-                    
+
                     st.caption("📊 Günlük Metrikler")
                     card['daily_metrics'] = st.multiselect("Daily Metrics", DAILY_METRIC_OPTIONS, default=card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"]), format_func=lambda x: daily_labels.get(x, x), key=f"dm_{card['id']}")
-                    
-                    if st.button("Delete", key=f"d_{card['id']}"): to_del.append(idx)
-                    save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-                
-                if not card.get('queues'): st.info("Select queues"); continue
+
+                    if st.button("Delete", key=f"d_{card['id']}"):
+                        to_del.append(idx)
+                    if card != prev_card:
+                        save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
+
+                if not card.get('queues'):
+                    st.info("Select queues")
+                    continue
                 
                 # Determine date range based on mode
                 if st.session_state.dashboard_mode == "Live":

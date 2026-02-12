@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import requests
+import sys
 
 _cache_lock = threading.Lock()
 _mem_cache = {}
@@ -11,10 +12,23 @@ _MAX_MEM_CACHE_ENTRIES = 50
 def _cache_key(client_id, region):
     return f"{client_id}:{region}"
 
+def _resolve_org_base_dir():
+    env_dir = os.environ.get("GENESYS_STATE_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+    if getattr(sys, "frozen", False):
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return os.path.join(appdata, "GenesysCloudReporting", "orgs")
+        return os.path.join(os.path.expanduser("~"), ".genesys_cloud_reporting", "orgs")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "orgs")
+
+ORG_BASE_DIR = _resolve_org_base_dir()
+
 def _org_token_cache_path(org_code):
     if not org_code:
         return None
-    base = os.path.join("orgs", org_code)
+    base = os.path.join(ORG_BASE_DIR, org_code)
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, ".token_cache.json")
 

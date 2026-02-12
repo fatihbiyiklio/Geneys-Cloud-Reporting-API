@@ -3,15 +3,56 @@ import os
 import base64
 import hmac
 import hashlib
+import sys
+import shutil
 
-ORG_BASE_DIR = "orgs"
+def _resolve_org_base_dir():
+    env_dir = os.environ.get("GENESYS_STATE_DIR")
+    if env_dir:
+        return os.path.abspath(env_dir)
+    if getattr(sys, "frozen", False):
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return os.path.join(appdata, "GenesysCloudReporting", "orgs")
+        return os.path.join(os.path.expanduser("~"), ".genesys_cloud_reporting", "orgs")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "orgs")
+
+ORG_BASE_DIR = _resolve_org_base_dir()
 USERS_FILE = "users.json"
 PBKDF2_HASH_PREFIX = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 260000
 
 class AuthManager:
     def __init__(self):
+        self._migrate_legacy_state_dir()
         self.users = self._load_users()
+
+    def _migrate_legacy_state_dir(self):
+        try:
+            os.makedirs(ORG_BASE_DIR, exist_ok=True)
+            if os.listdir(ORG_BASE_DIR):
+                return
+        except Exception:
+            return
+        candidates = []
+        try:
+            candidates.append(os.path.join(os.getcwd(), "orgs"))
+        except Exception:
+            pass
+        try:
+            if getattr(sys, "frozen", False):
+                candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "orgs"))
+        except Exception:
+            pass
+        for source in candidates:
+            try:
+                if not source or os.path.abspath(source) == os.path.abspath(ORG_BASE_DIR):
+                    continue
+                if os.path.isdir(source) and os.listdir(source):
+                    shutil.copytree(source, ORG_BASE_DIR, dirs_exist_ok=True)
+                    return
+            except Exception:
+                continue
 
     def _load_users(self):
         data = {}
