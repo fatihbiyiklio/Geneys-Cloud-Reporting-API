@@ -1164,9 +1164,21 @@ except Exception:
 
 # --- GLOBAL HELPERS (DEFINED FIRST) ---
 
-APP_SESSION_FILE = ".session.enc"
 APP_SESSION_COOKIE = "app_session"
 APP_SESSION_TTL = 7 * 24 * 3600
+_legacy_app_session_cleaned = False
+
+def _cleanup_legacy_app_session_file():
+    global _legacy_app_session_cleaned
+    if _legacy_app_session_cleaned:
+        return
+    try:
+        legacy_path = ".session.enc"
+        if os.path.exists(legacy_path):
+            os.remove(legacy_path)
+    except Exception:
+        pass
+    _legacy_app_session_cleaned = True
 
 def _get_or_create_key():
     if os.path.exists(KEY_FILE):
@@ -1256,21 +1268,8 @@ def generate_password(length=12):
 # --- APP SESSION MANAGEMENT (REMEMBER ME) ---
 def load_app_session():
     try:
-        # 1) Try local encrypted session file first (more reliable on refresh)
-        if os.path.exists(APP_SESSION_FILE):
-            try:
-                cipher = _get_cipher()
-                raw_file = open(APP_SESSION_FILE, "rb").read()
-                session_data = json.loads(cipher.decrypt(raw_file).decode("utf-8"))
-                timestamp = session_data.get("timestamp", 0)
-                if pytime.time() - timestamp <= APP_SESSION_TTL:
-                    return session_data
-                # Expired
-                os.remove(APP_SESSION_FILE)
-            except Exception:
-                pass
-
-        # 2) Fallback to cookie
+        _cleanup_legacy_app_session_file()
+        # Cookie-only session: browser scoped remember-me
         cookies = _get_cookie_manager()
         if cookies is None:
             return None
@@ -1288,19 +1287,7 @@ def load_app_session():
 
 def save_app_session(user_data):
     try:
-        # Save to local encrypted session file for robustness
-        try:
-            cipher = _get_cipher()
-            payload = {**user_data, "timestamp": pytime.time()}
-            with open(APP_SESSION_FILE, "wb") as f:
-                f.write(cipher.encrypt(json.dumps(payload).encode("utf-8")))
-            try:
-                os.chmod(APP_SESSION_FILE, 0o600)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
+        _cleanup_legacy_app_session_file()
         cookies = _get_cookie_manager()
         if cookies is not None:
             payload = {**user_data, "timestamp": pytime.time()}
@@ -1310,12 +1297,7 @@ def save_app_session(user_data):
         pass
 
 def delete_app_session():
-    # Delete session file first
-    try:
-        if os.path.exists(APP_SESSION_FILE):
-            os.remove(APP_SESSION_FILE)
-    except Exception:
-        pass
+    _cleanup_legacy_app_session_file()
     
     # Delete cookie
     try:
@@ -1323,13 +1305,6 @@ def delete_app_session():
         if cookies is not None and APP_SESSION_COOKIE in cookies:
             del cookies[APP_SESSION_COOKIE]
             cookies.save()
-    except Exception:
-        pass
-    
-    # Double-check file is gone
-    try:
-        if os.path.exists(APP_SESSION_FILE):
-            os.remove(APP_SESSION_FILE)
     except Exception:
         pass
 

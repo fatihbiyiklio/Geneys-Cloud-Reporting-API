@@ -16,6 +16,7 @@ build/
 credentials.enc
 .secret.key
 .session.enc
+.session.*
 .streamlit/secrets.toml
 users.json
 
@@ -29,6 +30,8 @@ orgs/
 *.log
 .genesys_logged_out
 .dm_disabled
+.token_cache.json
+**/.token_cache.json
 
 # User config files
 dashboard_config.json
