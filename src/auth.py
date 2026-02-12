@@ -3,7 +3,6 @@ import os
 import threading
 import time
 import requests
-import streamlit as st
 
 _cache_lock = threading.Lock()
 _mem_cache = {}

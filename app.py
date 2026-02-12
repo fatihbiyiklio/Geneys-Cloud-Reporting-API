@@ -51,7 +51,6 @@ except Exception:
     pass
 
 from streamlit.runtime import Runtime
-from streamlit_cookies_manager import EncryptedCookieManager
 from cryptography.fernet import Fernet
 from src.data_manager import DataManager
 from src.notifications import NotificationManager, AgentNotificationManager, GlobalConversationNotificationManager
@@ -1185,15 +1184,26 @@ _cookie_manager = None
 
 def _get_cookie_manager():
     global _cookie_manager
+    if not Runtime.exists():
+        return None
     if _cookie_manager is None:
         key = _get_or_create_key()
         try:
             key_str = key.decode("utf-8")
         except Exception:
             key_str = str(key)
-        _cookie_manager = EncryptedCookieManager(prefix="genesys", password=key_str)
-    if not _cookie_manager.ready():
-        st.stop()
+        try:
+            from streamlit_cookies_manager import EncryptedCookieManager
+            _cookie_manager = EncryptedCookieManager(prefix="genesys", password=key_str)
+        except RuntimeError:
+            return None
+        except Exception:
+            return None
+    try:
+        if not _cookie_manager.ready():
+            return None
+    except Exception:
+        return None
     return _cookie_manager
 
 def load_credentials(org_code):
@@ -1262,6 +1272,8 @@ def load_app_session():
 
         # 2) Fallback to cookie
         cookies = _get_cookie_manager()
+        if cookies is None:
+            return None
         raw = cookies.get(APP_SESSION_COOKIE)
         if not raw:
             return None
@@ -1290,9 +1302,10 @@ def save_app_session(user_data):
             pass
 
         cookies = _get_cookie_manager()
-        payload = {**user_data, "timestamp": pytime.time()}
-        cookies[APP_SESSION_COOKIE] = json.dumps(payload)
-        cookies.save()
+        if cookies is not None:
+            payload = {**user_data, "timestamp": pytime.time()}
+            cookies[APP_SESSION_COOKIE] = json.dumps(payload)
+            cookies.save()
     except Exception:
         pass
 
@@ -1307,7 +1320,7 @@ def delete_app_session():
     # Delete cookie
     try:
         cookies = _get_cookie_manager()
-        if APP_SESSION_COOKIE in cookies:
+        if cookies is not None and APP_SESSION_COOKIE in cookies:
             del cookies[APP_SESSION_COOKIE]
             cookies.save()
     except Exception:
