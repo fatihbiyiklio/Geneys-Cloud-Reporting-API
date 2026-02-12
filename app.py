@@ -2496,7 +2496,7 @@ def refresh_data_manager_queues():
                     q_id = norm_map.get(q_name)
                     if q_id:
                         all_dashboard_queues[q_name] = q_id
-                
+
                 # 2. Agent Details Primary Queue (First in card list)
                 primary_q = q_list[0].strip()
                 p_id = norm_map.get(primary_q)
@@ -2515,6 +2515,31 @@ def refresh_data_manager_queues():
     dm_agent_queues = {} if use_agent_notif else union_agent_queues
     st.session_state.data_manager.start(union_queues, dm_agent_queues)
 
+def recover_org_maps_if_needed(org_code, force=False):
+    """Best-effort map recovery for dashboard editors (queues/users/presence)."""
+    if not st.session_state.get('api_client'):
+        return False
+    if not force and st.session_state.get('queues_map'):
+        return True
+    now_ts = pytime.time()
+    last_try = float(st.session_state.get("_maps_recover_ts", 0) or 0)
+    if not force and (now_ts - last_try) < 15:
+        return bool(st.session_state.get('queues_map'))
+    st.session_state["_maps_recover_ts"] = now_ts
+    try:
+        api = GenesysAPI(st.session_state.api_client)
+        maps = get_shared_org_maps(org_code, api, ttl_seconds=300, force_refresh=force)
+        st.session_state.users_map = maps.get("users_map", st.session_state.get("users_map", {}))
+        st.session_state.users_info = maps.get("users_info", st.session_state.get("users_info", {}))
+        if st.session_state.users_info:
+            st.session_state._users_info_last = dict(st.session_state.users_info)
+        st.session_state.queues_map = maps.get("queues_map", st.session_state.get("queues_map", {}))
+        st.session_state.wrapup_map = maps.get("wrapup", st.session_state.get("wrapup_map", {}))
+        st.session_state.presence_map = maps.get("presence", st.session_state.get("presence_map", {}))
+        return bool(st.session_state.get("queues_map"))
+    except Exception:
+        return False
+
 def create_gauge_chart(value, title, height=250):
     try:
         if value is None or not np.isfinite(float(value)):
@@ -2522,11 +2547,12 @@ def create_gauge_chart(value, title, height=250):
     except Exception:
         value = 0
     value = float(value)
-    title_size = max(12, int(height * 0.15))
+    title_size = min(18, max(11, int(height * 0.12)))
     fig = go.Figure(go.Indicator(
         mode="gauge",
         value=value,
         title={"text": title, "font": {"size": title_size, "color": "#475569"}},
+        domain={"x": [0, 1], "y": [0, 0.82]},
         gauge={
             "axis": {"range": [0, 100]},
             "bar": {"color": "#00AEC7"},
@@ -2540,13 +2566,13 @@ def create_gauge_chart(value, title, height=250):
     # Keep gauge dimensions and alignment stable across cards.
     fig.update_layout(
         height=height,
-        margin=dict(l=4, r=4, t=40, b=0),
+        margin=dict(l=2, r=2, t=32, b=4),
         autosize=True,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
     # Center value: +50% size and bold.
-    num_size = max(18, int(height * 0.18))
+    num_size = min(30, max(16, int(height * 0.15)))
     fig.add_annotation(
         x=0.5,
         y=0.09,
@@ -2740,6 +2766,8 @@ if st.session_state.app_user:
                     maps = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
                 st.session_state.users_map = maps.get("users_map", {})
                 st.session_state.users_info = maps.get("users_info", {})
+                if st.session_state.users_info:
+                    st.session_state._users_info_last = dict(st.session_state.users_info)
                 st.session_state.queues_map = maps.get("queues_map", {})
                 st.session_state.wrapup_map = maps.get("wrapup", {})
                 st.session_state.presence_map = maps.get("presence", {})
@@ -3405,6 +3433,7 @@ elif page == get_text(lang, "menu_reports"):
                                     chart_df["Interval"] = pd.to_datetime(chart_df["Interval"], errors="coerce")
                                     chart_df = chart_df.dropna()
                                     if not chart_df.empty:
+                                        chart_df["Interval"] = chart_df["Interval"].dt.strftime("%Y-%m-%d %H:%M")
                                         st.subheader(get_text(lang, "daily_stat"))
                                         st.line_chart(chart_df.set_index("Interval"))
                         except Exception:
@@ -3635,6 +3664,8 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                     maps = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
                     st.session_state.users_map = maps.get("users_map", {})
                     st.session_state.users_info = maps.get("users_info", {})
+                    if st.session_state.users_info:
+                        st.session_state._users_info_last = dict(st.session_state.users_info)
                     st.session_state.queues_map = maps.get("queues_map", {})
                     st.session_state.wrapup_map = maps.get("wrapup", {})
                     st.session_state.presence_map = maps.get("presence", {})
@@ -3709,15 +3740,22 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
         
         st.divider()
         st.subheader(get_text(lang, "minutely_traffic"))
-        minutely = monitor.get_minutely_stats(minutes=1)
+        minutely_window = 60
+        minutely = monitor.get_minutely_stats(minutes=minutely_window)
         if minutely:
-            df_minutely = pd.DataFrame([
-                {"Zaman": k, "İstek Adet": v} for k, v in minutely.items()
-            ]).sort_values("Zaman")
+            now_dt = datetime.now().replace(second=0, microsecond=0)
+            start_dt = now_dt - timedelta(minutes=minutely_window - 1)
+            timeline = pd.date_range(start=start_dt, end=now_dt, freq="min")
+            counts = {pd.to_datetime(k, errors="coerce"): v for k, v in minutely.items()}
+            df_minutely = pd.DataFrame({
+                "Zaman": timeline,
+                "İstek Adet": [int(counts.get(ts, 0) or 0) for ts in timeline],
+            })
+            df_minutely["Zaman"] = df_minutely["Zaman"].dt.strftime("%Y-%m-%d %H:%M")
             df_minutely = sanitize_numeric_df(df_minutely)
             st.line_chart(df_minutely.set_index("Zaman"))
         else:
-            st.info("Son 1 dakikada trafik yok.")
+            st.info("Son 60 dakikada trafik yok.")
 
         st.subheader(get_text(lang, "hourly_traffic_24h"))
         hourly = monitor.get_hourly_stats()
@@ -3835,6 +3873,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
             df_mem["timestamp"] = pd.to_datetime(df_mem["timestamp"], errors="coerce")
             df_mem = df_mem.dropna(subset=["timestamp"])
             if not df_mem.empty:
+                df_mem["timestamp"] = df_mem["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
                 st.line_chart(df_mem.set_index("timestamp")[["rss_mb"]])
         else:
             st.info("Bellek örneği henüz yok.")
@@ -4707,6 +4746,8 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
 
 elif st.session_state.page == get_text(lang, "menu_dashboard"):
     # (Config already loaded at top level)
+    if recover_org_maps_if_needed(org, force=False):
+        refresh_data_manager_queues()
     st.title(get_text(lang, "menu_dashboard"))
     c_c1, c_c2, c_c3 = st.columns([1, 2, 1])
     if c_c1.button(get_text(lang, "add_group"), width='stretch'):
@@ -4757,6 +4798,12 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             ref_int = st.session_state.get('org_config', {}).get('refresh_interval', 15)
             if auto_ref:
                 _safe_autorefresh(interval=ref_int * 1000, key="data_refresh")
+        if not st.session_state.get("queues_map"):
+            st.caption("Queue listesi yuklenemedi.")
+            if st.button("Queue Listesini Yenile", key="reload_dashboard_queue_map"):
+                recover_org_maps_if_needed(org, force=True)
+                refresh_data_manager_queues()
+                st.rerun()
 
     # Available metric options
     # Available metric options
@@ -4805,8 +4852,28 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         with grid[idx % st.session_state.dashboard_layout]:
             # Determine Container Height based on size
             c_size = card.get('size', 'medium')
-            # Base heights: xsmall=300, Small=500, Medium=650, Large=800 (Adjusted for content)
-            c_height = 300 if c_size == 'xsmall' else (500 if c_size == 'small' else (650 if c_size == 'medium' else 800))
+            visuals_cfg = card.get('visual_metrics', ["Service Level"])
+            visual_count = max(1, len(visuals_cfg))
+            visuals_per_row = 1 if c_size == 'xsmall' else (2 if c_size in ['small', 'medium'] else 3)
+            visual_rows = max(1, (visual_count + visuals_per_row - 1) // visuals_per_row)
+            gauge_base_h = 110 if c_size == 'xsmall' else (125 if c_size == 'small' else (140 if c_size == 'medium' else 160))
+            gauge_row_h = gauge_base_h + 20
+
+            live_sel = card.get('live_metrics', ["Waiting", "Interacting", "On Queue"])
+            daily_sel = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
+            live_rows = ((len(live_sel) - 1) // 5 + 1) if (st.session_state.dashboard_mode == "Live" and live_sel) else 0
+            daily_rows = ((len(daily_sel) - 1) // 5 + 1) if daily_sel else 0
+            metric_row_h = 74
+
+            header_block_h = 96
+            caption_block_h = 28 if daily_rows else 0
+            metrics_block_h = (live_rows + daily_rows) * metric_row_h
+            visuals_block_h = visual_rows * gauge_row_h
+            padding_h = 28
+            c_height = header_block_h + caption_block_h + metrics_block_h + visuals_block_h + padding_h
+
+            min_height_map = {'xsmall': 380, 'small': 470, 'medium': 560, 'large': 650}
+            c_height = max(c_height, min_height_map.get(c_size, 560))
 
             with st.container(height=c_height, border=True):
                 card_title = card['title'] if card['title'] else f"Grup #{card['id']+1}"
@@ -4817,20 +4884,31 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     size_opts = ["xsmall", "small", "medium", "large"]
                     card['size'] = st.selectbox("Size", size_opts, index=size_opts.index(card.get('size', 'medium')), key=f"sz_{card['id']}")
                     card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
-                    queue_options_live = list(st.session_state.queues_map.keys())
-                    saved_queues = [q for q in card.get('queues', []) if isinstance(q, str)]
-                    missing_saved_queues = [q for q in saved_queues if q not in queue_options_live]
-                    queue_options = queue_options_live + missing_saved_queues
-                    selected_queues = st.multiselect(
-                        "Queues",
-                        queue_options,
-                        default=saved_queues,
-                        key=f"q_{card['id']}",
-                        format_func=lambda q: f"{q} (not loaded)" if q in missing_saved_queues else q,
-                    )
-                    # Keep previously saved queues when live queue-map is temporarily partial/unavailable.
-                    if queue_options_live:
+                    queue_options = list(st.session_state.queues_map.keys())
+                    option_by_lower = {q.strip().lower(): q for q in queue_options}
+                    queue_defaults = []
+                    for q in card.get('queues', []):
+                        if not isinstance(q, str):
+                            continue
+                        q_clean = q.replace("(not loaded)", "").strip()
+                        if q_clean in queue_options:
+                            queue_defaults.append(q_clean)
+                            continue
+                        canonical = option_by_lower.get(q_clean.lower())
+                        if canonical:
+                            queue_defaults.append(canonical)
+                    if queue_options:
+                        selected_queues = st.multiselect("Queues", queue_options, default=queue_defaults, key=f"q_{card['id']}")
                         card['queues'] = selected_queues
+                    else:
+                        fallback_default = ", ".join([q for q in card.get('queues', []) if isinstance(q, str)])
+                        manual_queues = st.text_input(
+                            "Queues (manual)",
+                            value=fallback_default,
+                            key=f"q_manual_{card['id']}",
+                            placeholder="Queue1, Queue2",
+                        )
+                        card['queues'] = [q.strip() for q in manual_queues.split(",") if q.strip()]
                     card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
 
                     st.write("---")
@@ -4855,6 +4933,26 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     obs_map, daily_map, _ = st.session_state.data_manager.get_data(card['queues'])
                     items_live = [obs_map.get(q) for q in card['queues'] if obs_map.get(q)]
                     items_daily = [daily_map.get(q) for q in card['queues'] if daily_map.get(q)]
+                    # Fallback: if DataManager cache is temporarily empty, fetch directly once.
+                    if (not items_live and not items_daily) and st.session_state.get('api_client'):
+                        queue_ids = [st.session_state.queues_map.get(q) for q in card['queues'] if st.session_state.queues_map.get(q)]
+                        if queue_ids:
+                            try:
+                                api = GenesysAPI(st.session_state.api_client)
+                                id_map = {v: k for k, v in st.session_state.queues_map.items()}
+                                obs_resp = api.get_queue_observations(queue_ids)
+                                if obs_resp:
+                                    obs_map = process_observations(obs_resp, id_map, st.session_state.get("presence_map") or {})
+                                    items_live = [obs_map.get(q) for q in card['queues'] if obs_map.get(q)]
+                                now_utc = datetime.now(timezone.utc)
+                                start_of_day_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+                                interval = f"{start_of_day_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{now_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                                daily_resp = api.get_queue_daily_stats(queue_ids, interval=interval)
+                                if daily_resp:
+                                    daily_map = process_daily_stats(daily_resp, id_map)
+                                    items_daily = [daily_map.get(q) for q in card['queues'] if daily_map.get(q)]
+                            except Exception:
+                                pass
                 else:
                     # Fetch historical data via API
                     items_live = []  # No live data for historical
@@ -5016,29 +5114,27 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             for j, metric in enumerate(batch):
                                 cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
                     
-                    # Render selected visuals
+                    # Render selected visuals (wrapped rows to prevent overflow)
                     visuals = card.get('visual_metrics', ["Service Level"])
-                    # Dynamic Height: Smaller if multiple visuals to fit side-by-side without overflowing vertically if wrapped (though we will use cols)
-                    # Actually if side-by-side, we can keep reasonable height but maybe separate row if too many?
-                    # For now, put them all in one row.
-                    base_h = 100 if card.get('size') == 'xsmall' else (130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190))
-                    # If multiple, potentially reduce slightly or keep same? User said "too big".
-                    # Let's trust the reduced base_h.
-                    
+                    size_now = card.get('size')
+                    base_h = 110 if size_now == 'xsmall' else (125 if size_now == 'small' else (140 if size_now == 'medium' else 160))
                     panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
 
                     if visuals:
-                        cols = st.columns(len(visuals))
-                        for idx, vis in enumerate(visuals):
-                            with cols[idx]:
-                                if vis == "Service Level":
-                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
-                                elif vis == "Answer Rate":
-                                    ar_val = (ans / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
-                                elif vis == "Abandon Rate":
-                                    ab_val = (abn / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
+                        per_row = 1 if size_now == 'xsmall' else (2 if size_now in ['small', 'medium'] else 3)
+                        for start in range(0, len(visuals), per_row):
+                            row = visuals[start:start + per_row]
+                            cols = st.columns(per_row)
+                            for idx, vis in enumerate(row):
+                                with cols[idx]:
+                                    if vis == "Service Level":
+                                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                    elif vis == "Answer Rate":
+                                        ar_val = (ans / off * 100) if off > 0 else 0
+                                        st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                    elif vis == "Abandon Rate":
+                                        ab_val = (abn / off * 100) if off > 0 else 0
+                                        st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}_{start}_{idx}")
                 
                 else:
                     # Historical mode (Yesterday/Date) - show daily stats with gauge
@@ -5054,23 +5150,27 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             for j, metric in enumerate(batch):
                                 cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
                     
-                    # Render selected visuals
+                    # Render selected visuals (wrapped rows to prevent overflow)
                     visuals = card.get('visual_metrics', ["Service Level"])
-                    base_h = 100 if card.get('size') == 'xsmall' else (130 if card.get('size') == 'small' else (160 if card.get('size') == 'medium' else 190))
+                    size_now = card.get('size')
+                    base_h = 110 if size_now == 'xsmall' else (125 if size_now == 'small' else (140 if size_now == 'medium' else 160))
                     panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
 
                     if visuals:
-                        cols = st.columns(len(visuals))
-                        for idx, vis in enumerate(visuals):
-                            with cols[idx]:
-                                if vis == "Service Level":
-                                    st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}")
-                                elif vis == "Answer Rate":
-                                    ar_val = (ans / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}")
-                                elif vis == "Abandon Rate":
-                                    ab_val = (abn / off * 100) if off > 0 else 0
-                                    st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}")
+                        per_row = 1 if size_now == 'xsmall' else (2 if size_now in ['small', 'medium'] else 3)
+                        for start in range(0, len(visuals), per_row):
+                            row = visuals[start:start + per_row]
+                            cols = st.columns(per_row)
+                            for idx, vis in enumerate(row):
+                                with cols[idx]:
+                                    if vis == "Service Level":
+                                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                    elif vis == "Answer Rate":
+                                        ar_val = (ans / off * 100) if off > 0 else 0
+                                        st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                    elif vis == "Abandon Rate":
+                                        ab_val = (abn / off * 100) if off > 0 else 0
+                                        st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}_{start}_{idx}")
 
     if to_del:
         for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]
@@ -5159,14 +5259,42 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 st.warning("Agent detayları sadece CANLI modda görünür.")
             elif not st.session_state.get('api_client'):
                 st.warning(get_text(lang, "genesys_not_connected"))
-            elif not st.session_state.get('users_info'):
-                st.info("Kullanıcı bilgileri yükleniyor...")
             else:
+                users_info_map = st.session_state.get('users_info') or {}
+                if users_info_map:
+                    st.session_state._users_info_last = dict(users_info_map)
+                else:
+                    # Recover from last-known users, lazy org refresh, then users_map inversion.
+                    cached_users_info = st.session_state.get('_users_info_last') or {}
+                    if cached_users_info:
+                        users_info_map = dict(cached_users_info)
+                    else:
+                        last_try = float(st.session_state.get("_users_info_recover_ts", 0) or 0)
+                        if (now_ts - last_try) > 20:
+                            st.session_state._users_info_recover_ts = now_ts
+                            try:
+                                api = GenesysAPI(st.session_state.api_client)
+                                refreshed = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
+                                users_info_map = refreshed.get("users_info", {}) or {}
+                                st.session_state.users_info = users_info_map
+                                if users_info_map:
+                                    st.session_state._users_info_last = dict(users_info_map)
+                            except Exception:
+                                pass
+                    if not users_info_map:
+                        users_map = st.session_state.get("users_map") or {}
+                        if users_map:
+                            users_info_map = {uid: {"name": name, "username": "", "email": ""} for name, uid in users_map.items()}
+                            st.session_state.users_info = users_info_map
+                            st.session_state._users_info_last = dict(users_info_map)
+                if not users_info_map:
+                    st.info("Kullanıcı bilgileri yükleniyor...")
+
                 agent_notif = ensure_agent_notifications_manager()
                 agent_notif.update_client(
                     st.session_state.api_client,
                     st.session_state.queues_map,
-                    st.session_state.get('users_info'),
+                    users_info_map,
                     st.session_state.get('presence_map')
                 )
 
@@ -5201,7 +5329,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                 group_member_ids.add(m.get("id"))
                     all_user_ids = sorted(group_member_ids)
                 else:
-                    all_user_ids = sorted(st.session_state.users_info.keys())
+                    all_user_ids = sorted(users_info_map.keys())
 
                 # Seed from API if notifications cache is empty/stale
                 shared_ts, shared_presence, shared_routing = _get_shared_agent_seed(org)
@@ -5247,7 +5375,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 # Build agent_data from active users
                 agent_data = {"_all": []}
                 for uid in active_user_ids:
-                    user_info = st.session_state.users_info.get(uid, {})
+                    user_info = users_info_map.get(uid, {})
                     name = user_info.get("name", "Unknown")
                     presence = agent_notif.get_user_presence(uid) if agent_notif else {}
                     routing = agent_notif.get_user_routing(uid) if agent_notif else {}
