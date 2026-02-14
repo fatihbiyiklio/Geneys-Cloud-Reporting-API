@@ -194,6 +194,7 @@ class DataManager:
         
         q_ids = list(self.queues_map.values())
         id_map = {v: k for k, v in self.queues_map.items()}
+        monitored_queue_names = set(id_map.values())
         
         # Debug Log to confirm optimization
         # (debug log removed for build)
@@ -202,27 +203,46 @@ class DataManager:
         agent_id_map = {v: k for k, v in self.agent_queues_map.items()}
         
         # 1. Observations (Live Metrics)
+        # Keep previous cache if refresh fails/returns empty.
         if q_ids:
-            obs_response = self.api.get_queue_observations(q_ids)
-            from src.processor import process_observations
-            obs_data_list = process_observations(obs_response, id_map, presence_map=self.presence_map)
-            self.obs_data_cache = {item['Queue']: item for item in obs_data_list}
+            try:
+                obs_response = self.api.get_queue_observations(q_ids)
+                from src.processor import process_observations
+                obs_data_list = process_observations(obs_response, id_map, presence_map=self.presence_map) or []
+                new_obs = {}
+                for item in obs_data_list:
+                    q_name = item.get("Queue")
+                    if q_name:
+                        new_obs[q_name] = item
+                if new_obs:
+                    merged_obs = {q: v for q, v in self.obs_data_cache.items() if q in monitored_queue_names}
+                    merged_obs.update(new_obs)
+                    self.obs_data_cache = merged_obs
+            except Exception as e:
+                self._log_error(f"Observation refresh error: {e}")
         else:
             self.obs_data_cache = {}
         
         # 2. Daily Stats (fetch less frequently to reduce API load)
         current_time = time.time()
         if q_ids and (current_time - self.last_daily_refresh >= 60):
-            now_local = datetime.now()
-            start_local = datetime.combine(now_local.date(), datetime.min.time())
-            start_utc = start_local - timedelta(hours=self.utc_offset)
-            end_utc = datetime.now(timezone.utc)
-            query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-            
-            daily_response = self.api.get_queue_daily_stats(q_ids, interval=query_interval)
-            from src.processor import process_daily_stats
-            self.daily_data_cache = process_daily_stats(daily_response, id_map)
-            self.last_daily_refresh = current_time
+            try:
+                now_local = datetime.now()
+                start_local = datetime.combine(now_local.date(), datetime.min.time())
+                start_utc = start_local - timedelta(hours=self.utc_offset)
+                end_utc = datetime.now(timezone.utc)
+                query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                
+                daily_response = self.api.get_queue_daily_stats(q_ids, interval=query_interval)
+                from src.processor import process_daily_stats
+                new_daily = process_daily_stats(daily_response, id_map) or {}
+                if new_daily:
+                    merged_daily = {q: v for q, v in self.daily_data_cache.items() if q in monitored_queue_names}
+                    merged_daily.update(new_daily)
+                    self.daily_data_cache = merged_daily
+                    self.last_daily_refresh = current_time
+            except Exception as e:
+                self._log_error(f"Daily stats refresh error: {e}")
         elif not q_ids:
             self.daily_data_cache = {}
         
@@ -256,6 +276,18 @@ class DataManager:
             for m in self.queue_members_cache.get(q_id, []):
                 unique_user_ids.add(m['id'])
         
+        prev_status = {}
+        for members in self.agent_details_cache.values():
+            for member in members:
+                uid = member.get("id")
+                if not uid:
+                    continue
+                user_obj = member.get("user", {})
+                prev_status[uid] = {
+                    "presence": user_obj.get("presence", {}),
+                    "routingStatus": member.get("routingStatus", {}),
+                }
+
         status_map = {}
         if agent_q_ids and unique_user_ids:
             try:
@@ -280,6 +312,9 @@ class DataManager:
             except Exception as e:
                 self._log_error(f"User Scan Error: {str(e)}")
                 self._log_error(f"Error updating users: {e}")
+                for u_id in unique_user_ids:
+                    if u_id in prev_status:
+                        status_map[u_id] = prev_status[u_id]
             
         # Detail Cache reconstruction
         temp_cache = {}
@@ -289,7 +324,7 @@ class DataManager:
             items = []
             for m in mems:
                 u_id = m['id']
-                st = status_map.get(u_id, {})
+                st = status_map.get(u_id) or prev_status.get(u_id, {})
                 items.append({
                     'id': u_id,
                     'user': {'id': u_id, 'name': m['name'], 'presence': st.get('presence', {})},
@@ -297,7 +332,10 @@ class DataManager:
                 })
             temp_cache[q_name] = items
         
-        self.agent_details_cache = temp_cache
+        if temp_cache:
+            self.agent_details_cache = temp_cache
+        elif not agent_q_ids:
+            self.agent_details_cache = {}
         self.last_update_time = time.time()
 
     def get_data(self, requested_queues):

@@ -9,6 +9,9 @@ _session.headers.update({"Content-Type": "application/json"})
 
 class GenesysAPI:
     ASSIGNMENT_BATCH_SIZE = 50
+    AGGREGATE_METRICS_BATCH_SIZE = 20
+    HTTP_429_RETRY_SECONDS = 60
+    HTTP_429_MAX_RETRIES = 0
     QUEUE_MEMBER_429_RETRY_SECONDS = 60
     QUEUE_MEMBER_429_MAX_RETRIES = 1
 
@@ -23,29 +26,40 @@ class GenesysAPI:
     def _get(self, path, params=None):
         start = time.monotonic()
         headers = self.headers
-        try:
-            response = _session.get(f"{self.api_host}{path}", headers=headers, params=params, timeout=10)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="GET", status_code=response.status_code, duration_ms=duration_ms)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
+        retry_429_count = 0
+        while True:
             try:
-                status_code = response.status_code
-            except Exception:
-                status_code = None
-            monitor.log_api_call(path, method="GET", status_code=status_code, duration_ms=duration_ms)
-            monitor.log_error("API_GET", f"HTTP {response.status_code} on {path}", str(e))
-            if response.status_code == 401:
-                monitor.log_error("API_GET", "Token expired (401). Should trigger re-auth here.")
-                raise e 
-            raise e
-        except Exception as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="GET", status_code=None, duration_ms=duration_ms)
-            monitor.log_error("API_GET", f"System Error on {path}", str(e))
-            raise e
+                response = _session.get(f"{self.api_host}{path}", headers=headers, params=params, timeout=10)
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="GET", status_code=response.status_code, duration_ms=duration_ms)
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.HTTPError as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                try:
+                    status_code = response.status_code
+                except Exception:
+                    status_code = None
+                monitor.log_api_call(path, method="GET", status_code=status_code, duration_ms=duration_ms)
+                if status_code == 429:
+                    retry_429_count += 1
+                    if self._can_retry_429(retry_429_count):
+                        wait_s = self._get_retry_after_seconds(response)
+                        monitor.log_error(
+                            "API_GET",
+                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                        )
+                        time.sleep(wait_s)
+                        continue
+                monitor.log_error("API_GET", f"HTTP {status_code} on {path}", str(e))
+                if status_code == 401:
+                    monitor.log_error("API_GET", "Token expired (401). Should trigger re-auth here.")
+                raise e
+            except Exception as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="GET", status_code=None, duration_ms=duration_ms)
+                monitor.log_error("API_GET", f"System Error on {path}", str(e))
+                raise e
 
     @staticmethod
     def _is_http_429(exc):
@@ -60,11 +74,49 @@ class GenesysAPI:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_http_status(exc, expected_status):
+        try:
+            resp = getattr(exc, "response", None)
+            code = getattr(resp, "status_code", None) if resp is not None else None
+            if code is not None:
+                return int(code) == int(expected_status)
+        except Exception:
+            pass
+        try:
+            return f" {int(expected_status)} " in f" {str(exc)} "
+        except Exception:
+            return False
+
+    def _get_retry_after_seconds(self, response, default_seconds=None):
+        default_wait = max(1, int(default_seconds or self.HTTP_429_RETRY_SECONDS or 1))
+        if response is None:
+            return default_wait
+        try:
+            retry_after = (getattr(response, "headers", {}) or {}).get("Retry-After")
+            if retry_after is None:
+                return default_wait
+            wait_s = int(float(str(retry_after).strip()))
+            return max(1, wait_s)
+        except Exception:
+            return default_wait
+
+    def _can_retry_429(self, retry_count):
+        try:
+            max_retries = int(self.HTTP_429_MAX_RETRIES or 0)
+        except Exception:
+            max_retries = 0
+        if max_retries <= 0:
+            return True
+        return retry_count <= max_retries
+
     def _post(self, path, data, timeout=10, retries=0, retry_sleep=0.4, params=None):
         start = time.monotonic()
         headers = self.headers
         attempts = max(0, int(retries)) + 1
-        for attempt in range(attempts):
+        timeout_attempt = 0
+        retry_429_count = 0
+        while True:
             try:
                 response = _session.post(
                     f"{self.api_host}{path}",
@@ -80,8 +132,9 @@ class GenesysAPI:
                     return {"status": response.status_code}
                 return response.json()
             except requests.exceptions.ReadTimeout as e:
-                if attempt < (attempts - 1):
-                    time.sleep(retry_sleep * (attempt + 1))
+                if timeout_attempt < (attempts - 1):
+                    timeout_attempt += 1
+                    time.sleep(retry_sleep * timeout_attempt)
                     continue
                 duration_ms = int((time.monotonic() - start) * 1000)
                 monitor.log_api_call(path, method="POST", status_code=None, duration_ms=duration_ms)
@@ -94,10 +147,19 @@ class GenesysAPI:
                 except Exception:
                     status_code = None
                 monitor.log_api_call(path, method="POST", status_code=status_code, duration_ms=duration_ms)
-                monitor.log_error("API_POST", f"HTTP {response.status_code} on {path}", str(e))
-                if response.status_code == 401:
+                if status_code == 429:
+                    retry_429_count += 1
+                    if self._can_retry_429(retry_429_count):
+                        wait_s = self._get_retry_after_seconds(response)
+                        monitor.log_error(
+                            "API_POST",
+                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                        )
+                        time.sleep(wait_s)
+                        continue
+                monitor.log_error("API_POST", f"HTTP {status_code} on {path}", str(e))
+                if status_code == 401:
                     monitor.log_error("API_POST", "Token expired (401) on POST.")
-                    raise e
                 raise e
             except Exception as e:
                 duration_ms = int((time.monotonic() - start) * 1000)
@@ -108,70 +170,148 @@ class GenesysAPI:
     def _put(self, path, data):
         start = time.monotonic()
         headers = self.headers
-        try:
-            response = _session.put(f"{self.api_host}{path}", headers=headers, json=data, timeout=10)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="PUT", status_code=response.status_code, duration_ms=duration_ms)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
+        retry_429_count = 0
+        while True:
             try:
-                status_code = response.status_code
-            except Exception:
-                status_code = None
-            detail = None
-            try:
-                detail = response.text
-                if detail and len(detail) > 2000:
-                    detail = detail[:2000] + "...(truncated)"
-            except Exception:
+                response = _session.put(f"{self.api_host}{path}", headers=headers, json=data, timeout=10)
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="PUT", status_code=response.status_code, duration_ms=duration_ms)
+                response.raise_for_status()
+                if response.status_code == 204 or not response.content:
+                    return {"status": response.status_code}
+                return response.json()
+            except requests.exceptions.HTTPError as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                try:
+                    status_code = response.status_code
+                except Exception:
+                    status_code = None
+                monitor.log_api_call(path, method="PUT", status_code=status_code, duration_ms=duration_ms)
+                if status_code == 429:
+                    retry_429_count += 1
+                    if self._can_retry_429(retry_429_count):
+                        wait_s = self._get_retry_after_seconds(response)
+                        monitor.log_error(
+                            "API_PUT",
+                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                        )
+                        time.sleep(wait_s)
+                        continue
                 detail = None
-            monitor.log_api_call(path, method="PUT", status_code=status_code, duration_ms=duration_ms)
-            monitor.log_error("API_PUT", f"HTTP {response.status_code} on {path}", detail or str(e))
-            if response.status_code == 401:
-                 monitor.log_error("API_PUT", "Token expired (401) on PUT.")
-                 raise e
-            raise e
-        except Exception as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="PUT", status_code=None, duration_ms=duration_ms)
-            monitor.log_error("API_PUT", f"System Error on {path}", str(e))
-            raise e
+                try:
+                    detail = response.text
+                    if detail and len(detail) > 2000:
+                        detail = detail[:2000] + "...(truncated)"
+                except Exception:
+                    detail = None
+                monitor.log_error("API_PUT", f"HTTP {status_code} on {path}", detail or str(e))
+                if status_code == 401:
+                    monitor.log_error("API_PUT", "Token expired (401) on PUT.")
+                raise e
+            except Exception as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="PUT", status_code=None, duration_ms=duration_ms)
+                monitor.log_error("API_PUT", f"System Error on {path}", str(e))
+                raise e
 
     def _patch(self, path, data=None):
         start = time.monotonic()
         headers = self.headers
-        try:
-            response = _session.patch(f"{self.api_host}{path}", headers=headers, json=data or {}, timeout=15)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="PATCH", status_code=response.status_code, duration_ms=duration_ms)
-            response.raise_for_status()
-            # Some PATCH endpoints return 202/204 with no body
-            if response.status_code in (202, 204) or not response.content:
-                return {"status": response.status_code}
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
+        retry_429_count = 0
+        while True:
             try:
-                status_code = response.status_code
-            except Exception:
-                status_code = None
-            detail = None
-            try:
-                detail = response.text
-                if detail and len(detail) > 2000:
-                    detail = detail[:2000] + "...(truncated)"
-            except Exception:
+                response = _session.patch(f"{self.api_host}{path}", headers=headers, json=data or {}, timeout=15)
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="PATCH", status_code=response.status_code, duration_ms=duration_ms)
+                response.raise_for_status()
+                # Some PATCH endpoints return 202/204 with no body
+                if response.status_code in (202, 204) or not response.content:
+                    return {"status": response.status_code}
+                return response.json()
+            except requests.exceptions.HTTPError as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                try:
+                    status_code = response.status_code
+                except Exception:
+                    status_code = None
+                monitor.log_api_call(path, method="PATCH", status_code=status_code, duration_ms=duration_ms)
+                if status_code == 429:
+                    retry_429_count += 1
+                    if self._can_retry_429(retry_429_count):
+                        wait_s = self._get_retry_after_seconds(response)
+                        monitor.log_error(
+                            "API_PATCH",
+                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                        )
+                        time.sleep(wait_s)
+                        continue
                 detail = None
-            monitor.log_api_call(path, method="PATCH", status_code=status_code, duration_ms=duration_ms)
-            monitor.log_error("API_PATCH", f"HTTP {response.status_code} on {path}", detail or str(e))
-            raise e
-        except Exception as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(path, method="PATCH", status_code=None, duration_ms=duration_ms)
-            monitor.log_error("API_PATCH", f"System Error on {path}", str(e))
-            raise e
+                try:
+                    detail = response.text
+                    if detail and len(detail) > 2000:
+                        detail = detail[:2000] + "...(truncated)"
+                except Exception:
+                    detail = None
+                monitor.log_error("API_PATCH", f"HTTP {status_code} on {path}", detail or str(e))
+                raise e
+            except Exception as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="PATCH", status_code=None, duration_ms=duration_ms)
+                monitor.log_error("API_PATCH", f"System Error on {path}", str(e))
+                raise e
+
+    def _delete(self, path, params=None, timeout=10):
+        start = time.monotonic()
+        headers = self.headers
+        retry_429_count = 0
+        while True:
+            try:
+                response = _session.delete(
+                    f"{self.api_host}{path}",
+                    headers=headers,
+                    params=params,
+                    timeout=timeout,
+                )
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="DELETE", status_code=response.status_code, duration_ms=duration_ms)
+                response.raise_for_status()
+                if response.status_code == 204 or not response.content:
+                    return {"status": response.status_code}
+                try:
+                    return response.json()
+                except Exception:
+                    return {"status": response.status_code}
+            except requests.exceptions.HTTPError as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                try:
+                    status_code = response.status_code
+                except Exception:
+                    status_code = None
+                monitor.log_api_call(path, method="DELETE", status_code=status_code, duration_ms=duration_ms)
+                if status_code == 429:
+                    retry_429_count += 1
+                    if self._can_retry_429(retry_429_count):
+                        wait_s = self._get_retry_after_seconds(response)
+                        monitor.log_error(
+                            "API_DELETE",
+                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                        )
+                        time.sleep(wait_s)
+                        continue
+                detail = None
+                try:
+                    detail = response.text
+                    if detail and len(detail) > 2000:
+                        detail = detail[:2000] + "...(truncated)"
+                except Exception:
+                    detail = None
+                monitor.log_error("API_DELETE", f"HTTP {status_code} on {path}", detail or str(e))
+                raise e
+            except Exception as e:
+                duration_ms = int((time.monotonic() - start) * 1000)
+                monitor.log_api_call(path, method="DELETE", status_code=None, duration_ms=duration_ms)
+                monitor.log_error("API_DELETE", f"System Error on {path}", str(e))
+                raise e
 
     def disconnect_conversation(self, conversation_id):
         """Disconnect/close a conversation.
@@ -872,21 +1012,13 @@ class GenesysAPI:
         DELETE /api/v2/groups/{groupId}/members with ids query param.
         """
         ids_str = ",".join(member_ids)
-        start = time.monotonic()
         try:
-            response = _session.delete(
-                f"{self.api_host}/api/v2/groups/{group_id}/members",
-                headers=self.headers,
+            return self._delete(
+                f"/api/v2/groups/{group_id}/members",
                 params={"ids": ids_str},
-                timeout=10
+                timeout=10,
             )
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(f"/api/v2/groups/{group_id}/members", method="DELETE", status_code=response.status_code, duration_ms=duration_ms)
-            response.raise_for_status()
-            return {"status": response.status_code}
         except Exception as e:
-            duration_ms = int((time.monotonic() - start) * 1000)
-            monitor.log_api_call(f"/api/v2/groups/{group_id}/members", method="DELETE", status_code=None, duration_ms=duration_ms)
             monitor.log_error("API_DELETE", f"Error removing group members: {e}")
             raise e
 
@@ -1022,17 +1154,37 @@ class GenesysAPI:
             "tPark", "tParkComplete", "tScreenMonitoring", "tShortAbandon", "tSnippetRecord",
             "tTalk", "tTalkComplete", "tUserResponseTime", "tVoicemail", "tWait"
         }
+        # Some metrics are present in docs/sdk enums but rejected at runtime by this endpoint.
+        known_runtime_unsupported_metrics = {
+            "nConversations", "tAgentVideoConnected", "tScreenMonitoring", "tSnippetRecord",
+        }
 
         if not metrics:
             metrics = ["nOffered", "tAnswered", "tAbandon", "tTalk", "tHandle"]
         else:
             # Convert UI metrics to API metrics
             metrics = convert_metrics(metrics, dimension == "queueId")
-            metrics = [m for m in metrics if m in supported_aggregate_metrics]
+            metrics = [m for m in metrics if (m in supported_aggregate_metrics) and (m not in known_runtime_unsupported_metrics)]
+            if not metrics:
+                monitor.log_error(
+                    "API_POST",
+                    "Aggregate metrics list became empty after conversion/filtering; falling back to default metrics."
+                )
+                metrics = ["nOffered", "tAnswered", "tAbandon", "tTalk", "tHandle"]
+        metrics = list(dict.fromkeys(metrics))
 
         combined_results = []
+        query_errors = []
+        dropped_bad_request_metrics = set()
         chunk_days = 14
         curr = start_date
+        try:
+            metrics_batch_size = max(1, int(self.AGGREGATE_METRICS_BATCH_SIZE))
+        except Exception:
+            metrics_batch_size = 20
+        metric_batches = list(self._chunk_list(metrics, metrics_batch_size)) if metrics else []
+        if not metric_batches:
+            metric_batches = [["nOffered", "tAnswered", "tAbandon", "tTalk", "tHandle"]]
         
         while curr < end_date:
             curr_end = curr + timedelta(days=chunk_days)
@@ -1044,26 +1196,88 @@ class GenesysAPI:
 
             interval = f"{curr.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{curr_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
             
-            query = {
-                "interval": interval,
-                "granularity": granularity,
-                "metrics": metrics
-            }
-            if group_by: query["groupBy"] = group_by
-            if filter_clause: query["filter"] = filter_clause
+            for metrics_batch in metric_batches:
+                # Skip metrics already proven invalid (400) in previous chunks.
+                metrics_batch = [m for m in metrics_batch if m not in dropped_bad_request_metrics]
+                if not metrics_batch:
+                    continue
+                query = {
+                    "interval": interval,
+                    "granularity": granularity,
+                    "metrics": metrics_batch
+                }
+                if group_by:
+                    query["groupBy"] = group_by
+                if filter_clause:
+                    query["filter"] = filter_clause
 
-            try:
-                data = self._post("/api/v2/analytics/conversations/aggregates/query", query)
-            except Exception as e:
-                monitor.log_error("API_POST", f"Error fetching aggregate chunk {interval}: {e}")
-                data = {}
+                try:
+                    data = self._post("/api/v2/analytics/conversations/aggregates/query", query)
+                except Exception as e:
+                    # If a metric batch causes 400, retry metric-by-metric and keep successful ones.
+                    if self._is_http_status(e, 400) and len(metrics_batch) > 1:
+                        recovered_any = False
+                        only_bad_request_metrics = True
+                        for metric_name in metrics_batch:
+                            if metric_name in dropped_bad_request_metrics:
+                                continue
+                            single_query = {
+                                "interval": interval,
+                                "granularity": granularity,
+                                "metrics": [metric_name],
+                            }
+                            if group_by:
+                                single_query["groupBy"] = group_by
+                            if filter_clause:
+                                single_query["filter"] = filter_clause
+                            try:
+                                single_data = self._post("/api/v2/analytics/conversations/aggregates/query", single_query)
+                                if 'results' in single_data:
+                                    combined_results.extend(single_data['results'])
+                                    recovered_any = True
+                                    only_bad_request_metrics = False
+                            except Exception as metric_err:
+                                if self._is_http_status(metric_err, 400):
+                                    dropped_bad_request_metrics.add(metric_name)
+                                    monitor.log_error(
+                                        "API_POST",
+                                        f"Dropping metric due to 400 in aggregate query: {metric_name}"
+                                    )
+                                    continue
+                                only_bad_request_metrics = False
+                                metric_err_txt = (
+                                    f"Error fetching aggregate chunk {interval} (metric={metric_name}): {metric_err}"
+                                )
+                                monitor.log_error("API_POST", metric_err_txt)
+                                query_errors.append(metric_err_txt)
+                        if recovered_any:
+                            continue
+                        if only_bad_request_metrics:
+                            # Whole batch was invalid metrics; continue without counting as runtime failure.
+                            continue
+                    elif self._is_http_status(e, 400) and len(metrics_batch) == 1:
+                        dropped_bad_request_metrics.add(metrics_batch[0])
+                        monitor.log_error(
+                            "API_POST",
+                            f"Dropping metric due to 400 in aggregate query: {metrics_batch[0]}"
+                        )
+                        continue
 
-            if 'results' in data:
-                combined_results.extend(data['results'])
+                    err_txt = f"Error fetching aggregate chunk {interval} (metrics={len(metrics_batch)}): {e}"
+                    monitor.log_error("API_POST", err_txt)
+                    query_errors.append(err_txt)
+                    data = {}
+
+                if 'results' in data:
+                    combined_results.extend(data['results'])
             
             curr = curr_end
-            
-        return {"results": combined_results}
+        
+        return {
+            "results": combined_results,
+            "_errors": query_errors,
+            "_dropped_metrics": sorted(dropped_bad_request_metrics),
+        }
 
     def get_queue_observations(self, queue_ids):
         CHUNK_SIZE = 100

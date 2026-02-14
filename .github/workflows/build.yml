@@ -41,14 +41,13 @@ jobs:
         .\\.venv\\Scripts\\activate
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pyinstaller
 
 
     - name: Build with PyInstaller (Windows)
       if: matrix.os == 'windows-latest'
       run: |
         .\\.venv\\Scripts\\activate
-        pyinstaller --onefile --noconsole --name "GenesysReporting" `
+        pyinstaller --clean --noconfirm --onefile --noconsole --name "GenesysReporting" `
           --collect-all streamlit `
           --collect-all streamlit_autorefresh `
           --collect-all streamlit_cookies_manager `
@@ -61,6 +60,8 @@ jobs:
           --hidden-import psutil `
           --add-data "app.py;." `
           --add-data "METRICS_REFERENCE.md;." `
+          --add-data "USER_GUIDE.md;." `
+          --add-data ".streamlit;.streamlit" `
           --add-data "src;src" `
           run_app.py
 
@@ -96,12 +97,11 @@ jobs:
         . .venv/bin/activate
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pyinstaller
 
     - name: Build with PyInstaller (Debian)
       run: |
         . .venv/bin/activate
-        pyinstaller --onefile --name "GenesysReporting" \
+        pyinstaller --clean --noconfirm --onefile --name "GenesysReporting" \
           --collect-all streamlit \
           --collect-all streamlit_autorefresh \
           --collect-all streamlit_cookies_manager \
@@ -114,6 +114,8 @@ jobs:
           --hidden-import psutil \
           --add-data "app.py:." \
           --add-data "METRICS_REFERENCE.md:." \
+          --add-data "USER_GUIDE.md:." \
+          --add-data ".streamlit:.streamlit" \
           --add-data "src:src" \
           run_app.py
 
