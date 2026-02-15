@@ -76,9 +76,21 @@ Notlar:
    python run_app.py
    ```
 
-3. **Varsayılan Admin Girişi:**
+3. **İlk Admin Girişi (Güvenli Bootstrap):**
    - Kullanıcı: `admin`
-   - Şifre: `admin` (ilk girişte değiştirilmeli)
+   - Şifre:
+   - `GENESYS_BOOTSTRAP_ADMIN_PASSWORD` ortam değişkeni verilirse bu değer kullanılır.
+   - Verilmezse uygulama ilk açılışta rastgele güçlü şifre üretir ve `orgs/default/_bootstrap_admin_password.txt` dosyasına yazar.
+   - İlk girişte şifre değişikliği zorunludur.
+
+4. **Org Code Kuralı:**
+   - Organizasyon kodu şu regex’e uymalıdır: `^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$`
+   - Path traversal engeli için bu format dışı kodlar reddedilir.
+
+5. **Çalıştırma Notu (Wrapper):**
+   - `run_app.py` varsayılan olarak sadece kendi Streamlit süreçlerini sonlandırır.
+   - 8501 portundaki farklı bir süreci zorla kapatmak için: `GENESYS_FORCE_PORT_CLEANUP=1`
+   - Sunucu bind adresini zorlamak için: `GENESYS_SERVER_ADDRESS=0.0.0.0`
 
 ---
 

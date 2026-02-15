@@ -19,6 +19,8 @@ import traceback
 import warnings
 import tempfile
 import psutil
+import re
+import html
 
 # Suppress st.cache deprecation warning from streamlit_cookies_manager
 warnings.filterwarnings("ignore", message=r".*st\.cache.*deprecated.*")
@@ -140,6 +142,10 @@ from src.processor import process_analytics_response, to_excel, to_csv, to_parqu
 
 SESSION_TTL_SECONDS = 120
 DEBUG_REMEMBER_ME = os.environ.get("GENESYS_DEBUG_REMEMBER_ME", "0").strip().lower() in ("1", "true", "yes", "on")
+ORG_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
+LOGIN_WINDOW_SECONDS = int(os.environ.get("GENESYS_LOGIN_WINDOW_SECONDS", "900"))
+LOGIN_LOCK_SECONDS = int(os.environ.get("GENESYS_LOGIN_LOCK_SECONDS", "900"))
+LOGIN_MAX_FAILURES = int(os.environ.get("GENESYS_LOGIN_MAX_FAILURES", "5"))
 
 def _rm_debug(msg, *args):
     if DEBUG_REMEMBER_ME:
@@ -234,6 +240,21 @@ def _resolve_resource_path(relative_path):
         if os.path.exists(candidate):
             return candidate
     return candidates[0] if candidates else relative_path
+
+
+def _safe_org_code(org_code, allow_default=True):
+    raw = str(org_code or "").strip()
+    if not raw:
+        if allow_default:
+            return "default"
+        raise ValueError("Organization code is required")
+    if not ORG_CODE_PATTERN.fullmatch(raw):
+        raise ValueError("Organization code must match ^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
+    return raw
+
+
+def _escape_html(value):
+    return html.escape("" if value is None else str(value), quote=True)
 
 def format_status_time(presence_ts, routing_ts):
     """Calculates duration since the most recent status change in HH:MM:SS format."""
@@ -1331,9 +1352,19 @@ def _maybe_periodic_temp_cleanup(force=False, aggressive=False, max_age_hours=No
 
 _configure_tempfile_dir()
 
+def _org_path(org_code, create=False):
+    safe_org = _safe_org_code(org_code)
+    base = os.path.abspath(ORG_BASE_DIR)
+    path = os.path.abspath(os.path.join(base, safe_org))
+    if os.path.commonpath([base, path]) != base:
+        raise ValueError(f"Invalid organization code: {org_code}")
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _org_dir(org_code):
-    path = os.path.join(ORG_BASE_DIR, org_code)
-    os.makedirs(path, exist_ok=True)
+    path = _org_path(org_code, create=True)
     return path
 
 def _org_flag_path(org_code):
@@ -1619,7 +1650,7 @@ def delete_credentials(org_code):
     if os.path.exists(filename): os.remove(filename)
 
 def delete_org_files(org_code):
-    org_path = os.path.join(ORG_BASE_DIR, org_code)
+    org_path = _org_path(org_code, create=False)
     try:
         if os.path.isdir(org_path):
             shutil.rmtree(org_path, ignore_errors=True)
@@ -1675,7 +1706,7 @@ def _read_app_session_cookie(with_status=False):
 def _hydrate_app_user_from_saved_session(session_data):
     try:
         username = (session_data or {}).get("username")
-        org_code = (session_data or {}).get("org_code", "default")
+        org_code = _safe_org_code((session_data or {}).get("org_code", "default"))
         if not username:
             _rm_debug("hydrate failed: missing username in saved session")
             return None
@@ -1836,6 +1867,68 @@ def _ensure_cookie_component_ready(max_retries=8):
         st.stop()
     _rm_debug("cookie component not ready after max retries=%s", max_retries)
     return False
+
+
+@st.cache_resource(show_spinner=False)
+def _login_attempt_store():
+    return {"lock": threading.Lock(), "entries": {}}
+
+
+def _login_failure_key(org_code, username):
+    return f"{str(org_code or '').strip().lower()}::{str(username or '').strip().lower()}"
+
+
+def _register_login_failure(org_code, username):
+    now = pytime.time()
+    key = _login_failure_key(org_code, username)
+    store = _login_attempt_store()
+    with store["lock"]:
+        if len(store["entries"]) > 5000:
+            stale_keys = []
+            for k, v in store["entries"].items():
+                lock_until = float((v or {}).get("lock_until", 0) or 0)
+                first_ts = float((v or {}).get("first_ts", 0) or 0)
+                if now > lock_until and now > first_ts + LOGIN_WINDOW_SECONDS:
+                    stale_keys.append(k)
+            for k in stale_keys:
+                store["entries"].pop(k, None)
+        entry = store["entries"].get(key, {"count": 0, "first_ts": now, "lock_until": 0})
+        if now > float(entry.get("first_ts", 0)) + LOGIN_WINDOW_SECONDS:
+            entry = {"count": 0, "first_ts": now, "lock_until": 0}
+        entry["count"] = int(entry.get("count", 0)) + 1
+        if entry["count"] >= max(1, LOGIN_MAX_FAILURES):
+            entry["lock_until"] = now + max(1, LOGIN_LOCK_SECONDS)
+        store["entries"][key] = entry
+        return {
+            "count": int(entry.get("count", 0)),
+            "locked": now < float(entry.get("lock_until", 0)),
+            "remaining": max(0, int(entry.get("lock_until", 0) - now)),
+        }
+
+
+def _clear_login_failures(org_code, username):
+    key = _login_failure_key(org_code, username)
+    store = _login_attempt_store()
+    with store["lock"]:
+        store["entries"].pop(key, None)
+
+
+def _get_login_lock_state(org_code, username):
+    now = pytime.time()
+    key = _login_failure_key(org_code, username)
+    store = _login_attempt_store()
+    with store["lock"]:
+        entry = store["entries"].get(key)
+        if not entry:
+            return {"locked": False, "remaining": 0}
+        first_ts = float(entry.get("first_ts", 0) or 0)
+        if now > first_ts + LOGIN_WINDOW_SECONDS and now >= float(entry.get("lock_until", 0) or 0):
+            store["entries"].pop(key, None)
+            return {"locked": False, "remaining": 0}
+        lock_until = float(entry.get("lock_until", 0) or 0)
+        if now < lock_until:
+            return {"locked": True, "remaining": int(lock_until - now)}
+        return {"locked": False, "remaining": 0}
 
 def _user_dir(org_code, username):
     base = _org_dir(org_code)
@@ -3254,9 +3347,13 @@ def init_session_state():
 
 def log_to_console(message, level='error'):
     """Injects JavaScript to log to browser console."""
+    safe_level = str(level or "log").lower()
+    if safe_level not in {"log", "info", "warn", "error", "debug"}:
+        safe_level = "log"
+    safe_message = json.dumps(f"☁️ GenesysApp: {str(message)}", ensure_ascii=False)
     js_code = f"""
     <script>
-        console.{level}("☁️ GenesysApp: {message}");
+        console.{safe_level}({safe_message});
     </script>
     """
     st.markdown(js_code, unsafe_allow_html=True)
@@ -3327,39 +3424,97 @@ if not st.session_state.app_user:
             remember_me = st.checkbox(get_text(st.session_state.language, "remember_me"), value=False, help="Bu cihazda oturumu hatirla.")
             
             if st.form_submit_button(get_text(st.session_state.language, "login"), width='stretch'):
-                user_data = auth_manager.authenticate(u_org, u_name, u_pass)
-                if user_data:
-                    # Exclude password hash from session state and file
-                    safe_user_data = {k: v for k, v in user_data.items() if k != 'password'}
-                    full_user = {"username": u_name, **safe_user_data}
-                    
-                    # Handle Remember Me
-                    if remember_me:
-                        _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name, u_org)
-                        remember_payload = {
-                            "username": u_name,
-                            "org_code": full_user.get("org_code", u_org),
-                        }
-                        st.session_state.remember_me_enabled = True
-                        st.session_state._remember_me_pending_payload = remember_payload
-                        st.session_state._remember_me_pending_retries = 0
-                        _rm_debug("remember-me queued for verified write")
+                u_name_clean = str(u_name or "").strip()
+                try:
+                    u_org_safe = _safe_org_code(u_org)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    u_org_safe = None
+
+                if u_org_safe and u_name_clean:
+                    lock_state = _get_login_lock_state(u_org_safe, u_name_clean)
+                    if lock_state.get("locked"):
+                        remaining = int(lock_state.get("remaining", 0))
+                        logger.warning("app login blocked user=%s org=%s remaining=%ss", u_name_clean, u_org_safe, remaining)
+                        st.error(f"Çok fazla başarısız deneme. {remaining} saniye sonra tekrar deneyin.")
                     else:
-                        _rm_debug("login submit with remember-me OFF for user=%s org=%s", u_name, u_org)
-                        st.session_state.remember_me_enabled = False
-                        st.session_state._remember_me_pending_delete = True
-                        st.session_state._remember_me_pending_delete_retries = 0
-                        delete_app_session()
-                        
-                    st.session_state.app_user = full_user
+                        user_data = auth_manager.authenticate(u_org_safe, u_name_clean, u_pass)
+                        if user_data:
+                            _clear_login_failures(u_org_safe, u_name_clean)
+                            logger.info("app login success user=%s org=%s", u_name_clean, u_org_safe)
+                            # Exclude password hash from session state and file
+                            safe_user_data = {k: v for k, v in user_data.items() if k != 'password'}
+                            full_user = {"username": u_name_clean, **safe_user_data}
+                            
+                            # Handle Remember Me
+                            if remember_me:
+                                _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name_clean, u_org_safe)
+                                remember_payload = {
+                                    "username": u_name_clean,
+                                    "org_code": full_user.get("org_code", u_org_safe),
+                                }
+                                st.session_state.remember_me_enabled = True
+                                st.session_state._remember_me_pending_payload = remember_payload
+                                st.session_state._remember_me_pending_retries = 0
+                                _rm_debug("remember-me queued for verified write")
+                            else:
+                                _rm_debug("login submit with remember-me OFF for user=%s org=%s", u_name_clean, u_org_safe)
+                                st.session_state.remember_me_enabled = False
+                                st.session_state._remember_me_pending_delete = True
+                                st.session_state._remember_me_pending_delete_retries = 0
+                                delete_app_session()
+                                
+                            st.session_state.app_user = full_user
+                            st.session_state.genesys_logged_out = False
+                            st.session_state.dashboard_config_loaded = False
+                            st.session_state.pop("_dashboard_config_owner", None)
+                            ensure_data_manager()
+                            st.rerun()
+                        else:
+                            lock_info = _register_login_failure(u_org_safe, u_name_clean)
+                            logger.warning(
+                                "app login failed user=%s org=%s attempts=%s locked=%s",
+                                u_name_clean,
+                                u_org_safe,
+                                lock_info.get("count"),
+                                lock_info.get("locked"),
+                            )
+                            if lock_info.get("locked"):
+                                st.error(f"Çok fazla başarısız deneme. {lock_info.get('remaining', 0)} saniye sonra tekrar deneyin.")
+                            else:
+                                st.error("Hatalı organizasyon, kullanıcı adı veya şifre!")
+                elif u_org_safe:
+                    st.error("Kullanıcı adı gereklidir.")
+    st.stop()
+
+# --- FORCED PASSWORD CHANGE (BOOTSTRAP) ---
+if st.session_state.get("app_user") and st.session_state.app_user.get("must_change_password"):
+    org = st.session_state.app_user.get("org_code", "default")
+    username = st.session_state.app_user.get("username", "")
+    st.title("🔐 İlk Giriş Güvenlik Adımı")
+    st.warning("Bu hesap için başlangıç şifresi kullanılıyor. Devam etmek için yeni şifre belirleyin.")
+    with st.form("force_password_change_form"):
+        new_pw = st.text_input("Yeni Şifre", type="password")
+        new_pw2 = st.text_input("Yeni Şifre (Tekrar)", type="password")
+        if st.form_submit_button("Şifreyi Güncelle", width='stretch'):
+            if not new_pw or not new_pw2:
+                st.error("Lütfen iki alanı da doldurun.")
+            elif new_pw != new_pw2:
+                st.error("Şifreler eşleşmiyor.")
+            elif len(new_pw) < 8:
+                st.error("Şifre en az 8 karakter olmalıdır.")
+            else:
+                ok, msg = auth_manager.reset_password(org, username, new_pw)
+                if ok:
+                    st.session_state.app_user["must_change_password"] = False
+                    st.success("Şifre güncellendi. Lütfen tekrar giriş yapın.")
+                    st.session_state.app_user = None
+                    st.session_state.api_client = None
+                    st.session_state.logged_in = False
                     st.session_state.genesys_logged_out = False
-                    st.session_state.dashboard_config_loaded = False
-                    st.session_state.pop("_dashboard_config_owner", None)
-                    ensure_data_manager()
                     st.rerun()
                 else:
-                    _rm_debug("login failed for user=%s org=%s", u_name, u_org)
-                    st.error("Hatalı organizasyon, kullanıcı adı veya şifre!")
+                    st.error(msg)
     st.stop()
 
 # --- AUTO-LOGIN GENESYS ---
@@ -4289,6 +4444,7 @@ elif page == get_text(lang, "menu_users") and role == "Admin":
     st.subheader("Mevcut Kullanıcılar")
     org = st.session_state.app_user.get('org_code', 'default')
     all_users = auth_manager.get_all_users(org)
+    current_username = st.session_state.app_user.get("username")
     for uname, udata in all_users.items():
         col1, col2, col3, col4 = st.columns([2, 2, 4, 1])
         col1.write(f"**{uname}**")
@@ -4297,10 +4453,14 @@ elif page == get_text(lang, "menu_users") and role == "Admin":
         
         # Action Buttons Column
         with col4:
-            if uname != "admin": # Don't delete self
+            if uname != current_username:
                 if st.button("🗑️", key=f"del_user_{uname}", help="Kullanıcıyı Sil"):
-                    auth_manager.delete_user(org, uname)
-                    st.rerun()
+                    ok, msg = auth_manager.delete_user(org, uname)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
         
         # Password Reset Section
         with st.expander(f"🔑 Şifre Sıfırla: {uname}"):
@@ -4340,7 +4500,15 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                     if not new_org or not new_admin or not new_admin_pw:
                         st.warning("Organization code, admin username and password are required.")
                     else:
-                        ok, msg = auth_manager.add_organization(new_org, new_admin, new_admin_pw)
+                        try:
+                            new_org_safe = _safe_org_code(new_org, allow_default=False)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                            new_org_safe = None
+                        if not new_org_safe:
+                            ok, msg = False, "Invalid organization code"
+                        else:
+                            ok, msg = auth_manager.add_organization(new_org_safe, new_admin, new_admin_pw)
                         if ok:
                             st.success(msg)
                             st.rerun()
@@ -5602,7 +5770,10 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             # Show Last Update Time
             if data_manager.last_update_time > 0:
                 last_upd = datetime.fromtimestamp(data_manager.last_update_time).strftime('%H:%M:%S')
-                c_time.markdown(f'<div class="last-update">Last Update: <span>{last_upd}</span></div>', unsafe_allow_html=True)
+                c_time.markdown(
+                    f'<div class="last-update">Last Update: <span>{_escape_html(last_upd)}</span></div>',
+                    unsafe_allow_html=True,
+                )
             
         if st.session_state.dashboard_mode == "Live":
             # DataManager is managed centrally by refresh_data_manager_queues()
@@ -6328,12 +6499,14 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                 status_text = "Toplantı"
 
                         display_status = f"{status_text} - {duration_str}" if duration_str else status_text
+                        safe_name = _escape_html(name)
+                        safe_status = _escape_html(display_status)
                         st.markdown(f"""
                             <div class="agent-card">
                                 <span class="status-dot" style="background-color: {dot_color};"></span>
                                 <div>
-                                        <p class="agent-name">{name}</p>
-                                        <p class="agent-status">{display_status}</p>
+                                        <p class="agent-name">{safe_name}</p>
+                                        <p class="agent-status">{safe_status}</p>
                                     </div>
                                 </div>
                             """, unsafe_allow_html=True)
@@ -6721,14 +6894,17 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         if conv_short:
                             meta_parts.append(f"#{conv_short}")
                         meta_text = " • ".join(meta_parts)
-                        meta_html = f'<div class="call-meta">{meta_text}</div>' if meta_text else ""
+                        safe_queue_text = _escape_html(queue_text)
+                        safe_meta_text = _escape_html(meta_text)
+                        safe_wait_str = _escape_html(wait_str)
+                        meta_html = f'<div class="call-meta">{safe_meta_text}</div>' if safe_meta_text else ""
 
                         st.markdown(f"""
                             <div class="call-card">
                                 <div class="call-info">
-                                    <div class="call-queue">{queue_text}</div>
+                                    <div class="call-queue">{safe_queue_text}</div>
                                     {meta_html}
                                 </div>
-                                <div class="call-wait">{wait_str}</div>
+                                <div class="call-wait">{safe_wait_str}</div>
                             </div>
                         """, unsafe_allow_html=True)

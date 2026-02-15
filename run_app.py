@@ -115,6 +115,7 @@ if __name__ == "__main__":
 
     acquire_single_instance_lock()
     app_path = resolve_path("app.py")
+    force_port_cleanup = os.environ.get("GENESYS_FORCE_PORT_CLEANUP", "0").strip().lower() in ("1", "true", "yes", "on")
 
     # Log file for debugging startup issues (especially on Windows)
     log_path = os.path.join(os.getcwd(), "app_startup.log")
@@ -139,6 +140,18 @@ if __name__ == "__main__":
     def _terminate_pid(pid):
         try:
             proc = psutil.Process(pid)
+            if not force_port_cleanup:
+                try:
+                    cmdline = " ".join(proc.cmdline()).lower()
+                except (psutil.AccessDenied, psutil.ZombieProcess, psutil.NoSuchProcess):
+                    cmdline = ""
+                # Only terminate likely app-related processes by default.
+                is_app_proc = (
+                    "streamlit" in cmdline
+                    and ("app.py" in cmdline or "run_app.py" in cmdline or CHILD_FLAG in cmdline)
+                )
+                if not is_app_proc:
+                    return False
             name = proc.name()
             print(f"🔪 Killing process {name} (PID: {pid})...")
             proc.terminate()
@@ -181,6 +194,14 @@ if __name__ == "__main__":
                 continue
         return False
 
+    def _resolve_server_address():
+        env_address = os.environ.get("GENESYS_SERVER_ADDRESS", "").strip()
+        if env_address:
+            return env_address
+        if os.path.exists("/.dockerenv"):
+            return "0.0.0.0"
+        return "localhost"
+
     # Launch Streamlit in a loop for auto-restart
     print("🚀 Starting Genesys Reporting App...")
     
@@ -190,9 +211,10 @@ if __name__ == "__main__":
     restart_exit_codes = {1, restart_exit_code}
 
     def run_streamlit():
+        server_address = _resolve_server_address()
         common_args = [
             "--server.port=8501",
-            "--server.address=localhost",
+            f"--server.address={server_address}",
             "--server.headless=true",
             "--global.developmentMode=false",
         ]
@@ -207,6 +229,13 @@ if __name__ == "__main__":
         try:
             # Force Kill: Ensure 8501 is free before starting
             kill_proc_on_port(8501)
+            if _is_port_busy(8501):
+                msg = "Port 8501 is in use by a non-app process. Refusing to terminate unrelated process."
+                print(f"❌ {msg}")
+                if not force_port_cleanup:
+                    print("Set GENESYS_FORCE_PORT_CLEANUP=1 only if you want to force-terminate any process on this port.")
+                log(msg)
+                break
             
             log(f"Starting streamlit: {app_path}")
             exit_code = run_streamlit()

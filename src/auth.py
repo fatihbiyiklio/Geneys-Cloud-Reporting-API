@@ -4,10 +4,14 @@ import threading
 import time
 import requests
 import sys
+import re
+from cryptography.fernet import Fernet
 
 _cache_lock = threading.Lock()
 _mem_cache = {}
 _MAX_MEM_CACHE_ENTRIES = 50
+ORG_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
+SECRET_KEY_FILENAME = ".secret.key"
 
 def _cache_key(client_id, region):
     return f"{client_id}:{region}"
@@ -25,11 +29,81 @@ def _resolve_org_base_dir():
 
 ORG_BASE_DIR = _resolve_org_base_dir()
 
-def _org_token_cache_path(org_code):
-    if not org_code:
+
+def _safe_org_code(org_code):
+    raw = str(org_code or "").strip()
+    if not raw:
         return None
-    base = os.path.join(ORG_BASE_DIR, org_code)
-    os.makedirs(base, exist_ok=True)
+    if not ORG_CODE_PATTERN.fullmatch(raw):
+        raise ValueError("Organization code must match ^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
+    return raw
+
+
+def _safe_org_dir(org_code, create=False):
+    safe_org = _safe_org_code(org_code)
+    if not safe_org:
+        return None
+    base = os.path.abspath(ORG_BASE_DIR)
+    path = os.path.abspath(os.path.join(base, safe_org))
+    if os.path.commonpath([base, path]) != base:
+        raise ValueError(f"Invalid organization code: {org_code}")
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _get_secret_key_path():
+    base_dir = os.environ.get("GENESYS_STATE_DIR") or ORG_BASE_DIR
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.join(base_dir, SECRET_KEY_FILENAME)
+
+
+def _get_or_create_key():
+    key_path = _get_secret_key_path()
+    if os.path.exists(key_path):
+        with open(key_path, "rb") as f:
+            return f.read()
+    key = Fernet.generate_key()
+    with open(key_path, "wb") as f:
+        f.write(key)
+    try:
+        os.chmod(key_path, 0o600)
+    except Exception:
+        pass
+    return key
+
+
+def _get_cipher():
+    return Fernet(_get_or_create_key())
+
+
+def _decrypt_cache_payload(raw_bytes):
+    if not raw_bytes:
+        return None
+    # Legacy plaintext cache compatibility.
+    try:
+        text = raw_bytes.decode("utf-8")
+        if text.strip().startswith("{"):
+            return json.loads(text)
+    except Exception:
+        pass
+    try:
+        cipher = _get_cipher()
+        decrypted = cipher.decrypt(raw_bytes).decode("utf-8")
+        return json.loads(decrypted)
+    except Exception:
+        return None
+
+
+def _encrypt_cache_payload(entry):
+    cipher = _get_cipher()
+    payload = json.dumps(entry, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return cipher.encrypt(payload)
+
+def _org_token_cache_path(org_code):
+    base = _safe_org_dir(org_code, create=True)
+    if not base:
+        return None
     return os.path.join(base, ".token_cache.json")
 
 def _load_cached_token(client_id, region, org_code=None):
@@ -47,11 +121,18 @@ def _load_cached_token(client_id, region, org_code=None):
     if not path or not os.path.exists(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            entry = json.load(f)
+        with open(path, "rb") as f:
+            raw = f.read()
+        legacy_plaintext = raw.lstrip().startswith(b"{")
+        entry = _decrypt_cache_payload(raw)
+        if not isinstance(entry, dict):
+            return None
         if entry.get("expires_at", 0) > (now + 60):
             with _cache_lock:
                 _mem_cache[key] = entry
+            if legacy_plaintext:
+                # Opportunistic migration to encrypted on successful read.
+                _store_cached_token(client_id, region, entry, org_code=org_code)
             return entry
     except Exception:
         return None
@@ -70,8 +151,9 @@ def _store_cached_token(client_id, region, entry, org_code=None):
     if not path:
         return
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(entry, f, ensure_ascii=False)
+        enc = _encrypt_cache_payload(entry)
+        with open(path, "wb") as f:
+            f.write(enc)
         try:
             os.chmod(path, 0o600)
         except Exception:
@@ -87,7 +169,12 @@ def authenticate(client_id, client_secret, region='mypurecloud.ie', org_code=Non
     if not client_id or not client_secret:
         return None, "Missing credentials"
 
-    cached = _load_cached_token(client_id, region, org_code=org_code)
+    try:
+        safe_org = _safe_org_code(org_code)
+    except ValueError as exc:
+        return None, str(exc)
+
+    cached = _load_cached_token(client_id, region, org_code=safe_org)
     if cached:
         return {
             "access_token": cached["access_token"],
@@ -116,7 +203,7 @@ def authenticate(client_id, client_secret, region='mypurecloud.ie', org_code=Non
                 "api_host": f"https://api.{region}",
                 "expires_at": time.time() + int(token_data.get("expires_in", 3600))
             }
-            _store_cached_token(client_id, region, token_entry, org_code=org_code)
+            _store_cached_token(client_id, region, token_entry, org_code=safe_org)
             return {
                 "access_token": token_entry["access_token"],
                 "region": token_entry["region"],

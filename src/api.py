@@ -1,4 +1,5 @@
 import time
+import random
 import requests
 from datetime import datetime, timezone, timedelta
 from src.monitor import monitor
@@ -11,7 +12,9 @@ class GenesysAPI:
     ASSIGNMENT_BATCH_SIZE = 50
     AGGREGATE_METRICS_BATCH_SIZE = 20
     HTTP_429_RETRY_SECONDS = 60
-    HTTP_429_MAX_RETRIES = 0
+    HTTP_429_MAX_RETRIES = 3
+    HTTP_429_MAX_TOTAL_WAIT_SECONDS = 180
+    HTTP_429_WAIT_CAP_SECONDS = 120
     QUEUE_MEMBER_429_RETRY_SECONDS = 60
     QUEUE_MEMBER_429_MAX_RETRIES = 1
 
@@ -27,6 +30,7 @@ class GenesysAPI:
         start = time.monotonic()
         headers = self.headers
         retry_429_count = 0
+        total_wait_429 = 0.0
         while True:
             try:
                 response = _session.get(f"{self.api_host}{path}", headers=headers, params=params, timeout=10)
@@ -43,14 +47,19 @@ class GenesysAPI:
                 monitor.log_api_call(path, method="GET", status_code=status_code, duration_ms=duration_ms)
                 if status_code == 429:
                     retry_429_count += 1
-                    if self._can_retry_429(retry_429_count):
-                        wait_s = self._get_retry_after_seconds(response)
+                    wait_s, projected_wait = self._next_429_wait(response, retry_429_count, total_wait_429)
+                    if wait_s is not None:
+                        total_wait_429 = projected_wait
                         monitor.log_error(
                             "API_GET",
-                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                            f"HTTP 429 on {path}; retrying in {wait_s:.2f}s (attempt {retry_429_count}, total_wait={total_wait_429:.2f}s)",
                         )
                         time.sleep(wait_s)
                         continue
+                    monitor.log_error(
+                        "API_GET",
+                        f"HTTP 429 retry budget exceeded on {path} (attempt {retry_429_count}, total_wait={projected_wait:.2f}s)",
+                    )
                 monitor.log_error("API_GET", f"HTTP {status_code} on {path}", str(e))
                 if status_code == 401:
                     monitor.log_error("API_GET", "Token expired (401). Should trigger re-auth here.")
@@ -90,16 +99,17 @@ class GenesysAPI:
 
     def _get_retry_after_seconds(self, response, default_seconds=None):
         default_wait = max(1, int(default_seconds or self.HTTP_429_RETRY_SECONDS or 1))
+        cap = max(1, int(getattr(self, "HTTP_429_WAIT_CAP_SECONDS", 120) or 120))
         if response is None:
-            return default_wait
+            return min(default_wait, cap)
         try:
             retry_after = (getattr(response, "headers", {}) or {}).get("Retry-After")
             if retry_after is None:
-                return default_wait
+                return min(default_wait, cap)
             wait_s = int(float(str(retry_after).strip()))
-            return max(1, wait_s)
+            return min(max(1, wait_s), cap)
         except Exception:
-            return default_wait
+            return min(default_wait, cap)
 
     def _can_retry_429(self, retry_count):
         try:
@@ -107,8 +117,23 @@ class GenesysAPI:
         except Exception:
             max_retries = 0
         if max_retries <= 0:
-            return True
+            return False
         return retry_count <= max_retries
+
+    def _next_429_wait(self, response, retry_count, total_wait_seconds):
+        if not self._can_retry_429(retry_count):
+            return None, total_wait_seconds
+        wait_s = self._get_retry_after_seconds(response)
+        # Small jitter avoids synchronized bursts after Retry-After.
+        wait_s += random.uniform(0, 0.5)
+        projected_wait = float(total_wait_seconds) + float(wait_s)
+        try:
+            max_total_wait = int(self.HTTP_429_MAX_TOTAL_WAIT_SECONDS or 0)
+        except Exception:
+            max_total_wait = 0
+        if max_total_wait > 0 and projected_wait > max_total_wait:
+            return None, projected_wait
+        return wait_s, projected_wait
 
     def _post(self, path, data, timeout=10, retries=0, retry_sleep=0.4, params=None):
         start = time.monotonic()
@@ -116,6 +141,7 @@ class GenesysAPI:
         attempts = max(0, int(retries)) + 1
         timeout_attempt = 0
         retry_429_count = 0
+        total_wait_429 = 0.0
         while True:
             try:
                 response = _session.post(
@@ -149,14 +175,19 @@ class GenesysAPI:
                 monitor.log_api_call(path, method="POST", status_code=status_code, duration_ms=duration_ms)
                 if status_code == 429:
                     retry_429_count += 1
-                    if self._can_retry_429(retry_429_count):
-                        wait_s = self._get_retry_after_seconds(response)
+                    wait_s, projected_wait = self._next_429_wait(response, retry_429_count, total_wait_429)
+                    if wait_s is not None:
+                        total_wait_429 = projected_wait
                         monitor.log_error(
                             "API_POST",
-                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                            f"HTTP 429 on {path}; retrying in {wait_s:.2f}s (attempt {retry_429_count}, total_wait={total_wait_429:.2f}s)",
                         )
                         time.sleep(wait_s)
                         continue
+                    monitor.log_error(
+                        "API_POST",
+                        f"HTTP 429 retry budget exceeded on {path} (attempt {retry_429_count}, total_wait={projected_wait:.2f}s)",
+                    )
                 monitor.log_error("API_POST", f"HTTP {status_code} on {path}", str(e))
                 if status_code == 401:
                     monitor.log_error("API_POST", "Token expired (401) on POST.")
@@ -171,6 +202,7 @@ class GenesysAPI:
         start = time.monotonic()
         headers = self.headers
         retry_429_count = 0
+        total_wait_429 = 0.0
         while True:
             try:
                 response = _session.put(f"{self.api_host}{path}", headers=headers, json=data, timeout=10)
@@ -189,14 +221,19 @@ class GenesysAPI:
                 monitor.log_api_call(path, method="PUT", status_code=status_code, duration_ms=duration_ms)
                 if status_code == 429:
                     retry_429_count += 1
-                    if self._can_retry_429(retry_429_count):
-                        wait_s = self._get_retry_after_seconds(response)
+                    wait_s, projected_wait = self._next_429_wait(response, retry_429_count, total_wait_429)
+                    if wait_s is not None:
+                        total_wait_429 = projected_wait
                         monitor.log_error(
                             "API_PUT",
-                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                            f"HTTP 429 on {path}; retrying in {wait_s:.2f}s (attempt {retry_429_count}, total_wait={total_wait_429:.2f}s)",
                         )
                         time.sleep(wait_s)
                         continue
+                    monitor.log_error(
+                        "API_PUT",
+                        f"HTTP 429 retry budget exceeded on {path} (attempt {retry_429_count}, total_wait={projected_wait:.2f}s)",
+                    )
                 detail = None
                 try:
                     detail = response.text
@@ -218,6 +255,7 @@ class GenesysAPI:
         start = time.monotonic()
         headers = self.headers
         retry_429_count = 0
+        total_wait_429 = 0.0
         while True:
             try:
                 response = _session.patch(f"{self.api_host}{path}", headers=headers, json=data or {}, timeout=15)
@@ -237,14 +275,19 @@ class GenesysAPI:
                 monitor.log_api_call(path, method="PATCH", status_code=status_code, duration_ms=duration_ms)
                 if status_code == 429:
                     retry_429_count += 1
-                    if self._can_retry_429(retry_429_count):
-                        wait_s = self._get_retry_after_seconds(response)
+                    wait_s, projected_wait = self._next_429_wait(response, retry_429_count, total_wait_429)
+                    if wait_s is not None:
+                        total_wait_429 = projected_wait
                         monitor.log_error(
                             "API_PATCH",
-                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                            f"HTTP 429 on {path}; retrying in {wait_s:.2f}s (attempt {retry_429_count}, total_wait={total_wait_429:.2f}s)",
                         )
                         time.sleep(wait_s)
                         continue
+                    monitor.log_error(
+                        "API_PATCH",
+                        f"HTTP 429 retry budget exceeded on {path} (attempt {retry_429_count}, total_wait={projected_wait:.2f}s)",
+                    )
                 detail = None
                 try:
                     detail = response.text
@@ -264,6 +307,7 @@ class GenesysAPI:
         start = time.monotonic()
         headers = self.headers
         retry_429_count = 0
+        total_wait_429 = 0.0
         while True:
             try:
                 response = _session.delete(
@@ -290,14 +334,19 @@ class GenesysAPI:
                 monitor.log_api_call(path, method="DELETE", status_code=status_code, duration_ms=duration_ms)
                 if status_code == 429:
                     retry_429_count += 1
-                    if self._can_retry_429(retry_429_count):
-                        wait_s = self._get_retry_after_seconds(response)
+                    wait_s, projected_wait = self._next_429_wait(response, retry_429_count, total_wait_429)
+                    if wait_s is not None:
+                        total_wait_429 = projected_wait
                         monitor.log_error(
                             "API_DELETE",
-                            f"HTTP 429 on {path}; retrying same request in {wait_s}s (attempt {retry_429_count})",
+                            f"HTTP 429 on {path}; retrying in {wait_s:.2f}s (attempt {retry_429_count}, total_wait={total_wait_429:.2f}s)",
                         )
                         time.sleep(wait_s)
                         continue
+                    monitor.log_error(
+                        "API_DELETE",
+                        f"HTTP 429 retry budget exceeded on {path} (attempt {retry_429_count}, total_wait={projected_wait:.2f}s)",
+                    )
                 detail = None
                 try:
                     detail = response.text
@@ -610,7 +659,7 @@ class GenesysAPI:
             return data
         except Exception as e:
             monitor.log_error("API_GET", f"Error fetching conversation {conversation_id}: {e}")
-            return None
+            return {}
 
     def get_conversation_call(self, conversation_id):
         """Fetch call conversation with participant attributes."""
@@ -621,29 +670,9 @@ class GenesysAPI:
             # Fallback to generic conversation endpoint
             return self.get_conversation(conversation_id)
 
-    def get_users(self):
-        """Fetches all users using direct API with paging."""
-        users = []
-        try:
-            page_number = 1
-            while True:
-                data = self._get("/api/v2/users", params={"pageNumber": page_number, "pageSize": 100})
-                if 'entities' in data:
-                    for user in data['entities']:
-                        users.append({
-                            'id': user['id'], 
-                            'name': user['name'],
-                            'username': user.get('username', '')
-                        })
-                    if not data.get('nextUri'):
-                        break
-                    page_number += 1
-                else:
-                    break
-        except Exception as e:
-            monitor.log_error("API_GET", f"Error: {e}")
-            return {"error": str(e)}
-        return users
+    def get_users(self, page_size=100, max_pages=50):
+        """Fetches all users from Genesys Cloud."""
+        return self._get_users_page_scan(page_size=page_size, max_pages=max_pages)
 
     def get_queues(self):
         """Fetches all queues using direct API with paging."""
@@ -1069,7 +1098,7 @@ class GenesysAPI:
             monitor.log_error("API_GET", f"Error fetching user by ID {user_id}: {e}")
             raise e
 
-    def get_users(self, page_size=100, max_pages=50):
+    def _get_users_page_scan(self, page_size=100, max_pages=50):
         """Fetches all users from Genesys Cloud."""
         users = []
         try:
@@ -1621,8 +1650,8 @@ class GenesysAPI:
             monitor.log_error("API_GET", f"Error fetching queue conversations for {queue_id}: {e}")
         return conversations
 
-    def get_conversation(self, conversation_id):
-        """Fetch a single conversation by id."""
+    def _get_conversation_basic(self, conversation_id):
+        """Legacy single-conversation fetch helper."""
         try:
             return self._get(f"/api/v2/conversations/{conversation_id}")
         except Exception as e:
