@@ -209,6 +209,7 @@ if __name__ == "__main__":
     last_restart = time.time()
     restart_exit_code = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
     restart_exit_codes = {1, restart_exit_code}
+    final_exit_code = 0
 
     def run_streamlit():
         server_address = _resolve_server_address()
@@ -235,6 +236,7 @@ if __name__ == "__main__":
                 if not force_port_cleanup:
                     print("Set GENESYS_FORCE_PORT_CLEANUP=1 only if you want to force-terminate any process on this port.")
                 log(msg)
+                final_exit_code = 1
                 break
             
             log(f"Starting streamlit: {app_path}")
@@ -243,6 +245,7 @@ if __name__ == "__main__":
             if exit_code == 0:
                 print("🛑 Application stopped gracefully (Exit Code 0).")
                 log("Exit code 0. Wrapper stopping.")
+                final_exit_code = 0
                 break
 
             restart_count += 1
@@ -254,6 +257,7 @@ if __name__ == "__main__":
             if restart_count >= 8:
                 print("❌ Too many restarts. Exiting.")
                 log("Too many restarts. Exiting.")
+                final_exit_code = exit_code if exit_code not in restart_exit_codes else 1
                 break
 
             if exit_code in restart_exit_codes:
@@ -264,10 +268,11 @@ if __name__ == "__main__":
                 time.sleep(5)
         except KeyboardInterrupt:
             print("\n👋 Manual interruption. Exiting...")
+            final_exit_code = 130
             break
         except Exception as e:
             print(f"❌ Fatal Error in wrapper: {e}")
             log(f"Fatal Error in wrapper: {e}")
             time.sleep(5)
             
-    sys.exit(0)
+    sys.exit(final_exit_code)

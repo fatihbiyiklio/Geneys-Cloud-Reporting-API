@@ -146,6 +146,7 @@ ORG_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
 LOGIN_WINDOW_SECONDS = int(os.environ.get("GENESYS_LOGIN_WINDOW_SECONDS", "900"))
 LOGIN_LOCK_SECONDS = int(os.environ.get("GENESYS_LOGIN_LOCK_SECONDS", "900"))
 LOGIN_MAX_FAILURES = int(os.environ.get("GENESYS_LOGIN_MAX_FAILURES", "5"))
+LOGIN_ATTEMPT_MAX_ENTRIES = int(os.environ.get("GENESYS_LOGIN_ATTEMPT_MAX_ENTRIES", "5000"))
 
 def _rm_debug(msg, *args):
     if DEBUG_REMEMBER_ME:
@@ -1720,6 +1721,7 @@ def _hydrate_app_user_from_saved_session(session_data):
             "org_code": org_code,
             "role": db_user.get("role", session_data.get("role", "Reports User")),
             "metrics": db_user.get("metrics", session_data.get("metrics", [])),
+            "must_change_password": bool(db_user.get("must_change_password")),
         }
         _rm_debug("hydrate success for user=%s org=%s", username, org_code)
         return hydrated
@@ -1824,6 +1826,36 @@ def _flush_pending_remember_me():
     payload = st.session_state.get("_remember_me_pending_payload")
     if not payload:
         return True
+    username = str(payload.get("username") or "").strip()
+    try:
+        org_code = _safe_org_code(payload.get("org_code", "default"))
+    except ValueError:
+        _rm_debug("pending remember-me dropped: invalid org_code in payload")
+        st.session_state.pop("_remember_me_pending_payload", None)
+        st.session_state.pop("_remember_me_pending_retries", None)
+        st.session_state.remember_me_enabled = False
+        st.session_state["_remember_me_pending_delete"] = True
+        st.session_state["_remember_me_pending_delete_retries"] = 0
+        return True
+
+    if username:
+        try:
+            org_users = auth_manager.get_all_users(org_code) or {}
+            db_user = org_users.get(username) or {}
+            if db_user.get("must_change_password"):
+                _rm_debug(
+                    "pending remember-me dropped for user=%s org=%s due to must_change_password",
+                    username,
+                    org_code,
+                )
+                st.session_state.pop("_remember_me_pending_payload", None)
+                st.session_state.pop("_remember_me_pending_retries", None)
+                st.session_state.remember_me_enabled = False
+                st.session_state["_remember_me_pending_delete"] = True
+                st.session_state["_remember_me_pending_delete_retries"] = 0
+                return True
+        except Exception as e:
+            _rm_debug("pending remember-me user lookup failed: %s", e)
     _rm_debug(
         "pending remember-me flush: retry=%s user=%s org=%s",
         st.session_state.get("_remember_me_pending_retries", 0),
@@ -1878,20 +1910,36 @@ def _login_failure_key(org_code, username):
     return f"{str(org_code or '').strip().lower()}::{str(username or '').strip().lower()}"
 
 
+def _prune_login_failures_locked(entries, now):
+    stale_keys = []
+    for k, v in entries.items():
+        lock_until = float((v or {}).get("lock_until", 0) or 0)
+        first_ts = float((v or {}).get("first_ts", 0) or 0)
+        if now > lock_until and now > first_ts + LOGIN_WINDOW_SECONDS:
+            stale_keys.append(k)
+    for k in stale_keys:
+        entries.pop(k, None)
+
+    max_entries = max(1000, int(LOGIN_ATTEMPT_MAX_ENTRIES))
+    if len(entries) <= max_entries:
+        return
+
+    ranked_entries = []
+    for k, v in entries.items():
+        lock_until = float((v or {}).get("lock_until", 0) or 0)
+        first_ts = float((v or {}).get("first_ts", 0) or 0)
+        ranked_entries.append((max(lock_until, first_ts), k))
+    ranked_entries.sort(reverse=True)
+    for _, key in ranked_entries[max_entries:]:
+        entries.pop(key, None)
+
+
 def _register_login_failure(org_code, username):
     now = pytime.time()
     key = _login_failure_key(org_code, username)
     store = _login_attempt_store()
     with store["lock"]:
-        if len(store["entries"]) > 5000:
-            stale_keys = []
-            for k, v in store["entries"].items():
-                lock_until = float((v or {}).get("lock_until", 0) or 0)
-                first_ts = float((v or {}).get("first_ts", 0) or 0)
-                if now > lock_until and now > first_ts + LOGIN_WINDOW_SECONDS:
-                    stale_keys.append(k)
-            for k in stale_keys:
-                store["entries"].pop(k, None)
+        _prune_login_failures_locked(store["entries"], now)
         entry = store["entries"].get(key, {"count": 0, "first_ts": now, "lock_until": 0})
         if now > float(entry.get("first_ts", 0)) + LOGIN_WINDOW_SECONDS:
             entry = {"count": 0, "first_ts": now, "lock_until": 0}
@@ -1899,6 +1947,7 @@ def _register_login_failure(org_code, username):
         if entry["count"] >= max(1, LOGIN_MAX_FAILURES):
             entry["lock_until"] = now + max(1, LOGIN_LOCK_SECONDS)
         store["entries"][key] = entry
+        _prune_login_failures_locked(store["entries"], now)
         return {
             "count": int(entry.get("count", 0)),
             "locked": now < float(entry.get("lock_until", 0)),
@@ -1918,6 +1967,7 @@ def _get_login_lock_state(org_code, username):
     key = _login_failure_key(org_code, username)
     store = _login_attempt_store()
     with store["lock"]:
+        _prune_login_failures_locked(store["entries"], now)
         entry = store["entries"].get(key)
         if not entry:
             return {"locked": False, "remaining": 0}
@@ -1939,6 +1989,114 @@ def _user_dir(org_code, username):
 
 def _current_user():
     return st.session_state.app_user if st.session_state.get("app_user") else None
+
+
+def _config_paths(org_code, username=None):
+    if username:
+        user_path = _user_dir(org_code, username)
+        return (
+            os.path.join(user_path, CONFIG_FILE),
+            os.path.join(user_path, PRESETS_FILE),
+        )
+    org_path = _org_dir(org_code)
+    return (
+        os.path.join(org_path, CONFIG_FILE),
+        os.path.join(org_path, PRESETS_FILE),
+    )
+
+
+def _config_mtime(path):
+    try:
+        return float(os.path.getmtime(path))
+    except Exception:
+        return 0.0
+
+
+def _invalidate_configs_export_cache():
+    try:
+        st.session_state.pop("_configs_export_cache", None)
+    except Exception:
+        pass
+
+
+def _resolve_utc_offset_hours(raw_offset, default=3.0):
+    try:
+        return float(raw_offset)
+    except Exception:
+        return float(default)
+
+
+def _resolve_org_code_for_config(org_code=None):
+    if org_code:
+        return str(org_code)
+    user = st.session_state.get("app_user") or {}
+    return str(user.get("org_code", "default") or "default")
+
+
+def _resolve_org_config(org_code=None, force_reload=False):
+    target_org = _resolve_org_code_for_config(org_code)
+    cfg_owner = st.session_state.get("_org_config_owner")
+    cfg = st.session_state.get("org_config") or {}
+    if force_reload or cfg_owner != target_org or not cfg:
+        try:
+            cfg = load_credentials(target_org) or {}
+        except Exception:
+            cfg = {}
+        st.session_state.org_config = cfg
+        st.session_state["_org_config_owner"] = target_org
+    return cfg
+
+
+def _resolve_org_utc_offset_hours(org_code=None, default=3.0, force_reload=False):
+    cfg = _resolve_org_config(org_code=org_code, force_reload=force_reload)
+    return _resolve_utc_offset_hours(cfg.get("utc_offset", default), default=default)
+
+
+def _dashboard_interval_utc(mode, saved_creds, selected_date=None):
+    offset_hours = _resolve_utc_offset_hours((saved_creds or {}).get("utc_offset", 3), default=3.0)
+    org_tz = timezone(timedelta(hours=offset_hours))
+    now_local = datetime.now(org_tz)
+    mode_safe = str(mode or "Live")
+
+    if mode_safe == "Yesterday":
+        target_day = now_local.date() - timedelta(days=1)
+        end_local = datetime.combine(target_day, time(23, 59, 59), tzinfo=org_tz)
+    elif mode_safe == "Date":
+        if isinstance(selected_date, datetime):
+            target_day = selected_date.date()
+        elif hasattr(selected_date, "year") and hasattr(selected_date, "month") and hasattr(selected_date, "day"):
+            target_day = selected_date
+        else:
+            target_day = now_local.date()
+        end_local = datetime.combine(target_day, time(23, 59, 59), tzinfo=org_tz)
+        if target_day == now_local.date() and end_local > now_local:
+            end_local = now_local
+    else:
+        target_day = now_local.date()
+        end_local = now_local
+
+    start_local = datetime.combine(target_day, time(0, 0), tzinfo=org_tz)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _resolve_card_queue_names(card_queues, queues_map):
+    resolved = []
+    missing = []
+    if not isinstance(queues_map, dict):
+        return resolved, missing
+    normalized_name_map = {str(name).strip().lower(): name for name in queues_map.keys()}
+
+    for raw_name in (card_queues or []):
+        clean_name = str(raw_name or "").replace("(not loaded)", "").strip()
+        if not clean_name:
+            continue
+        canonical = clean_name if clean_name in queues_map else normalized_name_map.get(clean_name.lower())
+        if canonical:
+            if canonical not in resolved:
+                resolved.append(canonical)
+        elif clean_name not in missing:
+            missing.append(clean_name)
+    return resolved, missing
 
 
 def _normalize_dashboard_cards(cards):
@@ -1994,11 +2152,9 @@ def _normalize_dashboard_cards(cards):
 def load_dashboard_config(org_code):
     user = _current_user()
     if user:
-        user_path = _user_dir(org_code, user.get("username"))
-        filename = os.path.join(user_path, CONFIG_FILE)
+        filename, _ = _config_paths(org_code, user.get("username"))
     else:
-        org_path = _org_dir(org_code)
-        filename = os.path.join(org_path, CONFIG_FILE)
+        filename, _ = _config_paths(org_code, None)
     if not os.path.exists(filename): return {"layout": 1, "cards": []}
     try:
         with open(filename, "r", encoding='utf-8') as f:
@@ -2019,9 +2175,9 @@ def load_dashboard_config(org_code):
 def save_dashboard_config(org_code, layout, cards):
     user = _current_user()
     if user:
-        filename = os.path.join(_user_dir(org_code, user.get("username")), CONFIG_FILE)
+        filename, _ = _config_paths(org_code, user.get("username"))
     else:
-        filename = os.path.join(_org_dir(org_code), CONFIG_FILE)
+        filename, _ = _config_paths(org_code, None)
     try:
         try:
             safe_layout = int(layout or 1)
@@ -2031,16 +2187,16 @@ def save_dashboard_config(org_code, layout, cards):
         safe_cards = _normalize_dashboard_cards(cards)
         with open(filename, "w", encoding='utf-8') as f:
             json.dump({"layout": safe_layout, "cards": safe_cards}, f, ensure_ascii=False)
+        _invalidate_configs_export_cache()
     except Exception as e:
         logger.warning("Failed to save dashboard config (%s): %s", filename, e)
 
 def load_presets(org_code):
     user = _current_user()
     if user:
-        filename = os.path.join(_user_dir(org_code, user.get("username")), PRESETS_FILE)
+        _, filename = _config_paths(org_code, user.get("username"))
     else:
-        org_path = _org_dir(org_code)
-        filename = os.path.join(org_path, PRESETS_FILE)
+        _, filename = _config_paths(org_code, None)
     if not os.path.exists(filename): return []
     try:
         with open(filename, "r", encoding='utf-8') as f:
@@ -2053,17 +2209,45 @@ def load_presets(org_code):
 def save_presets(org_code, presets):
     user = _current_user()
     if user:
-        filename = os.path.join(_user_dir(org_code, user.get("username")), PRESETS_FILE)
+        _, filename = _config_paths(org_code, user.get("username"))
     else:
-        filename = os.path.join(_org_dir(org_code), PRESETS_FILE)
+        _, filename = _config_paths(org_code, None)
     try:
         with open(filename, "w", encoding='utf-8') as f: json.dump(presets, f, ensure_ascii=False)
+        _invalidate_configs_export_cache()
     except Exception as e:
         logger.warning("Failed to save presets (%s): %s", filename, e)
 
 def get_all_configs_json():
-    org = st.session_state.app_user.get('org_code', 'default') if st.session_state.app_user else 'default'
-    return json.dumps({"dashboard": load_dashboard_config(org), "report_presets": load_presets(org)}, indent=2)
+    user = _current_user()
+    org = user.get("org_code", "default") if user else "default"
+    username = user.get("username") if user else None
+    config_path, presets_path = _config_paths(org, username)
+    config_mtime = _config_mtime(config_path)
+    presets_mtime = _config_mtime(presets_path)
+
+    cache = st.session_state.get("_configs_export_cache")
+    if (
+        isinstance(cache, dict)
+        and cache.get("org") == org
+        and cache.get("username") == (username or "")
+        and cache.get("config_mtime") == config_mtime
+        and cache.get("presets_mtime") == presets_mtime
+    ):
+        return cache.get("payload", "{}")
+
+    payload = json.dumps(
+        {"dashboard": load_dashboard_config(org), "report_presets": load_presets(org)},
+        indent=2,
+    )
+    st.session_state["_configs_export_cache"] = {
+        "org": org,
+        "username": username or "",
+        "config_mtime": config_mtime,
+        "presets_mtime": presets_mtime,
+        "payload": payload,
+    }
+    return payload
 
 def import_all_configs(json_data):
     try:
@@ -2073,6 +2257,7 @@ def import_all_configs(json_data):
             save_dashboard_config(org, data["dashboard"].get("layout", 1), data["dashboard"].get("cards", []))
         if "report_presets" in data:
             save_presets(org, data["report_presets"])
+        _invalidate_configs_export_cache()
         return True
     except Exception as e:
         logger.warning("Failed to import all configs: %s", e)
@@ -2147,6 +2332,7 @@ def _soft_memory_cleanup():
                 org["agent_presence"] = {}
                 org["agent_routing"] = {}
                 org["call_meta"] = {}
+                org["call_meta_attempt_ts"] = {}
                 org["daily_stats_cache"] = {}
                 org["call_seed_ts"] = 0
                 org["call_meta_poll_ts"] = 0
@@ -2434,6 +2620,7 @@ def _ensure_seed_org(store, org_code, max_orgs=20):
         "call_seed_ts": 0,
         "call_seed_data": [],
         "call_meta_poll_ts": 0,
+        "call_meta_attempt_ts": {},
         "ivr_calls_ts": 0,
         "ivr_calls_data": [],
         "agent_seed_ts": 0,
@@ -2446,6 +2633,7 @@ def _ensure_seed_org(store, org_code, max_orgs=20):
     org.setdefault("call_seed_ts", 0)
     org.setdefault("call_seed_data", [])
     org.setdefault("call_meta_poll_ts", 0)
+    org.setdefault("call_meta_attempt_ts", {})
     org.setdefault("ivr_calls_ts", 0)
     org.setdefault("ivr_calls_data", [])
     org.setdefault("agent_seed_ts", 0)
@@ -2545,6 +2733,50 @@ def _reserve_call_meta_poll(org_code, now_ts, min_interval=10):
         org["call_meta_poll_ts"] = now_ts
         return True
 
+
+def _reserve_call_meta_targets(
+    org_code,
+    candidate_ids,
+    now_ts,
+    min_interval=60,
+    cooldown_seconds=120,
+    max_items=1,
+):
+    store = _shared_seed_store()
+    with store["lock"]:
+        org = _ensure_seed_org(store, org_code)
+        last_poll_ts = float(org.get("call_meta_poll_ts", 0) or 0)
+        if (now_ts - last_poll_ts) < max(5, int(min_interval or 60)):
+            return []
+
+        attempts = org.setdefault("call_meta_attempt_ts", {})
+        cooldown = max(10, int(cooldown_seconds or 120))
+        max_targets = max(1, int(max_items or 1))
+        prune_before = now_ts - max(cooldown * 10, 1800)
+        stale_attempts = [cid for cid, ts in attempts.items() if float(ts or 0) < prune_before]
+        for cid in stale_attempts:
+            attempts.pop(cid, None)
+
+        selected = []
+        for raw_cid in candidate_ids or []:
+            cid = str(raw_cid or "").strip()
+            if not cid:
+                continue
+            last_attempt_ts = float(attempts.get(cid, 0) or 0)
+            if (now_ts - last_attempt_ts) < cooldown:
+                continue
+            selected.append(cid)
+            if len(selected) >= max_targets:
+                break
+
+        if not selected:
+            return []
+
+        org["call_meta_poll_ts"] = now_ts
+        for cid in selected:
+            attempts[cid] = now_ts
+        return selected
+
 def _get_shared_daily_stats(org_code, cache_key, max_age_seconds=300):
     store = _shared_seed_store()
     now = pytime.time()
@@ -2642,17 +2874,144 @@ def _update_ivr_calls(org_code, calls, now_ts, max_items=300):
         org["ivr_calls_data"] = data
 
 def _resolve_refresh_interval_seconds(org_code=None, minimum=3, default=15):
-    cfg = st.session_state.get("org_config") or {}
-    if not cfg and org_code:
-        try:
-            cfg = load_credentials(org_code) or {}
-        except Exception:
-            cfg = {}
+    cfg = _resolve_org_config(org_code=org_code, force_reload=False)
     try:
         refresh_s = int(cfg.get("refresh_interval", default) or default)
     except Exception:
         refresh_s = default
     return max(minimum, refresh_s)
+
+
+def _dashboard_dm_signature(org_code):
+    queues_map = st.session_state.get("queues_map") or {}
+    cards = st.session_state.get("dashboard_cards") or []
+    card_targets = []
+    for card in cards:
+        resolved, _ = _resolve_card_queue_names(card.get("queues", []), queues_map)
+        card_targets.append(tuple(resolved))
+    return (
+        str(org_code or "default"),
+        tuple(card_targets),
+        bool(st.session_state.get("use_agent_notifications", True)),
+        bool(st.session_state.get("api_client")),
+    )
+
+
+def _dashboard_profile_state():
+    state = st.session_state.get("_dashboard_profile")
+    if not isinstance(state, dict):
+        state = {
+            "enabled": False,
+            "started_ts": 0.0,
+            "duration_s": 180,
+            "runs": 0,
+            "samples": {},
+        }
+        st.session_state["_dashboard_profile"] = state
+    state.setdefault("enabled", False)
+    state.setdefault("started_ts", 0.0)
+    state.setdefault("duration_s", 180)
+    state.setdefault("runs", 0)
+    if not isinstance(state.get("samples"), dict):
+        state["samples"] = {}
+    return state
+
+
+def _dashboard_profile_start(duration_s=180):
+    state = _dashboard_profile_state()
+    try:
+        duration = int(duration_s)
+    except Exception:
+        duration = 180
+    duration = max(60, min(900, duration))
+    state["enabled"] = True
+    state["started_ts"] = pytime.time()
+    state["duration_s"] = duration
+    state["runs"] = 0
+    state["samples"] = {}
+
+
+def _dashboard_profile_stop():
+    state = _dashboard_profile_state()
+    state["enabled"] = False
+
+
+def _dashboard_profile_clear(duration_s=None):
+    state = _dashboard_profile_state()
+    if duration_s is not None:
+        try:
+            state["duration_s"] = max(60, min(900, int(duration_s)))
+        except Exception:
+            pass
+    state["runs"] = 0
+    state["samples"] = {}
+    state["started_ts"] = 0.0
+    state["enabled"] = False
+
+
+def _dashboard_profile_tick():
+    state = _dashboard_profile_state()
+    if not state.get("enabled"):
+        return
+    started_ts = float(state.get("started_ts", 0) or 0)
+    duration_s = max(60, int(state.get("duration_s", 180) or 180))
+    if started_ts and (pytime.time() - started_ts) >= duration_s:
+        state["enabled"] = False
+
+
+def _dashboard_profile_active():
+    return bool(_dashboard_profile_state().get("enabled"))
+
+
+def _dashboard_profile_record(block_name, elapsed_seconds):
+    if not _dashboard_profile_active():
+        return
+    try:
+        elapsed_ms = max(0.0, float(elapsed_seconds) * 1000.0)
+    except Exception:
+        return
+    state = _dashboard_profile_state()
+    samples = state.setdefault("samples", {})
+    key = str(block_name or "").strip()
+    if not key:
+        return
+    bucket = samples.setdefault(key, [])
+    bucket.append(round(elapsed_ms, 3))
+    if len(bucket) > 3000:
+        samples[key] = bucket[-2000:]
+
+
+def _dashboard_profile_commit_run():
+    if _dashboard_profile_active():
+        state = _dashboard_profile_state()
+        state["runs"] = int(state.get("runs", 0) or 0) + 1
+
+
+def _dashboard_profile_rows(limit=15):
+    state = _dashboard_profile_state()
+    rows = []
+    all_samples = state.get("samples", {}) or {}
+    for block_name, values in all_samples.items():
+        vals = [float(v) for v in values if isinstance(v, (int, float))]
+        if not vals:
+            continue
+        total_ms = float(sum(vals))
+        calls = len(vals)
+        avg_ms = total_ms / calls if calls else 0.0
+        p95_ms = float(np.percentile(vals, 95)) if calls > 1 else avg_ms
+        max_ms = float(max(vals))
+        rows.append(
+            {
+                "Blok": block_name,
+                "Çağrı": calls,
+                "Avg (ms)": round(avg_ms, 2),
+                "P95 (ms)": round(p95_ms, 2),
+                "Max (ms)": round(max_ms, 2),
+                "Toplam (ms)": round(total_ms, 2),
+            }
+        )
+    rows.sort(key=lambda r: r.get("Toplam (ms)", 0), reverse=True)
+    return rows[:max(1, int(limit))]
 
 def _get_session_id():
     if "_session_id" not in st.session_state:
@@ -2972,23 +3331,17 @@ def refresh_data_manager_queues():
     use_agent_notif = st.session_state.get('use_agent_notifications', True)
     
     if 'dashboard_cards' in st.session_state:
-        norm_map = {k.strip(): v for k, v in st.session_state.queues_map.items()}
         for card in st.session_state.dashboard_cards:
-            q_list = card.get('queues', [])
+            q_list, _ = _resolve_card_queue_names(card.get('queues', []), st.session_state.queues_map)
             if q_list:
                 # 1. Total Metrics Queues
                 for q_name in q_list:
-                    q_name = q_name.strip()
-                    q_id = norm_map.get(q_name)
+                    q_id = st.session_state.queues_map.get(q_name)
                     if q_id:
                         all_dashboard_queues[q_name] = q_id
-
-                # 2. Agent Details Primary Queue (First in card list)
-                primary_q = q_list[0].strip()
-                p_id = norm_map.get(primary_q)
-                if p_id:
-                    if len(agent_queues_map) < 50: # Safety Cap: Max 50 monitored queues for agents
-                        agent_queues_map[primary_q] = p_id
+                        # 2. Agent details now track all selected queues (capped)
+                        if len(agent_queues_map) < 50 and q_name not in agent_queues_map:
+                            agent_queues_map[q_name] = q_id
     
     # Register this session's queues and compute union across active sessions
     union_queues, union_agent_queues, sess_count = _register_org_session_queues(org_code, all_dashboard_queues, agent_queues_map)
@@ -2998,16 +3351,7 @@ def refresh_data_manager_queues():
     # We use all_dashboard_queues for overall metrics (efficiency)
     # Pass empty dicts ({}) if empty, do NOT fall back to 'None' or full map
     st.session_state.data_manager.update_api_client(st.session_state.api_client, st.session_state.get('presence_map'))
-    org_cfg = st.session_state.get("org_config") or {}
-    if not org_cfg:
-        try:
-            org_cfg = load_credentials(org_code) or {}
-        except Exception:
-            org_cfg = {}
-    try:
-        utc_offset = int(org_cfg.get("utc_offset", 3) or 3)
-    except Exception:
-        utc_offset = 3
+    utc_offset = _resolve_org_utc_offset_hours(org_code=org_code, default=3.0, force_reload=False)
     refresh_s = _resolve_refresh_interval_seconds(org_code, minimum=1, default=15)
     st.session_state.data_manager.update_settings(utc_offset, refresh_s)
     dm_agent_queues = {} if use_agent_notif else union_agent_queues
@@ -3332,6 +3676,8 @@ def init_session_state():
     if 'page' not in st.session_state: st.session_state.page = "Dashboard"
     if 'show_agent_panel' not in st.session_state: st.session_state.show_agent_panel = False
     if 'show_call_panel' not in st.session_state: st.session_state.show_call_panel = False
+    if 'dashboard_auto_refresh' not in st.session_state: st.session_state.dashboard_auto_refresh = True
+    if '_dashboard_dm_sig' not in st.session_state: st.session_state._dashboard_dm_sig = None
     if 'notifications_manager' not in st.session_state: st.session_state.notifications_manager = None
     if 'agent_notifications_manager' not in st.session_state: st.session_state.agent_notifications_manager = None
     if 'use_agent_notifications' not in st.session_state: st.session_state.use_agent_notifications = True
@@ -3447,7 +3793,19 @@ if not st.session_state.app_user:
                             full_user = {"username": u_name_clean, **safe_user_data}
                             
                             # Handle Remember Me
-                            if remember_me:
+                            if remember_me and full_user.get("must_change_password"):
+                                _rm_debug(
+                                    "remember-me skipped on login for user=%s org=%s due to must_change_password",
+                                    u_name_clean,
+                                    u_org_safe,
+                                )
+                                st.session_state.remember_me_enabled = False
+                                st.session_state._remember_me_pending_payload = None
+                                st.session_state._remember_me_pending_retries = 0
+                                st.session_state._remember_me_pending_delete = True
+                                st.session_state._remember_me_pending_delete_retries = 0
+                                delete_app_session()
+                            elif remember_me:
                                 _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name_clean, u_org_safe)
                                 remember_payload = {
                                     "username": u_name_clean,
@@ -3520,7 +3878,8 @@ if st.session_state.get("app_user") and st.session_state.app_user.get("must_chan
 # --- AUTO-LOGIN GENESYS ---
 if st.session_state.app_user:
     org = st.session_state.app_user.get('org_code', 'default')
-    saved_creds = load_credentials(org)
+    saved_creds = _resolve_org_config(org_code=org, force_reload=True)
+    utc_offset_hours = _resolve_org_utc_offset_hours(org_code=org, default=3.0, force_reload=False)
     
     if not st.session_state.api_client and saved_creds and not st.session_state.get('genesys_logged_out'):
         cid, csec, reg = saved_creds.get("client_id"), saved_creds.get("client_secret"), saved_creds.get("region", "mypurecloud.ie")
@@ -3541,6 +3900,7 @@ if st.session_state.app_user:
                 st.session_state.wrapup_map = maps.get("wrapup", {})
                 st.session_state.presence_map = maps.get("presence", {})
                 st.session_state.org_config = saved_creds # Store for later use (refresh interval etc.)
+                st.session_state["_org_config_owner"] = org
                 refresh_data_manager_queues()
 
     # Keep DataManager session sync lightweight (throttled)
@@ -3860,14 +4220,14 @@ elif page == get_text(lang, "menu_reports"):
             st.info(get_text(lang, "chat_detail_info"))
             if st.button(get_text(lang, "fetch_chat_data"), type="primary", width='stretch'):
              with st.spinner(get_text(lang, "fetching_data")):
-                 start_date = datetime.combine(sd, st_) - timedelta(hours=saved_creds.get("utc_offset", 3))
-                 end_date = datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
+                 start_date = datetime.combine(sd, st_) - timedelta(hours=utc_offset_hours)
+                 end_date = datetime.combine(ed, et) - timedelta(hours=utc_offset_hours)
                  
                  api = GenesysAPI(st.session_state.api_client)
                  max_records = int(st.session_state.get("rep_max_records", 5000))
                  dfs = []
                  total_rows = 0
-                 u_offset = saved_creds.get("utc_offset", 3)
+                 u_offset = utc_offset_hours
                  skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                  st.session_state.skills_map = skill_lookup
                  language_lookup = api.get_languages()
@@ -4001,8 +4361,8 @@ elif page == get_text(lang, "menu_reports"):
                  # api = GenesysAPI(st.session_state.api_client) # already initialized above if needed, but let's re-init
                  api = GenesysAPI(st.session_state.api_client)
                  
-                 s_dt = datetime.combine(sd, st_) - timedelta(hours=saved_creds.get("utc_offset", 3))
-                 e_dt = datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
+                 s_dt = datetime.combine(sd, st_) - timedelta(hours=utc_offset_hours)
+                 e_dt = datetime.combine(ed, et) - timedelta(hours=utc_offset_hours)
                  
                  # Get details
                  max_records = int(st.session_state.get("rep_max_records", 5000))
@@ -4023,7 +4383,7 @@ elif page == get_text(lang, "menu_reports"):
                          queue_map=st.session_state.queues_map,
                          wrapup_map=st.session_state.wrapup_map,
                          include_attributes=True,
-                         utc_offset=saved_creds.get("utc_offset", 3),
+                         utc_offset=utc_offset_hours,
                          skill_map=skill_lookup,
                          language_map=language_lookup
                      )
@@ -4111,8 +4471,8 @@ elif page == get_text(lang, "menu_reports"):
         
         if st.button(get_text(lang, "fetch_interactions"), type="primary", width='stretch'):
              with st.spinner(get_text(lang, "fetching_data")):
-                 start_date = datetime.combine(sd, st_) - timedelta(hours=saved_creds.get("utc_offset", 3))
-                 end_date = datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
+                 start_date = datetime.combine(sd, st_) - timedelta(hours=utc_offset_hours)
+                 end_date = datetime.combine(ed, et) - timedelta(hours=utc_offset_hours)
                  # Fetch data
                  api = GenesysAPI(st.session_state.api_client)
                  max_records = int(st.session_state.get("rep_max_records", 5000))
@@ -4132,7 +4492,7 @@ elif page == get_text(lang, "menu_reports"):
                          st.session_state.users_info,
                          st.session_state.queues_map,
                          st.session_state.wrapup_map,
-                         utc_offset=saved_creds.get("utc_offset", 3),
+                         utc_offset=utc_offset_hours,
                          skill_map=skill_lookup,
                          language_map=language_lookup
                      )
@@ -4243,10 +4603,16 @@ elif page == get_text(lang, "menu_reports"):
             st.session_state.last_metrics = sel_mets
             with st.spinner(get_text(lang, "fetching_data")):
                 api = GenesysAPI(st.session_state.api_client)
-                s_dt, e_dt = datetime.combine(sd, st_) - timedelta(hours=saved_creds.get("utc_offset", 3)), datetime.combine(ed, et) - timedelta(hours=saved_creds.get("utc_offset", 3))
-                now_utc_naive = datetime.utcnow()
-                if e_dt > now_utc_naive:
-                    e_dt = now_utc_naive
+                s_dt, e_dt = (
+                    datetime.combine(sd, st_) - timedelta(hours=utc_offset_hours),
+                    datetime.combine(ed, et) - timedelta(hours=utc_offset_hours),
+                )
+                # Use timezone-aware UTC datetimes to avoid deprecated utcnow().
+                s_dt = s_dt.replace(tzinfo=timezone.utc)
+                e_dt = e_dt.replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(timezone.utc)
+                if e_dt > now_utc:
+                    e_dt = now_utc
                     st.info("Bitiş zamanı gelecekte olduğu için mevcut zamana çekildi.")
                 if s_dt >= e_dt:
                     st.warning("Başlangıç zamanı bitiş zamanından küçük olmalıdır.")
@@ -4319,7 +4685,7 @@ elif page == get_text(lang, "menu_reports"):
                     lookup_map,
                     report_type_key,
                     queue_map=q_lookup,
-                    utc_offset=saved_creds.get("utc_offset", 3),
+                    utc_offset=utc_offset_hours,
                     skill_map=skill_lookup,
                     language_map=language_lookup
                 )
@@ -4341,7 +4707,7 @@ elif page == get_text(lang, "menu_reports"):
                             df[pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")] = df["Id"].apply(lambda x: p_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0))
                     
                     if any(m in sel_mets_effective for m in ["col_login", "col_logout"]) and is_agent:
-                        u_offset = saved_creds.get("utc_offset", 3)
+                        u_offset = utc_offset_hours
                         d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), utc_offset=u_offset)
                         if "col_login" in sel_mets: df["col_login"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
                         if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
@@ -4487,7 +4853,7 @@ elif page == get_text(lang, "menu_users") and role == "Admin":
 elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "Admin":
     st.title(f"🏢 {get_text(lang, 'menu_org_settings')}")
     org = st.session_state.app_user.get('org_code', 'default')
-    conf = load_credentials(org)
+    conf = _resolve_org_config(org_code=org, force_reload=True)
 
     # --- ORGANIZATION MANAGEMENT ---
     org_list = auth_manager.get_organizations()
@@ -4620,11 +4986,24 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
         ref_i = st.number_input(get_text(lang, "refresh_interval"), value=int(conf.get("refresh_interval", 10)), min_value=1, max_value=300, step=1, help=get_text(lang, "seconds_label"))
         
         if st.form_submit_button(get_text(lang, "save"), width='stretch'):
+            prev_u_off = _resolve_utc_offset_hours(conf.get("utc_offset", 3), default=3.0)
+            new_u_off = _resolve_utc_offset_hours(u_off, default=3.0)
             # Update credentials file (preserving sensitive data)
             save_credentials(org, conf.get("client_id"), conf.get("client_secret"), conf.get("region"), utc_offset=u_off, refresh_interval=ref_i)
             # Update session state for immediate effect
             st.session_state.org_config = load_credentials(org)
-            st.session_state.data_manager.update_settings(u_off, ref_i)
+            st.session_state["_org_config_owner"] = org
+            st.session_state.data_manager.update_settings(new_u_off, ref_i)
+            if abs(prev_u_off - new_u_off) > 1e-9:
+                try:
+                    dm = st.session_state.get("data_manager")
+                    if dm:
+                        with dm._lock:
+                            dm.daily_data_cache = {}
+                            dm.last_daily_refresh = 0
+                    _clear_live_panel_caches(org, clear_shared=True)
+                except Exception:
+                    pass
             st.success(get_text(lang, "view_saved"))
             st.rerun()
 
@@ -4658,9 +5037,10 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
                     st.session_state.wrapup_map = maps.get("wrapup", {})
                     st.session_state.presence_map = maps.get("presence", {})
                     st.session_state.org_config = load_credentials(org)
+                    st.session_state["_org_config_owner"] = org
                     
                     st.session_state.data_manager.update_api_client(client, st.session_state.presence_map)
-                    st.session_state.data_manager.update_settings(cur_off, cur_ref)
+                    st.session_state.data_manager.update_settings(_resolve_utc_offset_hours(cur_off, default=3.0), cur_ref)
                     # Start with empty queues to prevent full fetch
                     st.session_state.data_manager.start({}, {}) 
                     st.rerun()
@@ -5734,15 +6114,58 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
     # Org DataManager controls moved to Organization Settings
 
 elif st.session_state.page == get_text(lang, "menu_dashboard"):
+    dashboard_profile_total_t0 = pytime.perf_counter()
+    _dashboard_profile_tick()
     # (Config already loaded at top level)
-    if recover_org_maps_if_needed(org, force=False):
-        refresh_data_manager_queues()
+    maps_recover_t0 = pytime.perf_counter()
+    maps_recovered = recover_org_maps_if_needed(org, force=False)
+    _dashboard_profile_record("dashboard.maps_recover", pytime.perf_counter() - maps_recover_t0)
+    if maps_recovered:
+        dm_sig = _dashboard_dm_signature(org)
+        if st.session_state.get("_dashboard_dm_sig") != dm_sig:
+            dm_refresh_t0 = pytime.perf_counter()
+            refresh_data_manager_queues()
+            _dashboard_profile_record("dashboard.dm_refresh", pytime.perf_counter() - dm_refresh_t0)
+            st.session_state._dashboard_dm_sig = dm_sig
+    controls_t0 = pytime.perf_counter()
     st.title(get_text(lang, "menu_dashboard"))
+    profile_state = _dashboard_profile_state()
+    profile_rows = _dashboard_profile_rows(limit=12)
+    with st.expander("⏱️ Dashboard Profiling", expanded=bool(profile_state.get("enabled"))):
+        profile_duration = st.number_input(
+            "Profil süresi (sn)",
+            min_value=60,
+            max_value=900,
+            step=30,
+            value=int(profile_state.get("duration_s", 180) or 180),
+            key="dashboard_profile_duration_s",
+        )
+        p_c1, p_c2, p_c3 = st.columns(3)
+        if p_c1.button("Profili Başlat", key="dashboard_profile_start_btn", width='stretch'):
+            _dashboard_profile_start(duration_s=profile_duration)
+            st.rerun()
+        if p_c2.button("Profili Durdur", key="dashboard_profile_stop_btn", width='stretch'):
+            _dashboard_profile_stop()
+            st.rerun()
+        if p_c3.button("Profili Temizle", key="dashboard_profile_clear_btn", width='stretch'):
+            _dashboard_profile_clear(duration_s=profile_duration)
+            st.rerun()
+        if profile_state.get("enabled"):
+            elapsed_s = max(0, int(pytime.time() - float(profile_state.get("started_ts", 0) or 0)))
+            remaining_s = max(0, int(profile_state.get("duration_s", 180)) - elapsed_s)
+            st.caption(f"Profil aktif. Geçen: {elapsed_s}s | Kalan: {remaining_s}s | Rerun: {profile_state.get('runs', 0)}")
+        else:
+            st.caption(f"Profil pasif. Son kayıt rerun sayısı: {profile_state.get('runs', 0)}")
+        if profile_rows:
+            st.dataframe(pd.DataFrame(profile_rows), width='stretch', hide_index=True)
+        else:
+            st.caption("Henüz profil verisi yok.")
     c_c1, c_c2, c_c3 = st.columns([1, 2, 1])
     if c_c1.button(get_text(lang, "add_group"), width='stretch'):
         st.session_state.dashboard_cards.append({"id": max([c['id'] for c in st.session_state.dashboard_cards], default=-1)+1, "title": "", "queues": [], "size": "medium", "live_metrics": ["Waiting", "Interacting", "On Queue"], "daily_metrics": ["Offered", "Answered", "Abandoned", "Answer Rate"]})
         save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
         refresh_data_manager_queues()
+        st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
         st.rerun()
     
     with c_c2:
@@ -5758,7 +6181,11 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         if st.session_state.dashboard_mode == "Date": st.session_state.dashboard_date = st.date_input(get_text(lang, "mode_date"), datetime.today(), label_visibility="collapsed")
         elif st.session_state.dashboard_mode == "Live": 
             c_auto, c_time, c_spacer, c_agent, c_call = st.columns([1, 1, 1, 1, 1])
-            auto_ref = c_auto.toggle(get_text(lang, "auto_refresh"), value=True)
+            auto_ref = c_auto.toggle(
+                get_text(lang, "auto_refresh"),
+                value=st.session_state.get("dashboard_auto_refresh", True),
+                key="dashboard_auto_refresh",
+            )
             # Toggle moved to far right
             show_agent_panel = c_agent.toggle(f"👤 {get_text(lang, 'agent_panel')}", value=st.session_state.get('show_agent_panel', False), key='toggle_agent_panel')
             show_call_panel = c_call.toggle(f"📞 {get_text(lang, 'call_panel')}", value=st.session_state.get('show_call_panel', False), key='toggle_call_panel')
@@ -5788,14 +6215,16 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             # DataManager is managed centrally by refresh_data_manager_queues()
             # which is called on login, hot-reload, and config changes.
             ref_int = _resolve_refresh_interval_seconds(org, minimum=3, default=15)
-            if auto_ref:
+            if st.session_state.get("dashboard_auto_refresh", True):
                 _safe_autorefresh(interval=ref_int * 1000, key="data_refresh")
         if not st.session_state.get("queues_map"):
             st.caption("Queue listesi yuklenemedi.")
             if st.button("Queue Listesini Yenile", key="reload_dashboard_queue_map"):
                 recover_org_maps_if_needed(org, force=True)
                 refresh_data_manager_queues()
+                st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
                 st.rerun()
+    _dashboard_profile_record("dashboard.controls", pytime.perf_counter() - controls_t0)
 
     # Available metric options
     # Available metric options
@@ -5839,339 +6268,377 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         call_c = None
 
     grid = main_c.columns(st.session_state.dashboard_layout)
+    cards_total_t0 = pytime.perf_counter()
     to_del = []
     for idx, card in enumerate(st.session_state.dashboard_cards):
-        with grid[idx % st.session_state.dashboard_layout]:
-            # Determine Container Height based on size
-            c_size = card.get('size', 'medium')
-            visuals_cfg = card.get('visual_metrics', ["Service Level"])
-            visual_count = max(1, len(visuals_cfg))
-            visuals_per_row = 1 if c_size == 'xsmall' else (2 if c_size in ['small', 'medium'] else 3)
-            visual_rows = max(1, (visual_count + visuals_per_row - 1) // visuals_per_row)
-            gauge_base_h = 110 if c_size == 'xsmall' else (125 if c_size == 'small' else (140 if c_size == 'medium' else 160))
-            gauge_row_h = gauge_base_h + 20
-
-            live_sel = card.get('live_metrics', ["Waiting", "Interacting", "On Queue"])
-            daily_sel = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
-            live_rows = ((len(live_sel) - 1) // 5 + 1) if (st.session_state.dashboard_mode == "Live" and live_sel) else 0
-            daily_rows = ((len(daily_sel) - 1) // 5 + 1) if daily_sel else 0
-            metric_row_h = 74
-
-            header_block_h = 96
-            caption_block_h = 28 if daily_rows else 0
-            metrics_block_h = (live_rows + daily_rows) * metric_row_h
-            visuals_block_h = visual_rows * gauge_row_h
-            padding_h = 28
-            c_height = header_block_h + caption_block_h + metrics_block_h + visuals_block_h + padding_h
-
-            min_height_map = {'xsmall': 380, 'small': 470, 'medium': 560, 'large': 650}
-            c_height = max(c_height, min_height_map.get(c_size, 560))
-
-            with st.container(height=c_height, border=True):
-                card_title = card['title'] if card['title'] else f"Grup #{card['id']+1}"
-                st.markdown(f"### {card_title}")
-                with st.expander(f"⚙️ Settings", expanded=False):
-                    prev_card = dict(card)
-                    card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
-                    size_opts = ["xsmall", "small", "medium", "large"]
-                    card['size'] = st.selectbox("Size", size_opts, index=size_opts.index(card.get('size', 'medium')), key=f"sz_{card['id']}")
-                    card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
-                    queue_options = list(st.session_state.queues_map.keys())
-                    option_by_lower = {q.strip().lower(): q for q in queue_options}
-                    queue_defaults = []
-                    for q in card.get('queues', []):
-                        if not isinstance(q, str):
-                            continue
-                        q_clean = q.replace("(not loaded)", "").strip()
-                        if q_clean in queue_options:
-                            queue_defaults.append(q_clean)
-                            continue
-                        canonical = option_by_lower.get(q_clean.lower())
-                        if canonical:
-                            queue_defaults.append(canonical)
-                    if queue_options:
-                        selected_queues = st.multiselect("Queues", queue_options, default=queue_defaults, key=f"q_{card['id']}")
-                        card['queues'] = selected_queues
+        card_total_t0 = pytime.perf_counter()
+        try:
+            with grid[idx % st.session_state.dashboard_layout]:
+                # Determine Container Height based on size
+                c_size = card.get('size', 'medium')
+                visuals_cfg = card.get('visual_metrics', ["Service Level"])
+                visual_count = max(1, len(visuals_cfg))
+                visuals_per_row = 1 if c_size == 'xsmall' else (2 if c_size in ['small', 'medium'] else 3)
+                visual_rows = max(1, (visual_count + visuals_per_row - 1) // visuals_per_row)
+                gauge_base_h = 110 if c_size == 'xsmall' else (125 if c_size == 'small' else (140 if c_size == 'medium' else 160))
+                gauge_row_h = gauge_base_h + 20
+    
+                live_sel = card.get('live_metrics', ["Waiting", "Interacting", "On Queue"])
+                daily_sel = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
+                live_rows = ((len(live_sel) - 1) // 5 + 1) if (st.session_state.dashboard_mode == "Live" and live_sel) else 0
+                daily_rows = ((len(daily_sel) - 1) // 5 + 1) if daily_sel else 0
+                metric_row_h = 74
+    
+                header_block_h = 96
+                caption_block_h = 28 if daily_rows else 0
+                metrics_block_h = (live_rows + daily_rows) * metric_row_h
+                visuals_block_h = visual_rows * gauge_row_h
+                padding_h = 28
+                c_height = header_block_h + caption_block_h + metrics_block_h + visuals_block_h + padding_h
+    
+                min_height_map = {'xsmall': 380, 'small': 470, 'medium': 560, 'large': 650}
+                c_height = max(c_height, min_height_map.get(c_size, 560))
+    
+                with st.container(height=c_height, border=True):
+                    card_title = card['title'] if card['title'] else f"Grup #{card['id']+1}"
+                    st.markdown(f"### {card_title}")
+                    with st.expander(f"⚙️ Settings", expanded=False):
+                        prev_card = dict(card)
+                        card['title'] = st.text_input("Title", value=card['title'], key=f"t_{card['id']}")
+                        size_opts = ["xsmall", "small", "medium", "large"]
+                        card['size'] = st.selectbox("Size", size_opts, index=size_opts.index(card.get('size', 'medium')), key=f"sz_{card['id']}")
+                        card['visual_metrics'] = st.multiselect("Visuals", ["Service Level", "Answer Rate", "Abandon Rate"], default=card.get('visual_metrics', ["Service Level"]), key=f"vm_{card['id']}")
+                        queue_options = list(st.session_state.queues_map.keys())
+                        option_by_lower = {q.strip().lower(): q for q in queue_options}
+                        queue_defaults = []
+                        for q in card.get('queues', []):
+                            if not isinstance(q, str):
+                                continue
+                            q_clean = q.replace("(not loaded)", "").strip()
+                            if q_clean in queue_options:
+                                queue_defaults.append(q_clean)
+                                continue
+                            canonical = option_by_lower.get(q_clean.lower())
+                            if canonical:
+                                queue_defaults.append(canonical)
+                        if queue_options:
+                            selected_queues = st.multiselect("Queues", queue_options, default=queue_defaults, key=f"q_{card['id']}")
+                            card['queues'] = selected_queues
+                        else:
+                            fallback_default = ", ".join([q for q in card.get('queues', []) if isinstance(q, str)])
+                            manual_queues = st.text_input(
+                                "Queues (manual)",
+                                value=fallback_default,
+                                key=f"q_manual_{card['id']}",
+                                placeholder="Queue1, Queue2",
+                            )
+                            card['queues'] = [q.strip() for q in manual_queues.split(",") if q.strip()]
+                        card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
+    
+                        st.write("---")
+                        st.caption("📡 Canlı Metrikler")
+                        card['live_metrics'] = st.multiselect("Live Metrics", LIVE_METRIC_OPTIONS, default=card.get('live_metrics', ["Waiting", "Interacting", "On Queue"]), format_func=lambda x: live_labels.get(x, x), key=f"lm_{card['id']}")
+    
+                        st.caption("📊 Günlük Metrikler")
+                        card['daily_metrics'] = st.multiselect("Daily Metrics", DAILY_METRIC_OPTIONS, default=card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"]), format_func=lambda x: daily_labels.get(x, x), key=f"dm_{card['id']}")
+    
+                        if st.button("Delete", key=f"d_{card['id']}"):
+                            to_del.append(idx)
+                        if card != prev_card:
+                            save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
+                            if prev_card.get("queues") != card.get("queues"):
+                                refresh_data_manager_queues()
+                                st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
+    
+                    if not card.get('queues'):
+                        st.info("Select queues")
+                        continue
+                    resolved_card_queues, unresolved_card_queues = _resolve_card_queue_names(
+                        card.get('queues', []),
+                        st.session_state.get("queues_map", {}),
+                    )
+                    if unresolved_card_queues:
+                        st.caption("⚠️ Eşleşmeyen kuyruk: " + ", ".join(unresolved_card_queues[:3]))
+                    if not resolved_card_queues:
+                        st.warning("Seçili kuyruklar sistemde bulunamadı. Queue listesini yenileyip tekrar seçin.")
+                        continue
+                    
+                    # Determine date range based on mode
+                    data_fetch_t0 = pytime.perf_counter()
+                    if st.session_state.dashboard_mode == "Live":
+                        # Use cached live data
+                        obs_map, daily_map, _ = st.session_state.data_manager.get_data(resolved_card_queues)
+                        items_live = [obs_map.get(q) for q in resolved_card_queues if obs_map.get(q)]
+                        items_daily = [daily_map.get(q) for q in resolved_card_queues if daily_map.get(q)]
+                        # Fallback: if DataManager cache is temporarily empty, fetch directly once.
+                        if (not items_live and not items_daily) and st.session_state.get('api_client'):
+                            queue_ids = [
+                                st.session_state.queues_map.get(q)
+                                for q in resolved_card_queues
+                                if st.session_state.queues_map.get(q)
+                            ]
+                            if queue_ids:
+                                try:
+                                    api = GenesysAPI(st.session_state.api_client)
+                                    id_map = {v: k for k, v in st.session_state.queues_map.items()}
+                                    obs_resp = api.get_queue_observations(queue_ids)
+                                    if obs_resp:
+                                        obs_map = process_observations(obs_resp, id_map, st.session_state.get("presence_map") or {})
+                                        items_live = [obs_map.get(q) for q in resolved_card_queues if obs_map.get(q)]
+                                    start_dt, end_dt = _dashboard_interval_utc("Live", saved_creds)
+                                    interval = f"{start_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                                    daily_resp = api.get_queue_daily_stats(queue_ids, interval=interval)
+                                    if daily_resp:
+                                        daily_map = process_daily_stats(daily_resp, id_map)
+                                        items_daily = [daily_map.get(q) for q in resolved_card_queues if daily_map.get(q)]
+                                except Exception:
+                                    pass
                     else:
-                        fallback_default = ", ".join([q for q in card.get('queues', []) if isinstance(q, str)])
-                        manual_queues = st.text_input(
-                            "Queues (manual)",
-                            value=fallback_default,
-                            key=f"q_manual_{card['id']}",
-                            placeholder="Queue1, Queue2",
-                        )
-                        card['queues'] = [q.strip() for q in manual_queues.split(",") if q.strip()]
-                    card['media_types'] = st.multiselect("Media Types", ["voice", "chat", "email", "callback", "message"], default=card.get('media_types', []), key=f"mt_{card['id']}")
-
-                    st.write("---")
-                    st.caption("📡 Canlı Metrikler")
-                    card['live_metrics'] = st.multiselect("Live Metrics", LIVE_METRIC_OPTIONS, default=card.get('live_metrics', ["Waiting", "Interacting", "On Queue"]), format_func=lambda x: live_labels.get(x, x), key=f"lm_{card['id']}")
-
-                    st.caption("📊 Günlük Metrikler")
-                    card['daily_metrics'] = st.multiselect("Daily Metrics", DAILY_METRIC_OPTIONS, default=card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"]), format_func=lambda x: daily_labels.get(x, x), key=f"dm_{card['id']}")
-
-                    if st.button("Delete", key=f"d_{card['id']}"):
-                        to_del.append(idx)
-                    if card != prev_card:
-                        save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
-
-                if not card.get('queues'):
-                    st.info("Select queues")
-                    continue
-                
-                # Determine date range based on mode
-                if st.session_state.dashboard_mode == "Live":
-                    # Use cached live data
-                    obs_map, daily_map, _ = st.session_state.data_manager.get_data(card['queues'])
-                    items_live = [obs_map.get(q) for q in card['queues'] if obs_map.get(q)]
-                    items_daily = [daily_map.get(q) for q in card['queues'] if daily_map.get(q)]
-                    # Fallback: if DataManager cache is temporarily empty, fetch directly once.
-                    if (not items_live and not items_daily) and st.session_state.get('api_client'):
-                        queue_ids = [st.session_state.queues_map.get(q) for q in card['queues'] if st.session_state.queues_map.get(q)]
+                        # Fetch historical data via API
+                        items_live = []  # No live data for historical
+                        
+                        if st.session_state.dashboard_mode == "Yesterday":
+                            start_dt, end_dt = _dashboard_interval_utc("Yesterday", saved_creds)
+                        else:  # Date mode
+                            start_dt, end_dt = _dashboard_interval_utc(
+                                "Date",
+                                saved_creds,
+                                selected_date=st.session_state.get("dashboard_date", datetime.today()),
+                            )
+                        
+                        # Fetch aggregate data for selected queues
+                        queue_ids = [
+                            st.session_state.queues_map.get(q)
+                            for q in resolved_card_queues
+                            if st.session_state.queues_map.get(q)
+                        ]
+                        
+                        items_daily = []
                         if queue_ids:
                             try:
-                                api = GenesysAPI(st.session_state.api_client)
-                                id_map = {v: k for k, v in st.session_state.queues_map.items()}
-                                obs_resp = api.get_queue_observations(queue_ids)
-                                if obs_resp:
-                                    obs_map = process_observations(obs_resp, id_map, st.session_state.get("presence_map") or {})
-                                    items_live = [obs_map.get(q) for q in card['queues'] if obs_map.get(q)]
-                                now_utc = datetime.now(timezone.utc)
-                                start_of_day_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-                                interval = f"{start_of_day_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{now_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                                daily_resp = api.get_queue_daily_stats(queue_ids, interval=interval)
-                                if daily_resp:
-                                    daily_map = process_daily_stats(daily_resp, id_map)
-                                    items_daily = [daily_map.get(q) for q in card['queues'] if daily_map.get(q)]
-                            except Exception:
-                                pass
-                else:
-                    # Fetch historical data via API
-                    items_live = []  # No live data for historical
+                                interval = f"{start_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                                cache_key = f"{interval}|{','.join(sorted(queue_ids))}"
+                                daily_data = _get_shared_daily_stats(org, cache_key, max_age_seconds=300)
+                                if daily_data is None:
+                                    api = GenesysAPI(st.session_state.api_client)
+                                    resp = api.get_queue_daily_stats(queue_ids, interval=interval)
+                                    daily_data = {}
+                                    if resp and resp.get('results'):
+                                        id_map = {v: k for k, v in st.session_state.queues_map.items()}
+                                        from src.processor import process_daily_stats
+                                        daily_data = process_daily_stats(resp, id_map) or {}
+                                    _set_shared_daily_stats(org, cache_key, daily_data, pytime.time(), max_items=60)
+                                items_daily = [daily_data.get(q) for q in resolved_card_queues if daily_data.get(q)]
+                            except Exception as e:
+                                st.warning(f"Veri çekilemedi: {e}")
+                    _dashboard_profile_record("cards.data_fetch", pytime.perf_counter() - data_fetch_t0)
                     
-                    if st.session_state.dashboard_mode == "Yesterday":
-                        target_date = datetime.today() - timedelta(days=1)
-                    else:  # Date mode
-                        target_date = datetime.combine(st.session_state.get('dashboard_date', datetime.today()), time(0, 0))
+                    # Calculate aggregates
+                    calc_t0 = pytime.perf_counter()
+                    n_q = len(items_live) or 1
+                    n_s = len(resolved_card_queues) or 1
                     
-                    # Calculate date range (full day in UTC)
-                    start_dt = datetime.combine(target_date, time(0, 0)) - timedelta(hours=saved_creds.get("utc_offset", 3))
-                    end_dt = datetime.combine(target_date, time(23, 59, 59)) - timedelta(hours=saved_creds.get("utc_offset", 3))
+                    # Live Metric Helper: Sum based on selected media types
+                    selected_media = card.get('media_types', [])
                     
-                    # Fetch aggregate data for selected queues
-                    queue_ids = [st.session_state.queues_map.get(q) for q in card['queues'] if st.session_state.queues_map.get(q)]
-                    
-                    items_daily = []
-                    if queue_ids:
-                        try:
-                            interval = f"{start_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                            cache_key = f"{interval}|{','.join(sorted(queue_ids))}"
-                            daily_data = _get_shared_daily_stats(org, cache_key, max_age_seconds=300)
-                            if daily_data is None:
-                                api = GenesysAPI(st.session_state.api_client)
-                                resp = api.get_queue_daily_stats(queue_ids, interval=interval)
-                                daily_data = {}
-                                if resp and resp.get('results'):
-                                    id_map = {v: k for k, v in st.session_state.queues_map.items()}
-                                    from src.processor import process_daily_stats
-                                    daily_data = process_daily_stats(resp, id_map) or {}
-                                _set_shared_daily_stats(org, cache_key, daily_data, pytime.time(), max_items=60)
-                            items_daily = [daily_data.get(q) for q in card['queues'] if daily_data.get(q)]
-                        except Exception as e:
-                            st.warning(f"Veri çekilemedi: {e}")
-                
-                # Calculate aggregates
-                n_q = len(items_live) or 1
-                n_s = len(card['queues']) or 1
-                
-                # Live Metric Helper: Sum based on selected media types
-                selected_media = card.get('media_types', [])
-                
-                def get_media_sum(item, metric_key):
-                    # If metric is NOT dict (old data or non-media metric), return it directly
-                    val = item.get(metric_key, 0)
-                    if not isinstance(val, dict): return val
-                    
-                    # If dict, filter by selected media types
-                    if not selected_media: return val.get('Total', 0)
-                    
-                    return sum(val.get(m, 0) for m in selected_media)
-
-                off = sum(get_media_sum(d, 'Offered') for d in items_daily)
-                ans = sum(get_media_sum(d, 'Answered') for d in items_daily)
-                abn = sum(get_media_sum(d, 'Abandoned') for d in items_daily)
-                s_n = sum(d.get('SL_Numerator', 0) for d in items_daily)
-                s_d = sum(d.get('SL_Denominator', 0) for d in items_daily)
-                sl = (s_n / s_d * 100) if s_d > 0 else 0
-                avg_handle = sum(d.get('AvgHandle', 0) for d in items_daily) / len(items_daily) if items_daily else 0
-                avg_wait = sum(d.get('AvgWait', 0) for d in items_daily) / len(items_daily) if items_daily else 0
-                
-                # Live metrics mapping
-                # Live metrics mapping
-                
-                # 1. Fetch Agent Details for selected queues involved in this card
-                card_agent_data = st.session_state.data_manager.get_agent_details(card['queues'])
-                
-                # 2. Flatten and Deduplicate Agents
-                unique_agents = {}
-                for q_agents in card_agent_data.values():
-                    for agent in q_agents:
-                        unique_agents[agent['id']] = agent
+                    def get_media_sum(item, metric_key):
+                        # If metric is NOT dict (old data or non-media metric), return it directly
+                        val = item.get(metric_key, 0)
+                        if not isinstance(val, dict): return val
                         
-                # 3. Calculate Counts from Unique Agents
-                cnt_interacting = 0
-                cnt_idle = 0
-                cnt_on_queue = 0
-                cnt_available = 0
-                cnt_busy = 0
-                cnt_away = 0
-                cnt_break = 0
-                cnt_meal = 0
-                cnt_meeting = 0
-                cnt_training = 0
-                
-                for m in unique_agents.values():
-                    user_obj = m.get('user', {})
-                    presence = user_obj.get('presence', {}).get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
-                    routing = m.get('routingStatus', {}).get('status', 'OFF_QUEUE').upper()
+                        # If dict, filter by selected media types
+                        if not selected_media: return val.get('Total', 0)
+                        
+                        return sum(val.get(m, 0) for m in selected_media)
+    
+                    off = sum(get_media_sum(d, 'Offered') for d in items_daily)
+                    ans = sum(get_media_sum(d, 'Answered') for d in items_daily)
+                    abn = sum(get_media_sum(d, 'Abandoned') for d in items_daily)
+                    s_n = sum(d.get('SL_Numerator', 0) for d in items_daily)
+                    s_d = sum(d.get('SL_Denominator', 0) for d in items_daily)
+                    sl = (s_n / s_d * 100) if s_d > 0 else 0
+                    handle_sum = sum(get_media_sum(d, 'Handle_Sum') for d in items_daily)
+                    handle_count = sum(get_media_sum(d, 'Handle_Count') for d in items_daily)
+                    wait_sum = sum(get_media_sum(d, 'Wait_Sum') for d in items_daily)
+                    wait_count = sum(get_media_sum(d, 'Wait_Count') for d in items_daily)
+                    avg_handle = (handle_sum / handle_count) if handle_count > 0 else 0
+                    avg_wait = (wait_sum / wait_count) if wait_count > 0 else 0
                     
-                    # Logic must match the status text logic we fixed earlier
-                    if presence == 'AVAILABLE':
-                        cnt_available += 1
-                    elif presence in ['ON_QUEUE', 'ON QUEUE']:
-                        # On Queue Logic
-                        if routing in ['INTERACTING', 'COMMUNICATING']:
-                            cnt_interacting += 1
-                            cnt_on_queue += 1 # Technically on queue
-                        elif routing == 'IDLE':
-                            cnt_idle += 1 # Ready
-                            cnt_on_queue += 1
-                        elif routing == 'NOT_RESPONDING':
-                            cnt_on_queue += 1 
-                        else:
-                            cnt_on_queue += 1
-                    elif presence == "BUSY": cnt_busy += 1
-                    elif presence == "AWAY": cnt_away += 1
-                    elif presence == "BREAK": cnt_break += 1
-                    elif presence == "MEAL": cnt_meal += 1
-                    elif presence == "MEETING": cnt_meeting += 1
-                    elif presence == "TRAINING": cnt_training += 1
+                    # Live metrics mapping
+                    # Live metrics mapping
+                    
+                    # 1. Fetch Agent Details for selected queues involved in this card
+                    card_agent_data = st.session_state.data_manager.get_agent_details(resolved_card_queues)
+                    
+                    # 2. Flatten and Deduplicate Agents
+                    unique_agents = {}
+                    for q_agents in card_agent_data.values():
+                        for agent in q_agents:
+                            unique_agents[agent['id']] = agent
+                            
+                    # 3. Calculate Counts from Unique Agents
+                    cnt_interacting = 0
+                    cnt_idle = 0
+                    cnt_on_queue = 0
+                    cnt_available = 0
+                    cnt_busy = 0
+                    cnt_away = 0
+                    cnt_break = 0
+                    cnt_meal = 0
+                    cnt_meeting = 0
+                    cnt_training = 0
+                    
+                    for m in unique_agents.values():
+                        user_obj = m.get('user', {})
+                        presence = user_obj.get('presence', {}).get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
+                        routing = m.get('routingStatus', {}).get('status', 'OFF_QUEUE').upper()
+                        
+                        # Logic must match the status text logic we fixed earlier
+                        if presence == 'AVAILABLE':
+                            cnt_available += 1
+                        elif presence in ['ON_QUEUE', 'ON QUEUE']:
+                            # On Queue Logic
+                            if routing in ['INTERACTING', 'COMMUNICATING']:
+                                cnt_interacting += 1
+                                cnt_on_queue += 1 # Technically on queue
+                            elif routing == 'IDLE':
+                                cnt_idle += 1 # Ready
+                                cnt_on_queue += 1
+                            elif routing == 'NOT_RESPONDING':
+                                cnt_on_queue += 1 
+                            else:
+                                cnt_on_queue += 1
+                        elif presence == "BUSY": cnt_busy += 1
+                        elif presence == "AWAY": cnt_away += 1
+                        elif presence == "BREAK": cnt_break += 1
+                        elif presence == "MEAL": cnt_meal += 1
+                        elif presence == "MEETING": cnt_meeting += 1
+                        elif presence == "TRAINING": cnt_training += 1
+    
+                    live_values = {
+                        "Waiting": sum(get_media_sum(d, 'Waiting') for d in items_live) if items_live else 0,
+                        "Interacting": cnt_interacting,
+                        "Idle Agent": cnt_idle,
+                        "On Queue": cnt_on_queue,
+                        "Available": cnt_available,
+                        "Busy": cnt_busy,
+                        "Away": cnt_away,
+                        "Break": cnt_break,
+                        "Meal": cnt_meal,
+                        "Meeting": cnt_meeting,
+                        "Training": cnt_training,
+                    }
+                    
+                    # Daily metrics mapping
+                    daily_values = {
+                        "Offered": off,
+                        "Answered": ans,
+                        "Abandoned": abn,
+                        "Answer Rate": f"%{(ans/off*100) if off>0 else 0:.1f}",
+                        "Service Level": f"%{sl:.1f}",
+                        "Avg Handle Time": f"{avg_handle/60:.1f}m" if avg_handle else "0",
+                        "Avg Wait Time": f"{avg_wait:.0f}s" if avg_wait else "0",
+                    }
+                    _dashboard_profile_record("cards.compute", pytime.perf_counter() - calc_t0)
+                    
+                    render_t0 = pytime.perf_counter()
+                    if st.session_state.dashboard_mode == "Live":
+                        # Show selected live metrics (Responsive Grid)
+                        sel_live = card.get('live_metrics', ["Waiting", "Interacting", "On Queue"])
+                        if sel_live:
+                            # Use 5 columns per row
+                            cols_per_row = 5
+                            for i in range(0, len(sel_live), cols_per_row):
+                                batch = sel_live[i:i+cols_per_row]
+                                cols = st.columns(cols_per_row)
+                                for j, metric in enumerate(batch):
+                                    cols[j].metric(live_labels.get(metric, metric), live_values.get(metric, 0))
+                        
+                        # Show daily summary below live (Today's stats)
+                        # Show daily summary below live (Today's stats)
+                        st.caption(f"📅 Bugünün Özeti")
+                        sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
+                        if sel_daily:
+                            cols_per_row = 5
+                            for i in range(0, len(sel_daily), cols_per_row):
+                                batch = sel_daily[i:i+cols_per_row]
+                                cols = st.columns(cols_per_row)
+                                for j, metric in enumerate(batch):
+                                    cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
+                        
+                        # Render selected visuals (wrapped rows to prevent overflow)
+                        visuals = card.get('visual_metrics', ["Service Level"])
+                        size_now = card.get('size')
+                        base_h = 110 if size_now == 'xsmall' else (125 if size_now == 'small' else (140 if size_now == 'medium' else 160))
+                        panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
+    
+                        if visuals:
+                            per_row = 1 if size_now == 'xsmall' else (2 if size_now in ['small', 'medium'] else 3)
+                            for start in range(0, len(visuals), per_row):
+                                row = visuals[start:start + per_row]
+                                cols = st.columns(per_row)
+                                for idx, vis in enumerate(row):
+                                    with cols[idx]:
+                                        if vis == "Service Level":
+                                            st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                        elif vis == "Answer Rate":
+                                            ar_val = (ans / off * 100) if off > 0 else 0
+                                            st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                        elif vis == "Abandon Rate":
+                                            ab_val = (abn / off * 100) if off > 0 else 0
+                                            st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                    
+                    else:
+                        # Historical mode (Yesterday/Date) - show daily stats with gauge
+                        sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
+                        
+                        # Show daily metrics first for ALL sizes
+                        st.caption(f"📅 {get_text(lang, 'daily_stat')}")
+                        if sel_daily:
+                            cols_per_row = 5
+                            for i in range(0, len(sel_daily), cols_per_row):
+                                batch = sel_daily[i:i+cols_per_row]
+                                cols = st.columns(cols_per_row)
+                                for j, metric in enumerate(batch):
+                                    cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
+                        
+                        # Render selected visuals (wrapped rows to prevent overflow)
+                        visuals = card.get('visual_metrics', ["Service Level"])
+                        size_now = card.get('size')
+                        base_h = 110 if size_now == 'xsmall' else (125 if size_now == 'small' else (140 if size_now == 'medium' else 160))
+                        panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
+    
+                        if visuals:
+                            per_row = 1 if size_now == 'xsmall' else (2 if size_now in ['small', 'medium'] else 3)
+                            for start in range(0, len(visuals), per_row):
+                                row = visuals[start:start + per_row]
+                                cols = st.columns(per_row)
+                                for idx, vis in enumerate(row):
+                                    with cols[idx]:
+                                        if vis == "Service Level":
+                                            st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                        elif vis == "Answer Rate":
+                                            ar_val = (ans / off * 100) if off > 0 else 0
+                                            st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                                        elif vis == "Abandon Rate":
+                                            ab_val = (abn / off * 100) if off > 0 else 0
+                                            st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+                    _dashboard_profile_record("cards.render", pytime.perf_counter() - render_t0)
+        finally:
+            _dashboard_profile_record("cards.card_total", pytime.perf_counter() - card_total_t0)
 
-                live_values = {
-                    "Waiting": sum(get_media_sum(d, 'Waiting') for d in items_live) if items_live else 0,
-                    "Interacting": cnt_interacting,
-                    "Idle Agent": cnt_idle,
-                    "On Queue": cnt_on_queue,
-                    "Available": cnt_available,
-                    "Busy": cnt_busy,
-                    "Away": cnt_away,
-                    "Break": cnt_break,
-                    "Meal": cnt_meal,
-                    "Meeting": cnt_meeting,
-                    "Training": cnt_training,
-                }
-                
-                # Daily metrics mapping
-                daily_values = {
-                    "Offered": off,
-                    "Answered": ans,
-                    "Abandoned": abn,
-                    "Answer Rate": f"%{(ans/off*100) if off>0 else 0:.1f}",
-                    "Service Level": f"%{sl:.1f}",
-                    "Avg Handle Time": f"{avg_handle/60:.1f}m" if avg_handle else "0",
-                    "Avg Wait Time": f"{avg_wait:.0f}s" if avg_wait else "0",
-                }
-                
-                if st.session_state.dashboard_mode == "Live":
-                    # Show selected live metrics (Responsive Grid)
-                    sel_live = card.get('live_metrics', ["Waiting", "Interacting", "On Queue"])
-                    if sel_live:
-                        # Use 5 columns per row
-                        cols_per_row = 5
-                        for i in range(0, len(sel_live), cols_per_row):
-                            batch = sel_live[i:i+cols_per_row]
-                            cols = st.columns(cols_per_row)
-                            for j, metric in enumerate(batch):
-                                cols[j].metric(live_labels.get(metric, metric), live_values.get(metric, 0))
-                    
-                    # Show daily summary below live (Today's stats)
-                    # Show daily summary below live (Today's stats)
-                    st.caption(f"📅 Bugünün Özeti")
-                    sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
-                    if sel_daily:
-                        cols_per_row = 5
-                        for i in range(0, len(sel_daily), cols_per_row):
-                            batch = sel_daily[i:i+cols_per_row]
-                            cols = st.columns(cols_per_row)
-                            for j, metric in enumerate(batch):
-                                cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
-                    
-                    # Render selected visuals (wrapped rows to prevent overflow)
-                    visuals = card.get('visual_metrics', ["Service Level"])
-                    size_now = card.get('size')
-                    base_h = 110 if size_now == 'xsmall' else (125 if size_now == 'small' else (140 if size_now == 'medium' else 160))
-                    panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
-
-                    if visuals:
-                        per_row = 1 if size_now == 'xsmall' else (2 if size_now in ['small', 'medium'] else 3)
-                        for start in range(0, len(visuals), per_row):
-                            row = visuals[start:start + per_row]
-                            cols = st.columns(per_row)
-                            for idx, vis in enumerate(row):
-                                with cols[idx]:
-                                    if vis == "Service Level":
-                                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}_{start}_{idx}")
-                                    elif vis == "Answer Rate":
-                                        ar_val = (ans / off * 100) if off > 0 else 0
-                                        st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}_{start}_{idx}")
-                                    elif vis == "Abandon Rate":
-                                        ab_val = (abn / off * 100) if off > 0 else 0
-                                        st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}_{start}_{idx}")
-                
-                else:
-                    # Historical mode (Yesterday/Date) - show daily stats with gauge
-                    sel_daily = card.get('daily_metrics', ["Offered", "Answered", "Abandoned", "Answer Rate"])
-                    
-                    # Show daily metrics first for ALL sizes
-                    st.caption(f"📅 {get_text(lang, 'daily_stat')}")
-                    if sel_daily:
-                        cols_per_row = 5
-                        for i in range(0, len(sel_daily), cols_per_row):
-                            batch = sel_daily[i:i+cols_per_row]
-                            cols = st.columns(cols_per_row)
-                            for j, metric in enumerate(batch):
-                                cols[j].metric(daily_labels.get(metric, metric), daily_values.get(metric, 0))
-                    
-                    # Render selected visuals (wrapped rows to prevent overflow)
-                    visuals = card.get('visual_metrics', ["Service Level"])
-                    size_now = card.get('size')
-                    base_h = 110 if size_now == 'xsmall' else (125 if size_now == 'small' else (140 if size_now == 'medium' else 160))
-                    panel_key_suffix = "open" if (st.session_state.get('show_agent_panel', False) or st.session_state.get('show_call_panel', False)) else "closed"
-
-                    if visuals:
-                        per_row = 1 if size_now == 'xsmall' else (2 if size_now in ['small', 'medium'] else 3)
-                        for start in range(0, len(visuals), per_row):
-                            row = visuals[start:start + per_row]
-                            cols = st.columns(per_row)
-                            for idx, vis in enumerate(row):
-                                with cols[idx]:
-                                    if vis == "Service Level":
-                                        st.plotly_chart(create_gauge_chart(sl, get_text(lang, "avg_service_level"), base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_sl_{card['id']}_{panel_key_suffix}_{start}_{idx}")
-                                    elif vis == "Answer Rate":
-                                        ar_val = (ans / off * 100) if off > 0 else 0
-                                        st.plotly_chart(create_gauge_chart(ar_val, "Answer Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ar_{card['id']}_{panel_key_suffix}_{start}_{idx}")
-                                    elif vis == "Abandon Rate":
-                                        ab_val = (abn / off * 100) if off > 0 else 0
-                                        st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+    _dashboard_profile_record("cards.total", pytime.perf_counter() - cards_total_t0)
 
     if to_del:
         for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]
         save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
         refresh_data_manager_queues()
+        st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
         st.rerun()
 
     # --- SIDE PANEL LOGIC ---
     if st.session_state.get('show_agent_panel', False) and agent_c:
+        agent_panel_t0 = pytime.perf_counter()
         with agent_c:
             # --- Compact CSS for Agent List and Filters ---
             st.markdown("""
@@ -6229,11 +6696,9 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 </style>
             """, unsafe_allow_html=True)
 
-            # Filter Text Input
-            search_term = st.text_input("🔍 Agent Ara", "", label_visibility="collapsed", placeholder="Agent Ara...").lower()
-            
-            # Group Filter (Genesys Groups)
+            # Group Filter (Genesys Groups) + submit-based filters (no rerun on each keypress)
             now_ts = pytime.time()
+            groups_api_t0 = pytime.perf_counter()
             groups_cache = st.session_state.get("dashboard_groups_cache", [])
             groups_ts = st.session_state.get("dashboard_groups_ts", 0)
             if (not groups_cache) or ((now_ts - groups_ts) > 600):
@@ -6244,8 +6709,22 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     st.session_state.dashboard_groups_ts = now_ts
                 except Exception:
                     pass
+            _dashboard_profile_record("agent_panel.groups_api", pytime.perf_counter() - groups_api_t0)
             group_options = ["Hepsi (All)"] + [g.get('name', '') for g in groups_cache if g.get('name')]
-            selected_group = st.selectbox("📌 Grup Filtresi", group_options, index=0)
+            if "agent_panel_search" not in st.session_state:
+                st.session_state.agent_panel_search = ""
+            if st.session_state.get("agent_panel_group") not in group_options:
+                st.session_state.agent_panel_group = "Hepsi (All)"
+            with st.form("agent_panel_filters_form", clear_on_submit=False, border=False):
+                search_term = st.text_input(
+                    "🔍 Agent Ara",
+                    label_visibility="collapsed",
+                    placeholder="Agent Ara...",
+                    key="agent_panel_search",
+                )
+                selected_group = st.selectbox("📌 Grup Filtresi", group_options, key="agent_panel_group")
+                st.form_submit_button("Filtreyi Uygula", use_container_width=True)
+            search_term = str(search_term or "").strip().lower()
             
             if st.session_state.dashboard_mode != "Live":
                 st.warning("Agent detayları sadece CANLI modda görünür.")
@@ -6255,6 +6734,21 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 users_info_map = st.session_state.get('users_info') or {}
                 if users_info_map:
                     st.session_state._users_info_last = dict(users_info_map)
+                    users_info_refresh_ts = float(st.session_state.get("_users_info_full_refresh_ts", 0) or 0)
+                    if (now_ts - users_info_refresh_ts) > 600:
+                        users_info_api_t0 = pytime.perf_counter()
+                        try:
+                            api = GenesysAPI(st.session_state.api_client)
+                            refreshed = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
+                            refreshed_users_info = refreshed.get("users_info", {}) or {}
+                            if refreshed_users_info:
+                                users_info_map = refreshed_users_info
+                                st.session_state.users_info = users_info_map
+                                st.session_state._users_info_last = dict(users_info_map)
+                            st.session_state._users_info_full_refresh_ts = now_ts
+                        except Exception:
+                            pass
+                        _dashboard_profile_record("agent_panel.users_info_api", pytime.perf_counter() - users_info_api_t0)
                 else:
                     # Recover from last-known users, lazy org refresh, then users_map inversion.
                     cached_users_info = st.session_state.get('_users_info_last') or {}
@@ -6308,6 +6802,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             st.session_state.dashboard_group_members_cache = members_cache
                         entry = members_cache.get(group_id, {})
                         if (not entry) or ((now_ts - entry.get("ts", 0)) > 600):
+                            group_members_api_t0 = pytime.perf_counter()
                             try:
                                 api = GenesysAPI(st.session_state.api_client)
                                 members = api.get_group_members(group_id)
@@ -6316,6 +6811,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                 entry = members_cache.get(group_id, {})
                             except Exception:
                                 pass
+                            _dashboard_profile_record("agent_panel.group_members_api", pytime.perf_counter() - group_members_api_t0)
                         for m in (entry.get("members") or []):
                             if m.get("id"):
                                 group_member_ids.add(m.get("id"))
@@ -6328,14 +6824,21 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 shared_ts, shared_presence, shared_routing = _get_shared_agent_seed(org)
                 last_msg = getattr(agent_notif, "last_message_ts", 0)
                 last_evt = getattr(agent_notif, "last_event_ts", 0)
-                stale_after = max(30, int(refresh_s) * 2)
+                seed_interval_s = max(180, int(refresh_s) * 12)
+                stale_after = seed_interval_s
                 notif_stale = (not agent_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > stale_after)
+                periodic_seed_due = (now_ts - float(shared_ts or 0)) >= seed_interval_s
                 if all_user_ids:
                     seeded_from_api = False
                     reserved_seed = False
-                    needs_seed = (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {})) or notif_stale
-                    if needs_seed and _reserve_agent_seed(org, now_ts, min_interval=refresh_s):
+                    needs_seed = (
+                        (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {}))
+                        or notif_stale
+                        or periodic_seed_due
+                    )
+                    if needs_seed and _reserve_agent_seed(org, now_ts, min_interval=seed_interval_s):
                         reserved_seed = True
+                        seed_api_t0 = pytime.perf_counter()
                         try:
                             api = GenesysAPI(st.session_state.api_client)
                             snap = api.get_users_status_scan(target_user_ids=all_user_ids)
@@ -6348,6 +6851,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         except Exception:
                             if reserved_seed:
                                 _rollback_agent_seed(org, now_ts, fallback_ts=shared_ts)
+                        _dashboard_profile_record("agent_panel.seed_api", pytime.perf_counter() - seed_api_t0)
                     if reserved_seed and not seeded_from_api:
                         _rollback_agent_seed(org, now_ts, fallback_ts=shared_ts)
                     if (not seeded_from_api) and (shared_presence or shared_routing):
@@ -6356,20 +6860,21 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         if pres or rout:
                             agent_notif.seed_users_missing(pres, rout)
 
-                # Only keep non-OFFLINE users for websocket and display
+                # Keep WS subscriptions on the full target set so offline->active transitions are captured.
+                max_users = (agent_notif.MAX_TOPICS_PER_CHANNEL * agent_notif.MAX_CHANNELS) // 3
+                ws_user_ids = all_user_ids[:max_users]
+                if len(all_user_ids) > max_users:
+                    st.caption(f"⚠️ WebSocket limiti: {max_users}/{len(all_user_ids)} kullanıcı anlık takipte")
+                if ws_user_ids:
+                    agent_notif.start(ws_user_ids)
+
+                # Only keep non-OFFLINE users for display.
                 active_user_ids = []
                 for uid in all_user_ids:
                     presence = agent_notif.get_user_presence(uid) if agent_notif else {}
                     sys_presence = (presence.get('presenceDefinition', {}).get('systemPresence', '')).upper()
                     if sys_presence and sys_presence != "OFFLINE":
                         active_user_ids.append(uid)
-
-                max_users = (agent_notif.MAX_TOPICS_PER_CHANNEL * agent_notif.MAX_CHANNELS) // 3
-                ws_user_ids = active_user_ids[:max_users]
-                if len(active_user_ids) > max_users:
-                    st.caption(f"⚠️ WebSocket limiti: {max_users}/{len(active_user_ids)} agent anlık takipte")
-                if ws_user_ids:
-                    agent_notif.start(ws_user_ids)
 
                 # Build agent_data from active users
                 agent_data = {"_all": []}
@@ -6385,6 +6890,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     })
 
                 # Flatten, deduplicate and filter.
+                filter_sort_t0 = pytime.perf_counter()
                 all_members = []
                 if agent_data.get("_all"):
                     unique_members = {}
@@ -6459,16 +6965,18 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     cached = agent_cache.get(agent_cache_key) or {}
                     if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
                         all_members = list(cached.get("data") or [])
+                _dashboard_profile_record("agent_panel.filter_sort", pytime.perf_counter() - filter_sort_t0)
 
+                render_t0 = pytime.perf_counter()
                 if not all_members:
                     st.info("Aktif agent bulunamadı.")
                 else:
                     st.markdown(f'<p class="aktif-sayisi">Aktif: {len(all_members)}</p>', unsafe_allow_html=True)
-                    max_display = 200
-                    for i, m in enumerate(all_members):
-                        if i >= max_display:
-                            st.caption(f"+{len(all_members) - max_display} daha fazla kayıt")
-                            break
+                    max_display = 500
+                    render_members = all_members[:max_display]
+                    extra_count = max(0, len(all_members) - max_display)
+                    agent_cards_html = []
+                    for m in render_members:
                         user_obj = m.get('user', {})
                         name = user_obj.get('name', 'Unknown')
                         presence_obj = user_obj.get('presence', {})
@@ -6510,7 +7018,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         display_status = f"{status_text} - {duration_str}" if duration_str else status_text
                         safe_name = _escape_html(name)
                         safe_status = _escape_html(display_status)
-                        st.markdown(f"""
+                        agent_cards_html.append(f"""
                             <div class="agent-card">
                                 <span class="status-dot" style="background-color: {dot_color};"></span>
                                 <div>
@@ -6518,10 +7026,17 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                         <p class="agent-status">{safe_status}</p>
                                     </div>
                                 </div>
-                            """, unsafe_allow_html=True)
+                            """)
+                    if agent_cards_html:
+                        st.markdown("".join(agent_cards_html), unsafe_allow_html=True)
+                    if extra_count:
+                        st.caption(f"+{extra_count} daha fazla kayıt")
+                _dashboard_profile_record("agent_panel.render", pytime.perf_counter() - render_t0)
+        _dashboard_profile_record("agent_panel.total", pytime.perf_counter() - agent_panel_t0)
 
     # --- CALL PANEL LOGIC ---
     if st.session_state.get('show_call_panel', False) and call_c:
+        call_panel_t0 = pytime.perf_counter()
         with call_c:
 
             st.markdown("""
@@ -6579,16 +7094,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
             # Filter options (group filter is optional - data is queue-independent)
             waiting_calls = []
-            queue_search_term = st.text_input(
-                "🔍 Kuyruk Ara",
-                "",
-                label_visibility="collapsed",
-                placeholder="Kuyruk Ara...",
-                key="call_panel_queue_search",
-            ).strip().lower()
             group_options = ["Hepsi (All)"] + [card['title'] or f"Grup #{idx+1}" for idx, card in enumerate(st.session_state.dashboard_cards)]
-            selected_group = st.selectbox("📌 Grup Filtresi", group_options, index=0, key="call_panel_group")
-            hide_mevcut = st.checkbox("Mevcut içeren kuyrukları gizle", value=False, key="call_panel_hide_mevcut")
             call_filter_options = ["inbound", "outbound", "waiting", "connected", "callback", "message", "voice"]
             direction_filter_options = ["inbound", "outbound"]
             state_filter_options = ["waiting", "connected"]
@@ -6605,28 +7111,57 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 "message": "Message",
                 "voice": "Voice",
             }
-            selected_call_filters = st.multiselect(
-                "🎛️ Yön / Kanal / Durum Filtresi",
-                options=call_filter_options,
-                default=call_filter_options,
-                key="call_panel_type_filters",
-                format_func=lambda x: call_filter_labels.get(x, str(x).title()),
-            )
+
+            if "call_panel_queue_search" not in st.session_state:
+                st.session_state.call_panel_queue_search = ""
+            if st.session_state.get("call_panel_group") not in group_options:
+                st.session_state.call_panel_group = "Hepsi (All)"
+            if "call_panel_hide_mevcut" not in st.session_state:
+                st.session_state.call_panel_hide_mevcut = False
+            raw_type_filters = st.session_state.get("call_panel_type_filters")
+            if not isinstance(raw_type_filters, list):
+                st.session_state.call_panel_type_filters = list(call_filter_options)
+            else:
+                st.session_state.call_panel_type_filters = [f for f in raw_type_filters if f in call_filter_options]
+
+            with st.form("call_panel_filters_form", clear_on_submit=False, border=False):
+                queue_search_term = st.text_input(
+                    "🔍 Kuyruk Ara",
+                    label_visibility="collapsed",
+                    placeholder="Kuyruk Ara...",
+                    key="call_panel_queue_search",
+                )
+                selected_group = st.selectbox("📌 Grup Filtresi", group_options, key="call_panel_group")
+                hide_mevcut = st.checkbox("Mevcut içeren kuyrukları gizle", key="call_panel_hide_mevcut")
+                selected_call_filters = st.multiselect(
+                    "🎛️ Yön / Kanal / Durum Filtresi",
+                    options=call_filter_options,
+                    key="call_panel_type_filters",
+                    format_func=lambda x: call_filter_labels.get(x, str(x).title()),
+                )
+                st.form_submit_button("Filtreyi Uygula", use_container_width=True)
+
+            queue_search_term = str(queue_search_term or "").strip().lower()
             selected_filter_set = {str(x).lower() for x in (selected_call_filters or []) if x}
             selected_direction_filters = selected_filter_set.intersection(full_direction_filter_set)
             selected_state_filters = selected_filter_set.intersection(full_state_filter_set)
             selected_media_filters = selected_filter_set.intersection(full_media_filter_set)
+            is_filter_none = len(selected_filter_set) == 0
             is_filter_all = (
                 selected_direction_filters == full_direction_filter_set
                 and selected_state_filters == full_state_filter_set
                 and selected_media_filters == full_media_filter_set
             )
-            group_queues = set()
+            group_queues_lower = set()
             if selected_group != "Hepsi (All)":
                 for idx, card in enumerate(st.session_state.dashboard_cards):
                     label = card['title'] or f"Grup #{idx+1}"
                     if label == selected_group and card.get('queues'):
-                        group_queues.update(card['queues'])
+                        resolved_group_queues, _ = _resolve_card_queue_names(
+                            card.get("queues", []),
+                            st.session_state.get("queues_map", {}),
+                        )
+                        group_queues_lower = {str(q).strip().lower() for q in resolved_group_queues}
                         break
 
             if st.session_state.dashboard_mode != "Live":
@@ -6635,7 +7170,6 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 st.warning(get_text(lang, "genesys_not_connected"))
             else:
                 refresh_s = _resolve_refresh_interval_seconds(org, minimum=3, default=15)
-                _safe_autorefresh(interval=refresh_s * 1000, key="call_panel_fast_refresh")
                 now_ts = pytime.time()
                 queue_id_to_name = {v: k for k, v in st.session_state.queues_map.items()}
 
@@ -6653,7 +7187,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
 
                 last_msg = getattr(global_notif, "last_message_ts", 0)
                 last_evt = getattr(global_notif, "last_event_ts", 0)
-                notif_stale = (not global_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > 30)
+                snapshot_interval_s = max(90, int(refresh_s) * 8)
+                notif_stale = (not global_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > snapshot_interval_s)
 
                 # Basic model: WS is primary, periodic API snapshot fully replaces cache.
                 # Snapshot throttling is org-wide (shared), not per session.
@@ -6672,8 +7207,9 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             if seed_map:
                                 global_notif.active_conversations = seed_map
 
-                should_snapshot = notif_stale or (now_ts - shared_snapshot_ts >= refresh_s)
-                if should_snapshot and _reserve_call_seed(org, now_ts, min_interval=refresh_s):
+                should_snapshot = notif_stale or (now_ts - shared_snapshot_ts >= snapshot_interval_s)
+                if should_snapshot and _reserve_call_seed(org, now_ts, min_interval=snapshot_interval_s):
+                    snapshot_api_t0 = pytime.perf_counter()
                     try:
                         snapshot_started_ts = pytime.time()
                         api = GenesysAPI(st.session_state.api_client)
@@ -6720,6 +7256,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             global_notif.active_conversations = merged_map
                     except Exception:
                         pass
+                    _dashboard_profile_record("call_panel.snapshot_api", pytime.perf_counter() - snapshot_api_t0)
 
                 active_conversations = global_notif.get_active_conversations(max_age_seconds=300)
                 for c in active_conversations:
@@ -6752,11 +7289,21 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     if not (has_queue and has_wg and has_phone and has_direction):
                         missing_ids.append(cid)
 
-                if missing_ids and _reserve_call_meta_poll(org, now_ts, min_interval=refresh_s):
+                meta_poll_interval_s = max(60, int(refresh_s) * 6)
+                meta_target_ids = _reserve_call_meta_targets(
+                    org,
+                    missing_ids,
+                    now_ts,
+                    min_interval=meta_poll_interval_s,
+                    cooldown_seconds=max(120, int(refresh_s) * 12),
+                    max_items=1,
+                )
+                if meta_target_ids:
+                    meta_api_t0 = pytime.perf_counter()
                     try:
                         api = GenesysAPI(st.session_state.api_client)
                         users_info = st.session_state.get("users_info") or {}
-                        for cid in missing_ids[:2]:
+                        for cid in meta_target_ids:
                             meta = _fetch_conversation_meta(api, cid, queue_id_to_name, users_info=users_info)
                             if meta:
                                 if meta.get("ended"):
@@ -6770,6 +7317,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                 combined[cid] = _merge_call(combined.get(cid), meta)
                     except Exception:
                         pass
+                    _dashboard_profile_record("call_panel.meta_api", pytime.perf_counter() - meta_api_t0)
 
                 # Final cleanup.
                 for cid in list(combined.keys()):
@@ -6788,11 +7336,17 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 except Exception:
                     pass
 
-                if group_queues:
-                    waiting_calls = [c for c in waiting_calls if c.get("queue_name") in group_queues]
+                filter_sort_t0 = pytime.perf_counter()
+                if group_queues_lower:
+                    waiting_calls = [
+                        c for c in waiting_calls
+                        if str(c.get("queue_name") or "").strip().lower() in group_queues_lower
+                    ]
                 if hide_mevcut:
                     waiting_calls = [c for c in waiting_calls if "mevcut" not in (c.get("queue_name") or "").lower()]
-                if not is_filter_all:
+                if is_filter_none:
+                    waiting_calls = []
+                elif not is_filter_all:
                     waiting_calls = [
                         c for c in waiting_calls
                         if _call_matches_filters(
@@ -6834,21 +7388,24 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             call_cache.pop(k, None)
                     st.session_state["_call_panel_last_by_filter"] = call_cache
                 else:
-                    cached = call_cache.get(call_cache_key) or {}
-                    if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
-                        waiting_calls = list(cached.get("data") or [])
+                    if not is_filter_none:
+                        cached = call_cache.get(call_cache_key) or {}
+                        if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
+                            waiting_calls = list(cached.get("data") or [])
+                _dashboard_profile_record("call_panel.filter_sort", pytime.perf_counter() - filter_sort_t0)
 
                 count_label = "Aktif"
                 st.markdown(f'<p class="panel-count">{count_label}: {len(waiting_calls)}</p>', unsafe_allow_html=True)
 
+                render_t0 = pytime.perf_counter()
                 if not waiting_calls:
                     st.info(get_text(lang, "no_waiting_calls"))
                 else:
                     max_display = 200
-                    for i, item in enumerate(waiting_calls):
-                        if i >= max_display:
-                            st.caption(f"+{len(waiting_calls) - max_display} daha fazla kayıt")
-                            break
+                    render_calls = waiting_calls[:max_display]
+                    extra_count = max(0, len(waiting_calls) - max_display)
+                    call_cards_html = []
+                    for item in render_calls:
                         wait_str = format_duration_seconds(item.get("wait_seconds"))
                         q = item.get("queue_name", "")
                         wg = item.get("wg")
@@ -6908,7 +7465,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         safe_wait_str = _escape_html(wait_str)
                         meta_html = f'<div class="call-meta">{safe_meta_text}</div>' if safe_meta_text else ""
 
-                        st.markdown(f"""
+                        call_cards_html.append(f"""
                             <div class="call-card">
                                 <div class="call-info">
                                     <div class="call-queue">{safe_queue_text}</div>
@@ -6916,4 +7473,13 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                                 </div>
                                 <div class="call-wait">{safe_wait_str}</div>
                             </div>
-                        """, unsafe_allow_html=True)
+                        """)
+                    if call_cards_html:
+                        st.markdown("".join(call_cards_html), unsafe_allow_html=True)
+                    if extra_count:
+                        st.caption(f"+{extra_count} daha fazla kayıt")
+                _dashboard_profile_record("call_panel.render", pytime.perf_counter() - render_t0)
+            _dashboard_profile_record("call_panel.total", pytime.perf_counter() - call_panel_t0)
+
+    _dashboard_profile_record("dashboard.total", pytime.perf_counter() - dashboard_profile_total_t0)
+    _dashboard_profile_commit_run()

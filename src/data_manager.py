@@ -117,6 +117,16 @@ class DataManager:
             if len(self.error_log) > 100: self.error_log.pop(0)
         monitor.log_error("DataManager", message)
 
+    def _local_today_utc_interval(self):
+        try:
+            offset_hours = float(self.utc_offset)
+        except Exception:
+            offset_hours = 0.0
+        org_tz = timezone(timedelta(hours=offset_hours))
+        now_local = datetime.now(org_tz)
+        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_local.astimezone(timezone.utc), now_local.astimezone(timezone.utc)
+
     def _update_loop(self):
         while not self.stop_event.is_set():
             if not self.enabled:
@@ -139,69 +149,71 @@ class DataManager:
     def _cleanup_old_caches(self):
         """Periodically trim caches to prevent memory bloat."""
         current_time = time.time()
-        if (current_time - self.last_cache_cleanup) < self.CACHE_CLEANUP_INTERVAL:
-            return
-        
-        # Get currently active queue names for filtering
-        active_queue_names = set(self.queues_map.keys())
-        active_agent_queue_names = set(self.agent_queues_map.keys())
-        
-        # Trim obs_data_cache - remove entries for queues no longer monitored
-        if self.obs_data_cache:
-            stale_obs_keys = [k for k in self.obs_data_cache.keys() if k not in active_queue_names]
-            for k in stale_obs_keys:
-                self.obs_data_cache.pop(k, None)
-            # Also enforce max size
-            if len(self.obs_data_cache) > self.MAX_OBS_DATA_CACHE:
-                keys_to_remove = list(self.obs_data_cache.keys())[:-self.MAX_OBS_DATA_CACHE]
-                for k in keys_to_remove:
+        with self._lock:
+            if (current_time - self.last_cache_cleanup) < self.CACHE_CLEANUP_INTERVAL:
+                return
+
+            # Get currently active queue names for filtering
+            active_queue_names = set(self.queues_map.keys())
+            active_agent_queue_names = set(self.agent_queues_map.keys())
+
+            # Trim obs_data_cache - remove entries for queues no longer monitored
+            if self.obs_data_cache:
+                stale_obs_keys = [k for k in self.obs_data_cache.keys() if k not in active_queue_names]
+                for k in stale_obs_keys:
                     self.obs_data_cache.pop(k, None)
-        
-        # Trim daily_data_cache - remove entries for queues no longer monitored
-        if self.daily_data_cache:
-            stale_daily_keys = [k for k in self.daily_data_cache.keys() if k not in active_queue_names]
-            for k in stale_daily_keys:
-                self.daily_data_cache.pop(k, None)
-            # Also enforce max size
-            if len(self.daily_data_cache) > self.MAX_DAILY_DATA_CACHE:
-                keys_to_remove = list(self.daily_data_cache.keys())[:-self.MAX_DAILY_DATA_CACHE]
-                for k in keys_to_remove:
+                # Also enforce max size
+                if len(self.obs_data_cache) > self.MAX_OBS_DATA_CACHE:
+                    keys_to_remove = list(self.obs_data_cache.keys())[:-self.MAX_OBS_DATA_CACHE]
+                    for k in keys_to_remove:
+                        self.obs_data_cache.pop(k, None)
+
+            # Trim daily_data_cache - remove entries for queues no longer monitored
+            if self.daily_data_cache:
+                stale_daily_keys = [k for k in self.daily_data_cache.keys() if k not in active_queue_names]
+                for k in stale_daily_keys:
                     self.daily_data_cache.pop(k, None)
-        
-        # Trim queue_members_cache to max size
-        if len(self.queue_members_cache) > self.MAX_QUEUE_MEMBERS_CACHE:
-            # Keep only the most recently used
-            keys_to_remove = list(self.queue_members_cache.keys())[:-self.MAX_QUEUE_MEMBERS_CACHE]
-            for k in keys_to_remove:
-                self.queue_members_cache.pop(k, None)
-        
-        # Trim agent_details_cache - remove entries for queues no longer monitored
-        if self.agent_details_cache:
-            stale_agent_keys = [k for k in self.agent_details_cache.keys() if k not in active_agent_queue_names]
-            for k in stale_agent_keys:
-                self.agent_details_cache.pop(k, None)
-            # Also enforce max size
-            if len(self.agent_details_cache) > self.MAX_AGENT_DETAILS_CACHE:
-                keys_to_remove = list(self.agent_details_cache.keys())[:-self.MAX_AGENT_DETAILS_CACHE]
+                # Also enforce max size
+                if len(self.daily_data_cache) > self.MAX_DAILY_DATA_CACHE:
+                    keys_to_remove = list(self.daily_data_cache.keys())[:-self.MAX_DAILY_DATA_CACHE]
+                    for k in keys_to_remove:
+                        self.daily_data_cache.pop(k, None)
+
+            # Trim queue_members_cache to max size
+            if len(self.queue_members_cache) > self.MAX_QUEUE_MEMBERS_CACHE:
+                # Keep only the most recently used
+                keys_to_remove = list(self.queue_members_cache.keys())[:-self.MAX_QUEUE_MEMBERS_CACHE]
                 for k in keys_to_remove:
+                    self.queue_members_cache.pop(k, None)
+
+            # Trim agent_details_cache - remove entries for queues no longer monitored
+            if self.agent_details_cache:
+                stale_agent_keys = [k for k in self.agent_details_cache.keys() if k not in active_agent_queue_names]
+                for k in stale_agent_keys:
                     self.agent_details_cache.pop(k, None)
-        
-        self.last_cache_cleanup = current_time
+                # Also enforce max size
+                if len(self.agent_details_cache) > self.MAX_AGENT_DETAILS_CACHE:
+                    keys_to_remove = list(self.agent_details_cache.keys())[:-self.MAX_AGENT_DETAILS_CACHE]
+                    for k in keys_to_remove:
+                        self.agent_details_cache.pop(k, None)
+
+            self.last_cache_cleanup = current_time
     
     def _fetch_all_data(self):
         # Periodic cache cleanup
         self._cleanup_old_caches()
-        
-        q_ids = list(self.queues_map.values())
-        id_map = {v: k for k, v in self.queues_map.items()}
-        monitored_queue_names = set(id_map.values())
-        
-        # Debug Log to confirm optimization
-        # (debug log removed for build)
-        
-        agent_q_ids = list(self.agent_queues_map.values())
-        agent_id_map = {v: k for k, v in self.agent_queues_map.items()}
-        
+
+        with self._lock:
+            q_ids = list(self.queues_map.values())
+            id_map = {v: k for k, v in self.queues_map.items()}
+            monitored_queue_names = set(id_map.values())
+            agent_q_ids = list(self.agent_queues_map.values())
+            agent_id_map = {v: k for k, v in self.agent_queues_map.items()}
+            current_time = time.time()
+            last_daily_refresh = self.last_daily_refresh
+            last_member_refresh = self.last_member_refresh
+            member_cache_snapshot = self.queue_members_cache.copy()
+
         # 1. Observations (Live Metrics)
         # Keep previous cache if refresh fails/returns empty.
         if q_ids:
@@ -215,44 +227,46 @@ class DataManager:
                     if q_name:
                         new_obs[q_name] = item
                 if new_obs:
-                    merged_obs = {q: v for q, v in self.obs_data_cache.items() if q in monitored_queue_names}
-                    merged_obs.update(new_obs)
-                    self.obs_data_cache = merged_obs
+                    with self._lock:
+                        merged_obs = {q: v for q, v in self.obs_data_cache.items() if q in monitored_queue_names}
+                        merged_obs.update(new_obs)
+                        self.obs_data_cache = merged_obs
             except Exception as e:
                 self._log_error(f"Observation refresh error: {e}")
         else:
-            self.obs_data_cache = {}
-        
+            with self._lock:
+                self.obs_data_cache = {}
+
         # 2. Daily Stats (fetch less frequently to reduce API load)
-        current_time = time.time()
-        if q_ids and (current_time - self.last_daily_refresh >= 60):
+        if q_ids and (current_time - last_daily_refresh >= 60):
             try:
-                now_local = datetime.now()
-                start_local = datetime.combine(now_local.date(), datetime.min.time())
-                start_utc = start_local - timedelta(hours=self.utc_offset)
-                end_utc = datetime.now(timezone.utc)
+                start_utc, end_utc = self._local_today_utc_interval()
                 query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                
+
                 daily_response = self.api.get_queue_daily_stats(q_ids, interval=query_interval)
                 from src.processor import process_daily_stats
-                new_daily = process_daily_stats(daily_response, id_map) or {}
-                if new_daily:
-                    merged_daily = {q: v for q, v in self.daily_data_cache.items() if q in monitored_queue_names}
-                    merged_daily.update(new_daily)
-                    self.daily_data_cache = merged_daily
+                new_daily = process_daily_stats(daily_response, id_map) if daily_response else {}
+                new_daily = new_daily or {}
+                with self._lock:
+                    # Replace monitored queues atomically so empty successful responses
+                    # don't keep stale prior-day values.
+                    preserved = {q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names}
+                    preserved.update(new_daily)
+                    self.daily_data_cache = preserved
                     self.last_daily_refresh = current_time
             except Exception as e:
                 self._log_error(f"Daily stats refresh error: {e}")
         elif not q_ids:
-            self.daily_data_cache = {}
-        
+            with self._lock:
+                self.daily_data_cache = {}
+
         # 3. Agent Details
         # Refresh membership every 30 mins
-        missing_some = any(q_id not in self.queue_members_cache for q_id in agent_q_ids)
+        missing_some = any(q_id not in member_cache_snapshot for q_id in agent_q_ids)
         refresh_threshold = 60 if missing_some else 3600
-        
-        if (current_time - self.last_member_refresh > refresh_threshold) and agent_q_ids:
-            new_cache = self.queue_members_cache.copy()
+
+        if (current_time - last_member_refresh > refresh_threshold) and agent_q_ids:
+            new_cache = member_cache_snapshot.copy()
             for q_id in agent_q_ids:
                 try:
                     mems = self.api.get_queue_members(q_id)
@@ -267,17 +281,22 @@ class DataManager:
                 except Exception as e:
                     self._log_error(f"Error fetching members for {q_id}: {str(e)}")
                     self._log_error(f"Error fetching members for {q_id}: {e}")
-            self.queue_members_cache = new_cache
-            self.last_member_refresh = current_time
+            with self._lock:
+                self.queue_members_cache = new_cache
+                self.last_member_refresh = current_time
+
+        with self._lock:
+            queue_members_snapshot = {q_id: list(self.queue_members_cache.get(q_id, [])) for q_id in agent_q_ids}
+            previous_agent_cache = {k: list(v or []) for k, v in self.agent_details_cache.items()}
 
         # User Status Scan
         unique_user_ids = set()
         for q_id in agent_q_ids:
-            for m in self.queue_members_cache.get(q_id, []):
+            for m in queue_members_snapshot.get(q_id, []):
                 unique_user_ids.add(m['id'])
-        
+
         prev_status = {}
-        for members in self.agent_details_cache.values():
+        for members in previous_agent_cache.values():
             for member in members:
                 uid = member.get("id")
                 if not uid:
@@ -301,7 +320,7 @@ class DataManager:
                     pi = self.presence_map.get(pid, {})
                     sysp = pres_obj.get('presenceDefinition', {}).get('systemPresence', 'OFFLINE')
                     label = pi.get('label', sysp)
-                    
+
                     final_pres = {
                         "presenceDefinition": {"id": pid, "systemPresence": sysp, "label": label},
                         "modifiedDate": pres_obj.get('modifiedDate')
@@ -315,12 +334,12 @@ class DataManager:
                 for u_id in unique_user_ids:
                     if u_id in prev_status:
                         status_map[u_id] = prev_status[u_id]
-            
+
         # Detail Cache reconstruction
         temp_cache = {}
         for q_id in agent_q_ids:
             q_name = agent_id_map.get(q_id)
-            mems = self.queue_members_cache.get(q_id, [])
+            mems = queue_members_snapshot.get(q_id, [])
             items = []
             for m in mems:
                 u_id = m['id']
@@ -331,21 +350,25 @@ class DataManager:
                     'routingStatus': st.get('routingStatus', {})
                 })
             temp_cache[q_name] = items
-        
-        if temp_cache:
-            self.agent_details_cache = temp_cache
-        elif not agent_q_ids:
-            self.agent_details_cache = {}
-        self.last_update_time = time.time()
+
+        with self._lock:
+            if temp_cache:
+                self.agent_details_cache = temp_cache
+            elif not agent_q_ids:
+                self.agent_details_cache = {}
+            self.last_update_time = time.time()
 
     def get_data(self, requested_queues):
-        obs = {q: self.obs_data_cache.get(q) for q in requested_queues if q in self.obs_data_cache}
-        daily = {q: self.daily_data_cache.get(q) for q in requested_queues if q in self.daily_data_cache}
-        return obs, daily, self.last_update_time
+        with self._lock:
+            obs = {q: self.obs_data_cache.get(q) for q in requested_queues if q in self.obs_data_cache}
+            daily = {q: self.daily_data_cache.get(q) for q in requested_queues if q in self.daily_data_cache}
+            last_update = self.last_update_time
+        return obs, daily, last_update
 
     def get_agent_details(self, requested_queues):
-        agents = {}
-        for q in requested_queues:
-            if q in self.agent_details_cache:
-                agents[q] = self.agent_details_cache[q]
+        with self._lock:
+            agents = {}
+            for q in requested_queues:
+                if q in self.agent_details_cache:
+                    agents[q] = list(self.agent_details_cache[q])
         return agents

@@ -1344,7 +1344,7 @@ class GenesysAPI:
             query = {
                 "interval": interval,
                 "groupBy": ["queueId", "mediaType"],
-                "metrics": ["nOffered", "tAnswered", "tAbandon", "oServiceLevel"],
+                "metrics": ["nOffered", "tAnswered", "tAbandon", "tHandle", "tWait", "oServiceLevel"],
                 "filter": {"type": "or", "predicates": predicates}
             }
             try:

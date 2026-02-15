@@ -108,9 +108,19 @@ class AuthManager:
                 if os.path.exists(users_path):
                     try:
                         with open(users_path, "r", encoding="utf-8") as f:
-                            data[safe_org] = json.load(f)
+                            loaded = json.load(f)
+                            if isinstance(loaded, dict):
+                                data[safe_org] = loaded
+                            else:
+                                print(
+                                    f"[WARN] Skipping users file with invalid structure: {users_path}",
+                                    file=sys.stderr,
+                                )
                     except Exception as exc:
-                        raise RuntimeError(f"Failed to read users file: {users_path}") from exc
+                        print(
+                            f"[WARN] Failed to read users file, skipping: {users_path} ({exc})",
+                            file=sys.stderr,
+                        )
         if data:
             return data
 
@@ -130,7 +140,10 @@ class AuthManager:
                         pass
                     return legacy
             except Exception as exc:
-                raise RuntimeError("Failed to migrate legacy users.json") from exc
+                print(
+                    f"[WARN] Failed to migrate legacy users.json, proceeding with bootstrap defaults: {exc}",
+                    file=sys.stderr,
+                )
         
         # Default setup
         bootstrap_password = os.environ.get(DEFAULT_ADMIN_PASSWORD_ENV, "").strip()

@@ -41,7 +41,12 @@ def process_daily_stats(response, lookup_map):
                 "Offered": {"Total": 0}, 
                 "Answered": {"Total": 0}, 
                 "Abandoned": {"Total": 0}, 
-                "SL_Numerator": 0, "SL_Denominator": 0
+                "Handle_Sum": {"Total": 0.0},
+                "Handle_Count": {"Total": 0},
+                "Wait_Sum": {"Total": 0.0},
+                "Wait_Count": {"Total": 0},
+                "SL_Numerator": 0,
+                "SL_Denominator": 0,
             }
             
         data_buckets = result.get('data', [])
@@ -60,29 +65,28 @@ def process_daily_stats(response, lookup_map):
                 elif m == "tAbandon":
                     stats[q_name]["Abandoned"][media_type] = stats[q_name]["Abandoned"].get(media_type, 0) + count
                     stats[q_name]["Abandoned"]["Total"] += count
+                elif m == "tHandle":
+                    handle_sum_s = (s.get("sum", 0) or 0) / 1000
+                    handle_count = s.get("count", 0) or 0
+                    stats[q_name]["Handle_Sum"][media_type] = stats[q_name]["Handle_Sum"].get(media_type, 0) + handle_sum_s
+                    stats[q_name]["Handle_Sum"]["Total"] += handle_sum_s
+                    stats[q_name]["Handle_Count"][media_type] = stats[q_name]["Handle_Count"].get(media_type, 0) + handle_count
+                    stats[q_name]["Handle_Count"]["Total"] += handle_count
+                elif m == "tWait":
+                    wait_sum_s = (s.get("sum", 0) or 0) / 1000
+                    wait_count = s.get("count", 0) or 0
+                    stats[q_name]["Wait_Sum"][media_type] = stats[q_name]["Wait_Sum"].get(media_type, 0) + wait_sum_s
+                    stats[q_name]["Wait_Sum"]["Total"] += wait_sum_s
+                    stats[q_name]["Wait_Count"][media_type] = stats[q_name]["Wait_Count"].get(media_type, 0) + wait_count
+                    stats[q_name]["Wait_Count"]["Total"] += wait_count
                 elif m == "oServiceLevel":
                     stats[q_name]["SL_Numerator"] += s.get('numerator', 0)
                     stats[q_name]["SL_Denominator"] += s.get('denominator', 0)
-        
-        # Calculate Offered as Answered + Abandoned (matches Genesys workgroup view)
-        # We need to sum up processed Answered/Abandoned for this specific media type iteration
-        # Note: Since we are iterating rows, we accumulate Total in real-time.
-        # But for 'Offered', we can compute it at the end or incrementally.
-        # Let's compute Offered incrementally for the media_type
-        
-        ans_m = stats[q_name]["Answered"].get(media_type, 0)
-        abn_m = stats[q_name]["Abandoned"].get(media_type, 0)
-        
-        # Re-calculating Offered for this media type based on what we just added? 
-        # Actually, since results are separate rows per media type, we can just add to offered here.
-        # Wait, the loop runs once per result row (one queue+media combo).
-        # So inside this loop, we processed ALL metrics for that combo.
-        
-        # Correct approach:
+
+        # Offered = Answered + Abandoned for the same media type.
         offered_val = stats[q_name]["Answered"].get(media_type, 0) + stats[q_name]["Abandoned"].get(media_type, 0)
         stats[q_name]["Offered"][media_type] = offered_val
-        
-        # Re-sum Total Offered (easier than tracking increments)
+        # Keep total in sync with per-media values.
         stats[q_name]["Offered"]["Total"] = sum(v for k,v in stats[q_name]["Offered"].items() if k != "Total")
     
     return stats

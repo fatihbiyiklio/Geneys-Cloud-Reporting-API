@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import tempfile
 import unittest
@@ -49,6 +50,31 @@ class HardeningTests(unittest.TestCase):
             total_wait = projected
         self.assertIsNone(wait_s)
         self.assertGreaterEqual(projected, 1.0)
+
+    def test_auth_manager_skips_malformed_org_users_file(self):
+        good_org = os.path.join(self._tmpdir.name, "goodorg")
+        bad_org = os.path.join(self._tmpdir.name, "badorg")
+        os.makedirs(good_org, exist_ok=True)
+        os.makedirs(bad_org, exist_ok=True)
+
+        with open(os.path.join(good_org, "users.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "alice": {
+                        "password": "placeholder",
+                        "role": "Admin",
+                        "metrics": [],
+                    }
+                },
+                f,
+            )
+        with open(os.path.join(bad_org, "users.json"), "w", encoding="utf-8") as f:
+            f.write("{this is not valid json")
+
+        manager = self.auth_manager_mod.AuthManager()
+        self.assertIn("goodorg", manager.users)
+        self.assertIn("alice", manager.users["goodorg"])
+        self.assertNotIn("badorg", manager.users)
 
 
 if __name__ == "__main__":

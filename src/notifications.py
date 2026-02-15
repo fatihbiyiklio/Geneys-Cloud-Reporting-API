@@ -426,8 +426,8 @@ class AgentNotificationManager:
     USER_CACHE_TTL_SECONDS = 900   # Reduced from 1800 (15 min vs 30 min)
     ACTIVE_CALL_TTL_SECONDS = 180  # Reduced from 300
     CLEANUP_INTERVAL_SECONDS = 30  # Reduced from 90
-    MAX_USER_PRESENCE_CACHE = 500  # Reduced from 1000
-    MAX_USER_ROUTING_CACHE = 500   # Reduced from 1000
+    MAX_USER_PRESENCE_CACHE = 2000
+    MAX_USER_ROUTING_CACHE = 2000
     MAX_ACTIVE_CALLS_CACHE = 300   # Reduced from 500
     MAX_QUEUE_MEMBERS_CACHE = 50   # Reduced from 100
 
@@ -520,8 +520,9 @@ class AgentNotificationManager:
         for qid in queue_ids:
             if not qid:
                 continue
-            last = self.last_member_refresh.get(qid, 0)
-            threshold = 60 if qid not in self.queue_members_cache else 1800
+            with self._lock:
+                last = self.last_member_refresh.get(qid, 0)
+                threshold = 60 if qid not in self.queue_members_cache else 1800
             if (now - last) < threshold:
                 continue
             try:
@@ -535,12 +536,14 @@ class AgentNotificationManager:
                         u_name = self.users_info.get(u_id, {}).get("name")
                     if u_id:
                         processed.append({"id": u_id, "name": u_name or "Unknown"})
-                self.queue_members_cache[qid] = processed
-                self.last_member_refresh[qid] = now
+                with self._lock:
+                    self.queue_members_cache[qid] = processed
+                    self.last_member_refresh[qid] = now
             except Exception:
                 # Keep last cached data on error
                 pass
-        return {qid: self.queue_members_cache.get(qid, []) for qid in queue_ids if qid}
+        with self._lock:
+            return {qid: list(self.queue_members_cache.get(qid, [])) for qid in queue_ids if qid}
 
     def start(self, user_ids):
         if not self.api:
@@ -585,13 +588,15 @@ class AgentNotificationManager:
     def get_user_presence(self, user_id):
         if not user_id:
             return {}
-        p = self.user_presence.get(user_id) or {}
+        with self._lock:
+            p = self.user_presence.get(user_id) or {}
         return _normalize_presence(p, self.presence_map)
 
     def get_user_routing(self, user_id):
         if not user_id:
             return {}
-        return self.user_routing.get(user_id) or {}
+        with self._lock:
+            return self.user_routing.get(user_id) or {}
 
     def get_active_calls(self, max_age_seconds=600):
         now = time.time()
@@ -657,29 +662,31 @@ class AgentNotificationManager:
 
     def seed_users(self, presence_map, routing_map):
         """Seed caches from a one-time API snapshot."""
-        if presence_map:
-            for uid, pres in presence_map.items():
-                if pres:
-                    self.user_presence[uid] = pres
-                    self._user_presence_ts[uid] = time.time()
-        if routing_map:
-            for uid, rout in routing_map.items():
-                if rout:
-                    self.user_routing[uid] = rout
-                    self._user_routing_ts[uid] = time.time()
+        with self._lock:
+            if presence_map:
+                for uid, pres in presence_map.items():
+                    if pres:
+                        self.user_presence[uid] = pres
+                        self._user_presence_ts[uid] = time.time()
+            if routing_map:
+                for uid, rout in routing_map.items():
+                    if rout:
+                        self.user_routing[uid] = rout
+                        self._user_routing_ts[uid] = time.time()
 
     def seed_users_missing(self, presence_map, routing_map):
         """Seed caches only for users not already present."""
-        if presence_map:
-            for uid, pres in presence_map.items():
-                if pres and uid not in self.user_presence:
-                    self.user_presence[uid] = pres
-                    self._user_presence_ts[uid] = time.time()
-        if routing_map:
-            for uid, rout in routing_map.items():
-                if rout and uid not in self.user_routing:
-                    self.user_routing[uid] = rout
-                    self._user_routing_ts[uid] = time.time()
+        with self._lock:
+            if presence_map:
+                for uid, pres in presence_map.items():
+                    if pres and uid not in self.user_presence:
+                        self.user_presence[uid] = pres
+                        self._user_presence_ts[uid] = time.time()
+            if routing_map:
+                for uid, rout in routing_map.items():
+                    if rout and uid not in self.user_routing:
+                        self.user_routing[uid] = rout
+                        self._user_routing_ts[uid] = time.time()
 
     def _create_channel(self, topics):
         try:
@@ -798,22 +805,23 @@ class AgentNotificationManager:
                             _cleanup_dead_websockets()
                     except Exception:
                         pass
-                    except Exception:
-                        pass
 
     def _handle_user_event(self, topic, event):
         parts = topic.split(".")
         if len(parts) < 4:
             return
         user_id = parts[2]
-        self.last_event_ts = time.time()
+        event_ts = time.time()
+        self.last_event_ts = event_ts
 
         if topic.endswith(".presence"):
-            self.user_presence[user_id] = event or {}
-            self._user_presence_ts[user_id] = time.time()
+            with self._lock:
+                self.user_presence[user_id] = event or {}
+                self._user_presence_ts[user_id] = event_ts
         elif topic.endswith(".routingStatus"):
-            self.user_routing[user_id] = event or {}
-            self._user_routing_ts[user_id] = time.time()
+            with self._lock:
+                self.user_routing[user_id] = event or {}
+                self._user_routing_ts[user_id] = event_ts
         elif ".conversations" in topic:
             self._handle_call_event(event)
 
