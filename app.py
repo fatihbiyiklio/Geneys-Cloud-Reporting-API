@@ -142,6 +142,7 @@ from src.processor import process_analytics_response, to_excel, to_csv, to_parqu
 
 SESSION_TTL_SECONDS = 120
 DEBUG_REMEMBER_ME = os.environ.get("GENESYS_DEBUG_REMEMBER_ME", "0").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_DASHBOARD_PROFILING = os.environ.get("GENESYS_ENABLE_DASHBOARD_PROFILING", "0").strip().lower() in ("1", "true", "yes", "on")
 ORG_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
 LOGIN_WINDOW_SECONDS = int(os.environ.get("GENESYS_LOGIN_WINDOW_SECONDS", "900"))
 LOGIN_LOCK_SECONDS = int(os.environ.get("GENESYS_LOGIN_LOCK_SECONDS", "900"))
@@ -2950,6 +2951,8 @@ def _dashboard_profile_clear(duration_s=None):
 
 
 def _dashboard_profile_tick():
+    if not ENABLE_DASHBOARD_PROFILING:
+        return
     state = _dashboard_profile_state()
     if not state.get("enabled"):
         return
@@ -2960,6 +2963,8 @@ def _dashboard_profile_tick():
 
 
 def _dashboard_profile_active():
+    if not ENABLE_DASHBOARD_PROFILING:
+        return False
     return bool(_dashboard_profile_state().get("enabled"))
 
 
@@ -2988,6 +2993,8 @@ def _dashboard_profile_commit_run():
 
 
 def _dashboard_profile_rows(limit=15):
+    if not ENABLE_DASHBOARD_PROFILING:
+        return []
     state = _dashboard_profile_state()
     rows = []
     all_samples = state.get("samples", {}) or {}
@@ -6129,37 +6136,38 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             st.session_state._dashboard_dm_sig = dm_sig
     controls_t0 = pytime.perf_counter()
     st.title(get_text(lang, "menu_dashboard"))
-    profile_state = _dashboard_profile_state()
-    profile_rows = _dashboard_profile_rows(limit=12)
-    with st.expander("⏱️ Dashboard Profiling", expanded=bool(profile_state.get("enabled"))):
-        profile_duration = st.number_input(
-            "Profil süresi (sn)",
-            min_value=60,
-            max_value=900,
-            step=30,
-            value=int(profile_state.get("duration_s", 180) or 180),
-            key="dashboard_profile_duration_s",
-        )
-        p_c1, p_c2, p_c3 = st.columns(3)
-        if p_c1.button("Profili Başlat", key="dashboard_profile_start_btn", width='stretch'):
-            _dashboard_profile_start(duration_s=profile_duration)
-            st.rerun()
-        if p_c2.button("Profili Durdur", key="dashboard_profile_stop_btn", width='stretch'):
-            _dashboard_profile_stop()
-            st.rerun()
-        if p_c3.button("Profili Temizle", key="dashboard_profile_clear_btn", width='stretch'):
-            _dashboard_profile_clear(duration_s=profile_duration)
-            st.rerun()
-        if profile_state.get("enabled"):
-            elapsed_s = max(0, int(pytime.time() - float(profile_state.get("started_ts", 0) or 0)))
-            remaining_s = max(0, int(profile_state.get("duration_s", 180)) - elapsed_s)
-            st.caption(f"Profil aktif. Geçen: {elapsed_s}s | Kalan: {remaining_s}s | Rerun: {profile_state.get('runs', 0)}")
-        else:
-            st.caption(f"Profil pasif. Son kayıt rerun sayısı: {profile_state.get('runs', 0)}")
-        if profile_rows:
-            st.dataframe(pd.DataFrame(profile_rows), width='stretch', hide_index=True)
-        else:
-            st.caption("Henüz profil verisi yok.")
+    if ENABLE_DASHBOARD_PROFILING:
+        profile_state = _dashboard_profile_state()
+        profile_rows = _dashboard_profile_rows(limit=12)
+        with st.expander("⏱️ Dashboard Profiling", expanded=bool(profile_state.get("enabled"))):
+            profile_duration = st.number_input(
+                "Profil süresi (sn)",
+                min_value=60,
+                max_value=900,
+                step=30,
+                value=int(profile_state.get("duration_s", 180) or 180),
+                key="dashboard_profile_duration_s",
+            )
+            p_c1, p_c2, p_c3 = st.columns(3)
+            if p_c1.button("Profili Başlat", key="dashboard_profile_start_btn", width='stretch'):
+                _dashboard_profile_start(duration_s=profile_duration)
+                st.rerun()
+            if p_c2.button("Profili Durdur", key="dashboard_profile_stop_btn", width='stretch'):
+                _dashboard_profile_stop()
+                st.rerun()
+            if p_c3.button("Profili Temizle", key="dashboard_profile_clear_btn", width='stretch'):
+                _dashboard_profile_clear(duration_s=profile_duration)
+                st.rerun()
+            if profile_state.get("enabled"):
+                elapsed_s = max(0, int(pytime.time() - float(profile_state.get("started_ts", 0) or 0)))
+                remaining_s = max(0, int(profile_state.get("duration_s", 180)) - elapsed_s)
+                st.caption(f"Profil aktif. Geçen: {elapsed_s}s | Kalan: {remaining_s}s | Rerun: {profile_state.get('runs', 0)}")
+            else:
+                st.caption(f"Profil pasif. Son kayıt rerun sayısı: {profile_state.get('runs', 0)}")
+            if profile_rows:
+                st.dataframe(pd.DataFrame(profile_rows), width='stretch', hide_index=True)
+            else:
+                st.caption("Henüz profil verisi yok.")
     c_c1, c_c2, c_c3 = st.columns([1, 2, 1])
     if c_c1.button(get_text(lang, "add_group"), width='stretch'):
         st.session_state.dashboard_cards.append({"id": max([c['id'] for c in st.session_state.dashboard_cards], default=-1)+1, "title": "", "queues": [], "size": "medium", "live_metrics": ["Waiting", "Interacting", "On Queue"], "daily_metrics": ["Offered", "Answered", "Abandoned", "Answer Rate"]})

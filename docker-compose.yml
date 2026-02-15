@@ -2,9 +2,8 @@ version: '3.8'
 
 services:
   genesys-reporting:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${IMAGE_REPOSITORY:-ghcr.io/fbiyikli/genesys-cloud-reporting}:${IMAGE_TAG:-latest}
+    pull_policy: always
     container_name: genesys-cloud-reporting
     restart: unless-stopped
     ports:
@@ -18,6 +17,8 @@ services:
     environment:
       - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
       - STREAMLIT_SERVER_USAGE_STATS=false
+      - GENESYS_DEBUG_REMEMBER_ME=0
+      - GENESYS_ENABLE_DASHBOARD_PROFILING=0
       - GENESYS_MEMORY_LIMIT_MB=800
       - GENESYS_MEMORY_HARD_LIMIT_MB=1024
       - GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC=60

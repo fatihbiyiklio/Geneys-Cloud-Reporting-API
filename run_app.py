@@ -23,6 +23,82 @@ CHILD_FLAG = "--streamlit-child"
 
 _lock_handle = None
 
+
+def _env_flag(name, default="0"):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_windows_admin():
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _run_sc_command(*args):
+    try:
+        proc = subprocess.run(
+            ["sc.exe", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return proc.returncode == 0, output
+    except Exception as e:
+        return False, str(e)
+
+
+def ensure_windows_service_registration(log_func):
+    """Register this app as a Windows service (startup: automatic)."""
+    if not platform.system().lower().startswith("win"):
+        return
+    if not _env_flag("GENESYS_WINDOWS_SERVICE_AUTO_INSTALL", "1"):
+        return
+
+    service_name = os.environ.get("GENESYS_WINDOWS_SERVICE_NAME", "GenesysReporting").strip() or "GenesysReporting"
+    display_name = os.environ.get("GENESYS_WINDOWS_SERVICE_DISPLAY_NAME", "Genesys Cloud Reporting").strip() or "Genesys Cloud Reporting"
+    description = os.environ.get(
+        "GENESYS_WINDOWS_SERVICE_DESCRIPTION",
+        "Genesys Cloud Reporting Streamlit service",
+    ).strip() or "Genesys Cloud Reporting Streamlit service"
+    start_mode = os.environ.get("GENESYS_WINDOWS_SERVICE_START_MODE", "auto").strip().lower() or "auto"
+    if start_mode not in ("auto", "demand", "disabled", "delayed-auto"):
+        start_mode = "auto"
+
+    exists, _ = _run_sc_command("query", service_name)
+    if exists:
+        # Keep startup mode in sync.
+        _run_sc_command("config", service_name, "start=", start_mode)
+        return
+
+    if not _is_windows_admin():
+        log_func("Windows service auto-install skipped: run once as Administrator.")
+        return
+
+    if getattr(sys, "frozen", False):
+        bin_path = f"\"{sys.executable}\""
+    else:
+        bin_path = f"\"{sys.executable}\" \"{os.path.abspath(__file__)}\""
+
+    ok, out = _run_sc_command(
+        "create",
+        service_name,
+        "binPath=",
+        bin_path,
+        "start=",
+        start_mode,
+        "DisplayName=",
+        display_name,
+    )
+    if not ok:
+        log_func(f"Windows service create failed for '{service_name}': {out}")
+        return
+
+    _run_sc_command("description", service_name, description)
+    log_func(f"Windows service registered: {service_name} (start={start_mode})")
+
 def run_streamlit_child():
     """Run Streamlit in child mode inside this process."""
     if len(sys.argv) < 3:
@@ -108,11 +184,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == CHILD_FLAG:
         sys.exit(run_streamlit_child())
 
-    # Simple self-test hook for CI/debugging
-    if os.environ.get("GENESYS_SELF_TEST") == "1":
-        print("SELF_TEST_OK")
-        sys.exit(0)
-
     acquire_single_instance_lock()
     app_path = resolve_path("app.py")
     force_port_cleanup = os.environ.get("GENESYS_FORCE_PORT_CLEANUP", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -125,6 +196,8 @@ if __name__ == "__main__":
                 f.write(msg + "\n")
         except Exception:
             pass
+
+    ensure_windows_service_registration(log)
     
     def _is_port_busy(port, host="127.0.0.1", timeout=0.25):
         """Fast port probe to skip expensive process scans when port is already free."""

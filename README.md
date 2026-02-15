@@ -32,15 +32,23 @@ Bu uygulama, Genesys Cloud platformu için gerçek zamanlı dashboard ve geçmi�
 
 ## 🚀 Dağıtım Seçenekleri (Production)
 
-### Bağımsız Çalıştırılabilir Dosya
-GitHub Actions üzerinden her sürüm için otomatik olarak **Linux** ve **Windows** binary'leri oluşturulur.
-- Release sekmesinden indirip doğrudan çalıştırabilirsiniz
-- Python kurulumuna gerek yoktur
+### Docker (GitHub Build -> GHCR)
+GitHub Actions, `ghcr.io/<owner>/genesys-cloud-reporting` imajını otomatik üretir.
+
+Örnek canlı çalıştırma:
+```bash
+IMAGE_REPOSITORY=ghcr.io/<owner>/genesys-cloud-reporting IMAGE_TAG=latest docker compose up -d
+```
+
+### Windows EXE (GitHub Artifact/Release)
+GitHub Actions aynı workflow içinde `GenesysReporting.exe` dosyasını da üretir.
+- Her build sonunda Actions artifact olarak indirilebilir
+- `v*` tag push edildiğinde Release içine otomatik eklenir
 
 ### Windows + IIS Reverse Proxy
 Bu proje Streamlit tabanli oldugu icin IIS'te dogrudan host edilmez, reverse proxy olarak yayinlanir.
 
-1. Uygulamayi sunucuda calistirin (`python run_app.py` veya release binary).
+1. Uygulamayi sunucuda calistirin (`python run_app.py` veya Docker container).
 2. Windows sunucuda su bilesenleri kurulu olmali:
    - IIS + WebSocket Protocol
    - URL Rewrite
@@ -91,6 +99,13 @@ Notlar:
    - `run_app.py` varsayılan olarak sadece kendi Streamlit süreçlerini sonlandırır.
    - 8501 portundaki farklı bir süreci zorla kapatmak için: `GENESYS_FORCE_PORT_CLEANUP=1`
    - Sunucu bind adresini zorlamak için: `GENESYS_SERVER_ADDRESS=0.0.0.0`
+
+6. **Windows Servis Otomatik Kayıt:**
+   - Windows'ta `run_app.py` ilk çalıştırmada kendini servis olarak eklemeyi dener.
+   - Varsayılan: `GENESYS_WINDOWS_SERVICE_AUTO_INSTALL=1`
+   - Servis adı özelleştirme: `GENESYS_WINDOWS_SERVICE_NAME=GenesysReporting`
+   - Startup tipi: `GENESYS_WINDOWS_SERVICE_START_MODE=auto`
+   - Not: Servis oluşturmak için bir kez **Administrator** olarak çalıştırmak gerekir.
 
 ---
 
