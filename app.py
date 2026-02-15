@@ -3543,9 +3543,13 @@ if st.session_state.app_user:
                 st.session_state.org_config = saved_creds # Store for later use (refresh interval etc.)
                 refresh_data_manager_queues()
 
-    # Ensure DataManager is active and in sync on every rerun
+    # Keep DataManager session sync lightweight (throttled)
     if st.session_state.get('api_client') and st.session_state.get('queues_map'):
-        refresh_data_manager_queues()
+        now_ts = pytime.time()
+        last_sync_ts = float(st.session_state.get("_dm_sync_ts", 0) or 0)
+        if (now_ts - last_sync_ts) >= 10:
+            refresh_data_manager_queues()
+            st.session_state["_dm_sync_ts"] = now_ts
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -3609,8 +3613,13 @@ with st.sidebar:
         with dm._lock:
             current_log_count = len(dm.error_log)
             if current_log_count > st.session_state.last_console_log_count:
+                # Avoid rendering too many script tags in one rerun.
+                start_idx = st.session_state.last_console_log_count
+                max_batch = 10
+                if (current_log_count - start_idx) > max_batch:
+                    start_idx = current_log_count - max_batch
                 # Log new errors
-                for i in range(st.session_state.last_console_log_count, current_log_count):
+                for i in range(start_idx, current_log_count):
                     log_to_console(dm.error_log[i])
                 
                 # Update tracker
@@ -3630,7 +3639,7 @@ elif prev_page != page:
     _clear_live_panel_caches(org)
     _clear_page_transient_state()
     st.session_state["_prev_page"] = page
-    st.rerun()
+    # Do not force an extra rerun on page switch; render target page in the same run.
 
 # Block only reports/dashboard if API is missing
 if page in [get_text(lang, "menu_reports"), get_text(lang, "menu_dashboard")] and not st.session_state.api_client:
