@@ -41,9 +41,12 @@ IMAGE_REPOSITORY=ghcr.io/<owner>/genesys-cloud-reporting IMAGE_TAG=latest docker
 ```
 
 ### Windows EXE (GitHub Artifact/Release)
-GitHub Actions aynı workflow içinde `GenesysReporting.exe` dosyasını da üretir.
-- Her build sonunda Actions artifact olarak indirilebilir
-- `v*` tag push edildiğinde Release içine otomatik eklenir
+GitHub Actions her `main/master` push'unda otomatik tag + release üretir.
+- Önce benzersiz bir `v*` tag oluşturulur ve release açılır.
+- Aynı akışta Linux binary (`GenesysReporting-linux`) ve Windows EXE (`GenesysReporting.exe`) build edilir.
+- Dosyalar otomatik olarak bu tag release'ine eklenir.
+- Release/Artifact içinde ayrıca commit izleme için `GenesysReporting-<commit_sha>.exe`, `build-info-linux.txt` ve `build-info-windows.txt` bulunur.
+- Güncellik doğrulaması için `build-info-*.txt` dosyalarındaki `sha` alanını kontrol edin.
 
 ### Windows + IIS Reverse Proxy
 Bu proje Streamlit tabanli oldugu icin IIS'te dogrudan host edilmez, reverse proxy olarak yayinlanir.

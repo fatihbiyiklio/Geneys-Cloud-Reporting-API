@@ -63,6 +63,17 @@ def _normalize_service_bin_path(value):
     return " ".join((value or "").replace('"', "").split()).lower()
 
 
+def _emit_startup_message(log_func, message):
+    try:
+        print(message)
+    except Exception:
+        pass
+    try:
+        log_func(message)
+    except Exception:
+        pass
+
+
 def ensure_windows_service_registration(log_func):
     """Register or sync this app as a Windows service (startup: automatic)."""
     if not platform.system().lower().startswith("win"):
@@ -96,9 +107,12 @@ def ensure_windows_service_registration(log_func):
         )
 
         if needs_bin_update and not is_admin:
-            log_func(
-                f"Windows service '{service_name}' points to a different executable. "
-                "Run once as Administrator to sync it."
+            _emit_startup_message(
+                log_func,
+                (
+                    f"Windows service '{service_name}' points to a different executable. "
+                    "Run once as Administrator to sync it."
+                ),
             )
             return
 
@@ -118,15 +132,15 @@ def ensure_windows_service_registration(log_func):
                 display_name,
             )
             if not ok:
-                log_func(f"Windows service update failed for '{service_name}': {out}")
+                _emit_startup_message(log_func, f"Windows service update failed for '{service_name}': {out}")
                 return
             _run_sc_command("description", service_name, description)
             if needs_bin_update:
-                log_func(f"Windows service executable synced: {service_name}")
+                _emit_startup_message(log_func, f"Windows service executable synced: {service_name}")
         return
 
     if not is_admin:
-        log_func("Windows service auto-install skipped: run once as Administrator.")
+        _emit_startup_message(log_func, "Windows service auto-install skipped: run once as Administrator.")
         return
 
     ok, out = _run_sc_command(
@@ -140,11 +154,48 @@ def ensure_windows_service_registration(log_func):
         display_name,
     )
     if not ok:
-        log_func(f"Windows service create failed for '{service_name}': {out}")
+        _emit_startup_message(log_func, f"Windows service create failed for '{service_name}': {out}")
         return
 
     _run_sc_command("description", service_name, description)
-    log_func(f"Windows service registered: {service_name} (start={start_mode})")
+    _emit_startup_message(log_func, f"Windows service registered: {service_name} (start={start_mode})")
+
+
+def validate_embedded_app_source(app_path, log_func):
+    """Fail fast with a clear message when bundled app.py is stale or invalid."""
+    try:
+        with open(app_path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except Exception as e:
+        _emit_startup_message(log_func, f"Failed to read bundled app source '{app_path}': {e}")
+        return False
+
+    stale_expr = "{'" + "\\u200b" + "' * idx}"
+    if 'out.append(f"{label}' in source and stale_expr in source:
+        _emit_startup_message(
+            log_func,
+            "Bundled app.py contains a known old build with incompatible f-string syntax. "
+            "Download the latest EXE artifact/release and re-run once as Administrator.",
+        )
+        return False
+
+    try:
+        compile(source, app_path, "exec")
+    except SyntaxError as e:
+        _emit_startup_message(
+            log_func,
+            (
+                "Bundled app.py failed syntax validation: "
+                f"{e.msg} (line {e.lineno}, offset {e.offset}). "
+                "This EXE is likely outdated or corrupted."
+            ),
+        )
+        return False
+    except Exception as e:
+        _emit_startup_message(log_func, f"Bundled app.py validation failed unexpectedly: {e}")
+        return False
+
+    return True
 
 def run_streamlit_child():
     """Run Streamlit in child mode inside this process."""
@@ -243,6 +294,8 @@ if __name__ == "__main__":
     ensure_windows_service_registration(log)
     acquire_single_instance_lock()
     app_path = resolve_path("app.py")
+    if not validate_embedded_app_source(app_path, log):
+        sys.exit(1)
     force_port_cleanup = os.environ.get("GENESYS_FORCE_PORT_CLEANUP", "0").strip().lower() in ("1", "true", "yes", "on")
     
     def _is_port_busy(port, host="127.0.0.1", timeout=0.25):
