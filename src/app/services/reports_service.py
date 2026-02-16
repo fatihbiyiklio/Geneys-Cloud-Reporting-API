@@ -812,7 +812,16 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     if any(m in sel_mets_effective for m in p_keys) and is_agent:
                         p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
                         for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime", "nNotResponding"]:
-                            df[pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")] = df["Id"].apply(lambda x: p_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0))
+                            target_col = pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")
+                            fallback_series = df["Id"].apply(
+                                lambda x: p_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0)
+                            )
+                            if target_col not in df.columns:
+                                df[target_col] = fallback_series
+                            else:
+                                existing_numeric = pd.to_numeric(df[target_col], errors="coerce")
+                                keep_existing = existing_numeric.notna() & (existing_numeric != 0)
+                                df[target_col] = existing_numeric.where(keep_existing, fallback_series)
                     
                     if any(m in sel_mets_effective for m in ["col_login", "col_logout"]) and is_agent:
                         u_offset = utc_offset_hours
