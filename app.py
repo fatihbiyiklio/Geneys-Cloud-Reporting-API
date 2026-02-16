@@ -2045,7 +2045,7 @@ def load_credentials(org_code):
         creds = json.loads(cipher.decrypt(data).decode('utf-8'))
         # Ensure default values for new fields
         if "utc_offset" not in creds: creds["utc_offset"] = 3
-        if "refresh_interval" not in creds: creds["refresh_interval"] = 15
+        if "refresh_interval" not in creds: creds["refresh_interval"] = 10
         return creds
     except: return {}
 
@@ -2057,7 +2057,7 @@ def save_credentials(org_code, client_id, client_secret, region, utc_offset=3, *
         "client_secret": client_secret, 
         "region": region,
         "utc_offset": utc_offset,
-        "refresh_interval": kwargs.get("refresh_interval", 15)
+        "refresh_interval": kwargs.get("refresh_interval", 10)
     }).encode('utf-8')
     with open(filename, "wb") as f: f.write(cipher.encrypt(data))
     try: os.chmod(filename, 0o600)
@@ -3290,13 +3290,9 @@ def _update_ivr_calls(org_code, calls, now_ts, max_items=300):
             data = data[:max_items]
         org["ivr_calls_data"] = data
 
-def _resolve_refresh_interval_seconds(org_code=None, minimum=3, default=15):
-    cfg = _resolve_org_config(org_code=org_code, force_reload=False)
-    try:
-        refresh_s = int(cfg.get("refresh_interval", default) or default)
-    except Exception:
-        refresh_s = default
-    return max(minimum, refresh_s)
+def _resolve_refresh_interval_seconds(org_code=None, minimum=3, default=10):
+    # Live metric polling is intentionally fixed at 10 seconds for stability.
+    return max(minimum, 10)
 
 
 def _dashboard_dm_signature(org_code):
@@ -3775,7 +3771,7 @@ def refresh_data_manager_queues():
     # Pass empty dicts ({}) if empty, do NOT fall back to 'None' or full map
     st.session_state.data_manager.update_api_client(st.session_state.api_client, st.session_state.get('presence_map'))
     utc_offset = _resolve_org_utc_offset_hours(org_code=org_code, default=3.0, force_reload=False)
-    refresh_s = _resolve_refresh_interval_seconds(org_code, minimum=1, default=15)
+    refresh_s = _resolve_refresh_interval_seconds(org_code, minimum=10, default=10)
     st.session_state.data_manager.update_settings(utc_offset, refresh_s)
     dm_agent_queues = {} if use_agent_notif else union_agent_queues
     st.session_state.data_manager.start(union_queues, dm_agent_queues)
@@ -5520,7 +5516,14 @@ elif st.session_state.page == get_text(lang, "menu_org_settings") and role == "A
         # UTC Offset
         u_off = st.number_input(get_text(lang, "utc_offset"), value=int(conf.get("utc_offset", 3)), step=1)
         # Refresh Interval
-        ref_i = st.number_input(get_text(lang, "refresh_interval"), value=int(conf.get("refresh_interval", 10)), min_value=1, max_value=300, step=1, help=get_text(lang, "seconds_label"))
+        ref_i = st.number_input(
+            get_text(lang, "refresh_interval"),
+            value=10,
+            min_value=10,
+            max_value=10,
+            step=1,
+            help="Canli metrik yenileme suresi 10 saniye olarak sabitlenmistir.",
+        )
         
         if st.form_submit_button(get_text(lang, "save"), width='stretch'):
             prev_u_off = _resolve_utc_offset_hours(conf.get("utc_offset", 3), default=3.0)
@@ -7078,7 +7081,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
         if st.session_state.dashboard_mode == "Live":
             # DataManager is managed centrally by refresh_data_manager_queues()
             # which is called on login, hot-reload, and config changes.
-            ref_int = _resolve_refresh_interval_seconds(org, minimum=3, default=15)
+            ref_int = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
             if st.session_state.get("dashboard_auto_refresh", True):
                 _safe_autorefresh(interval=ref_int * 1000, key="data_refresh")
         if not st.session_state.get("queues_map"):
@@ -7234,29 +7237,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         obs_map, daily_map, _ = st.session_state.data_manager.get_data(resolved_card_queues)
                         items_live = [obs_map.get(q) for q in resolved_card_queues if obs_map.get(q)]
                         items_daily = [daily_map.get(q) for q in resolved_card_queues if daily_map.get(q)]
-                        # Fallback: if DataManager cache is temporarily empty, fetch directly once.
-                        if (not items_live and not items_daily) and st.session_state.get('api_client'):
-                            queue_ids = [
-                                st.session_state.queues_map.get(q)
-                                for q in resolved_card_queues
-                                if st.session_state.queues_map.get(q)
-                            ]
-                            if queue_ids:
-                                try:
-                                    api = GenesysAPI(st.session_state.api_client)
-                                    id_map = {v: k for k, v in st.session_state.queues_map.items()}
-                                    obs_resp = api.get_queue_observations(queue_ids)
-                                    if obs_resp:
-                                        obs_map = process_observations(obs_resp, id_map, st.session_state.get("presence_map") or {})
-                                        items_live = [obs_map.get(q) for q in resolved_card_queues if obs_map.get(q)]
-                                    start_dt, end_dt = _dashboard_interval_utc("Live", saved_creds)
-                                    interval = f"{start_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                                    daily_resp = api.get_queue_daily_stats(queue_ids, interval=interval)
-                                    if daily_resp:
-                                        daily_map = process_daily_stats(daily_resp, id_map)
-                                        items_daily = [daily_map.get(q) for q in resolved_card_queues if daily_map.get(q)]
-                                except Exception:
-                                    pass
+                        # No per-card direct API fallback in live mode to protect API budget.
                     else:
                         # Fetch historical data via API
                         items_live = []  # No live data for historical
@@ -7328,19 +7309,146 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     avg_handle = (handle_sum / handle_count) if handle_count > 0 else 0
                     avg_wait = (wait_sum / wait_count) if wait_count > 0 else 0
                     
-                    # Live metrics mapping
-                    # Live metrics mapping
-                    
-                    # 1. Fetch Agent Details for selected queues involved in this card
-                    card_agent_data = st.session_state.data_manager.get_agent_details(resolved_card_queues)
-                    
-                    # 2. Flatten and Deduplicate Agents
-                    unique_agents = {}
-                    for q_agents in card_agent_data.values():
-                        for agent in q_agents:
-                            unique_agents[agent['id']] = agent
-                            
-                    # 3. Calculate Counts from Unique Agents
+                    # Live metrics mapping (Genesys API aligned, low-API model):
+                    # 1) Queue observations => waiting/interacting queue counts
+                    # 2) Routing activity entities => deduped agent states per userId
+                    def _safe_int(v):
+                        try:
+                            return int(v or 0)
+                        except Exception:
+                            return 0
+
+                    def _obs_onqueue_total(item):
+                        base = _safe_int(item.get("OnQueue", 0))
+                        idle_v = _safe_int(item.get("OnQueueIdle", 0))
+                        int_v = _safe_int(item.get("OnQueueInteracting", 0))
+                        return base if base > 0 else (idle_v + int_v)
+
+                    obs_waiting = sum(get_media_sum(d, 'Waiting') for d in items_live) if items_live else 0
+                    obs_interacting = sum(get_media_sum(d, 'Interacting') for d in items_live) if items_live else 0
+                    obs_onqueue_max = max((_obs_onqueue_total(d) for d in items_live), default=0) if items_live else 0
+                    obs_idle_max = max((_safe_int(d.get("OnQueueIdle", 0)) for d in items_live), default=0) if items_live else 0
+
+                    presence_defs = st.session_state.get("presence_map") or {}
+
+                    def _entity_ts(entity):
+                        try:
+                            raw = entity.get("activity_date") or entity.get("activityDate")
+                            if not raw:
+                                return 0.0
+                            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            return 0.0
+
+                    def _routing_status_token(value):
+                        return str(value or "").strip().upper().replace(" ", "_")
+
+                    def _routing_is_onqueue(value):
+                        token = _routing_status_token(value)
+                        if not token or token in {"OFF_QUEUE", "OFFLINE"}:
+                            return False
+                        return True
+
+                    def _routing_status_rank(value):
+                        token = _routing_status_token(value)
+                        if token in {"INTERACTING", "COMMUNICATING"}:
+                            return 4
+                        if token == "IDLE":
+                            return 3
+                        if token in {"NOT_RESPONDING", "ON_QUEUE"}:
+                            return 2
+                        if _routing_is_onqueue(token):
+                            return 1
+                        return 0
+
+                    def _presence_bucket(entity):
+                        org_presence_id = str(
+                            entity.get("organization_presence_id")
+                            or entity.get("organizationPresenceId")
+                            or ""
+                        ).strip()
+                        system_presence = str(
+                            entity.get("system_presence")
+                            or entity.get("systemPresence")
+                            or ""
+                        ).strip()
+
+                        mapped_label = ""
+                        mapped_system = ""
+                        if org_presence_id and org_presence_id in presence_defs:
+                            p_info = presence_defs.get(org_presence_id)
+                            if isinstance(p_info, dict):
+                                mapped_label = str(p_info.get("label") or "").strip()
+                                mapped_system = str(p_info.get("systemPresence") or "").strip()
+                            else:
+                                mapped_label = str(p_info or "").strip()
+
+                        raw = " ".join([
+                            mapped_label.lower(),
+                            mapped_system.lower(),
+                            system_presence.lower(),
+                        ]).strip()
+
+                        if "break" in raw:
+                            return "Break"
+                        if "meal" in raw:
+                            return "Meal"
+                        if "meeting" in raw:
+                            return "Meeting"
+                        if "training" in raw:
+                            return "Training"
+                        if "away" in raw:
+                            return "Away"
+                        if "busy" in raw or "do not disturb" in raw or "dnd" in raw:
+                            return "Busy"
+                        if "available" in raw:
+                            return "Available"
+                        return None
+
+                    routing_snapshot_by_queue = {}
+                    try:
+                        routing_snapshot_by_queue = st.session_state.data_manager.get_routing_activity(resolved_card_queues) or {}
+                    except Exception:
+                        routing_snapshot_by_queue = {}
+
+                    routing_users_dedup = {}
+                    for q_name in resolved_card_queues:
+                        q_entities = routing_snapshot_by_queue.get(q_name) or {}
+                        if not isinstance(q_entities, dict) or not q_entities:
+                            continue
+                        for uid, entity in q_entities.items():
+                            uid_s = str(uid or "").strip()
+                            if not uid_s:
+                                continue
+                            curr = dict(entity or {})
+                            curr.setdefault("user_id", uid_s)
+                            prev = routing_users_dedup.get(uid_s)
+                            if not prev:
+                                routing_users_dedup[uid_s] = curr
+                                continue
+                            prev_rank = _routing_status_rank(prev.get("routing_status"))
+                            curr_rank = _routing_status_rank(curr.get("routing_status"))
+                            if curr_rank > prev_rank:
+                                routing_users_dedup[uid_s] = curr
+                                continue
+                            if curr_rank == prev_rank and _entity_ts(curr) >= _entity_ts(prev):
+                                routing_users_dedup[uid_s] = curr
+
+                    routing_has_payload = bool(routing_users_dedup)
+                    obs_pres_max = {
+                        "Available": 0,
+                        "Busy": 0,
+                        "Away": 0,
+                        "Break": 0,
+                        "Meal": 0,
+                        "Meeting": 0,
+                        "Training": 0,
+                    }
+                    for d in items_live:
+                        pres = d.get("Presences") or {}
+                        for k in obs_pres_max.keys():
+                            obs_pres_max[k] = max(obs_pres_max[k], _safe_int(pres.get(k, 0)))
+
                     cnt_interacting = 0
                     cnt_idle = 0
                     cnt_on_queue = 0
@@ -7351,36 +7459,75 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     cnt_meal = 0
                     cnt_meeting = 0
                     cnt_training = 0
-                    
-                    for m in unique_agents.values():
-                        user_obj = m.get('user', {})
-                        presence = user_obj.get('presence', {}).get('presenceDefinition', {}).get('systemPresence', 'OFFLINE').upper()
-                        routing = m.get('routingStatus', {}).get('status', 'OFF_QUEUE').upper()
-                        
-                        # Logic must match the status text logic we fixed earlier
-                        if presence == 'AVAILABLE':
-                            cnt_available += 1
-                        elif presence in ['ON_QUEUE', 'ON QUEUE']:
-                            # On Queue Logic
-                            if routing in ['INTERACTING', 'COMMUNICATING']:
+
+                    if routing_has_payload:
+                        has_routing_status = False
+                        has_presence_details = False
+                        for entity in routing_users_dedup.values():
+                            routing_status = _routing_status_token(entity.get("routing_status"))
+                            if routing_status:
+                                has_routing_status = True
+                            if routing_status in {"INTERACTING", "COMMUNICATING"}:
                                 cnt_interacting += 1
-                                cnt_on_queue += 1 # Technically on queue
-                            elif routing == 'IDLE':
-                                cnt_idle += 1 # Ready
+                            if routing_status == "IDLE":
+                                cnt_idle += 1
+                            if _routing_is_onqueue(routing_status):
                                 cnt_on_queue += 1
-                            elif routing == 'NOT_RESPONDING':
-                                cnt_on_queue += 1 
-                            else:
-                                cnt_on_queue += 1
-                        elif presence == "BUSY": cnt_busy += 1
-                        elif presence == "AWAY": cnt_away += 1
-                        elif presence == "BREAK": cnt_break += 1
-                        elif presence == "MEAL": cnt_meal += 1
-                        elif presence == "MEETING": cnt_meeting += 1
-                        elif presence == "TRAINING": cnt_training += 1
-    
+                            bucket = _presence_bucket(entity)
+                            if bucket:
+                                has_presence_details = True
+                            if bucket == "Available":
+                                cnt_available += 1
+                            elif bucket == "Busy":
+                                cnt_busy += 1
+                            elif bucket == "Away":
+                                cnt_away += 1
+                            elif bucket == "Break":
+                                cnt_break += 1
+                            elif bucket == "Meal":
+                                cnt_meal += 1
+                            elif bucket == "Meeting":
+                                cnt_meeting += 1
+                            elif bucket == "Training":
+                                cnt_training += 1
+
+                        # Queue metriclerinde interacting her zaman on-queue kapsaminda olmalidir.
+                        cnt_on_queue = max(cnt_on_queue, cnt_interacting)
+
+                        # Routing detaylari eksik gelirse observation degerlerine geri don.
+                        if not has_routing_status:
+                            cnt_interacting = obs_interacting
+                            cnt_on_queue = max(cnt_interacting, obs_onqueue_max)
+                            cnt_idle = obs_idle_max
+                        else:
+                            if cnt_on_queue == 0 and obs_onqueue_max > 0:
+                                cnt_on_queue = max(cnt_interacting, obs_onqueue_max)
+                            if cnt_idle == 0 and obs_idle_max > 0:
+                                cnt_idle = obs_idle_max
+
+                        if not has_presence_details:
+                            cnt_available = obs_pres_max["Available"]
+                            cnt_busy = obs_pres_max["Busy"]
+                            cnt_away = obs_pres_max["Away"]
+                            cnt_break = obs_pres_max["Break"]
+                            cnt_meal = obs_pres_max["Meal"]
+                            cnt_meeting = obs_pres_max["Meeting"]
+                            cnt_training = obs_pres_max["Training"]
+                    else:
+                        # Fallback to queue observations when routing detail payload is unavailable.
+                        cnt_interacting = obs_interacting
+                        cnt_on_queue = max(cnt_interacting, obs_onqueue_max)
+                        cnt_idle = obs_idle_max
+                        cnt_available = obs_pres_max["Available"]
+                        cnt_busy = obs_pres_max["Busy"]
+                        cnt_away = obs_pres_max["Away"]
+                        cnt_break = obs_pres_max["Break"]
+                        cnt_meal = obs_pres_max["Meal"]
+                        cnt_meeting = obs_pres_max["Meeting"]
+                        cnt_training = obs_pres_max["Training"]
+
                     live_values = {
-                        "Waiting": sum(get_media_sum(d, 'Waiting') for d in items_live) if items_live else 0,
+                        "Waiting": obs_waiting,
                         "Interacting": cnt_interacting,
                         "Idle Agent": cnt_idle,
                         "On Queue": cnt_on_queue,
@@ -7408,8 +7555,8 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     card_cache = st.session_state.get("_dashboard_card_last_by_target", {})
                     if not isinstance(card_cache, dict):
                         card_cache = {}
-                    refresh_s_local = _resolve_refresh_interval_seconds(org, minimum=3, default=15)
-                    fallback_ttl = max(30, int(refresh_s_local) * 4)
+                    refresh_s_local = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
+                    fallback_ttl = 20
                     mode = st.session_state.get("dashboard_mode", "Live")
                     if mode == "Date":
                         mode_sig = f"Date:{st.session_state.get('dashboard_date', datetime.today()).isoformat()}"
@@ -7418,7 +7565,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     media_sig = ",".join(sorted(str(m).strip().lower() for m in (selected_media or []) if m))
                     queue_sig = ",".join(sorted(str(q).strip().lower() for q in resolved_card_queues))
                     card_cache_key = f"v2|mode:{mode_sig}|card:{card.get('id')}|q:{queue_sig}|media:{media_sig}"
-                    has_source_data = bool(items_daily) if mode != "Live" else bool(items_live or items_daily or unique_agents)
+                    has_source_data = bool(items_daily) if mode != "Live" else bool(items_live or items_daily or routing_has_payload)
                     if has_source_data:
                         card_cache[card_cache_key] = {
                             "ts": now_ts,
@@ -7724,7 +7871,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     all_user_ids = sorted(users_info_map.keys())
 
                 # Seed from API if notifications cache is empty/stale
-                refresh_s = _resolve_refresh_interval_seconds(org, minimum=3, default=15)
+                refresh_s = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
                 shared_ts, shared_presence, shared_routing = _get_shared_agent_seed(org)
                 last_msg = getattr(agent_notif, "last_message_ts", 0)
                 last_evt = getattr(agent_notif, "last_event_ts", 0)
@@ -7857,7 +8004,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 agent_cache = st.session_state.get("_agent_panel_last_by_filter", {})
                 if not isinstance(agent_cache, dict):
                     agent_cache = {}
-                fallback_ttl = max(60, int(refresh_s) * 6)
+                fallback_ttl = 20
                 if all_members:
                     agent_cache[agent_cache_key] = {"ts": now_ts, "data": list(all_members)}
                     if len(agent_cache) > 20:
@@ -8052,9 +8199,12 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             selected_media_filters = selected_filter_set.intersection(full_media_filter_set)
             is_filter_none = len(selected_filter_set) == 0
             is_filter_all = (
-                selected_direction_filters == full_direction_filter_set
-                and selected_state_filters == full_state_filter_set
-                and selected_media_filters == full_media_filter_set
+                is_filter_none
+                or (
+                    selected_direction_filters == full_direction_filter_set
+                    and selected_state_filters == full_state_filter_set
+                    and selected_media_filters == full_media_filter_set
+                )
             )
             group_queues_lower = set()
             if selected_group != "Hepsi (All)":
@@ -8073,7 +8223,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
             elif not st.session_state.get('api_client'):
                 st.warning(get_text(lang, "genesys_not_connected"))
             else:
-                refresh_s = _resolve_refresh_interval_seconds(org, minimum=3, default=15)
+                refresh_s = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
                 now_ts = pytime.time()
                 queue_id_to_name = {v: k for k, v in st.session_state.queues_map.items()}
 
@@ -8248,9 +8398,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                     ]
                 if hide_mevcut:
                     waiting_calls = [c for c in waiting_calls if "mevcut" not in (c.get("queue_name") or "").lower()]
-                if is_filter_none:
-                    waiting_calls = []
-                elif not is_filter_all:
+                if not is_filter_all:
                     waiting_calls = [
                         c for c in waiting_calls
                         if _call_matches_filters(
@@ -8283,7 +8431,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                 call_cache = st.session_state.get("_call_panel_last_by_filter", {})
                 if not isinstance(call_cache, dict):
                     call_cache = {}
-                fallback_ttl = max(60, int(refresh_s) * 6)
+                fallback_ttl = 20
                 if waiting_calls:
                     call_cache[call_cache_key] = {"ts": now_ts, "data": list(waiting_calls)}
                     if len(call_cache) > 20:
@@ -8292,7 +8440,7 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                             call_cache.pop(k, None)
                     st.session_state["_call_panel_last_by_filter"] = call_cache
                 else:
-                    if not is_filter_none:
+                    if is_filter_all or selected_filter_set:
                         cached = call_cache.get(call_cache_key) or {}
                         if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
                             waiting_calls = list(cached.get("data") or [])

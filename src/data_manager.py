@@ -14,6 +14,7 @@ class DataManager:
     MAX_AGENT_DETAILS_CACHE = 50   # Max queues for agent details (reduced from 100)
     MAX_OBS_DATA_CACHE = 100       # Max queues for observations cache (reduced from 200)
     MAX_DAILY_DATA_CACHE = 100     # Max queues for daily stats cache (reduced from 200)
+    MAX_ROUTING_ACTIVITY_CACHE = 100  # Max queues for routing activity cache
     CACHE_CLEANUP_INTERVAL = 120   # 2 minutes (reduced from 5 minutes)
     
     def __init__(self, api_client=None, presence_map=None):
@@ -28,6 +29,7 @@ class DataManager:
         # Data storage
         self.obs_data_cache = {}
         self.daily_data_cache = {}
+        self.routing_activity_cache = {}
         self.agent_details_cache = {}
         self.queue_members_cache = {} 
         self.last_member_refresh = 0
@@ -81,6 +83,7 @@ class DataManager:
         # Clear caches on stop to free memory
         self.obs_data_cache = {}
         self.daily_data_cache = {}
+        self.routing_activity_cache = {}
         self.agent_details_cache = {}
         self.queue_members_cache = {}
         self.error_log = []
@@ -127,6 +130,15 @@ class DataManager:
         now_local = datetime.now(org_tz)
         start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         return start_local.astimezone(timezone.utc), now_local.astimezone(timezone.utc)
+
+    @staticmethod
+    def _parse_iso_ts(value):
+        if not value:
+            return 0.0
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
 
     def _update_loop(self):
         while not self.stop_event.is_set():
@@ -179,6 +191,16 @@ class DataManager:
                     keys_to_remove = list(self.daily_data_cache.keys())[:-self.MAX_DAILY_DATA_CACHE]
                     for k in keys_to_remove:
                         self.daily_data_cache.pop(k, None)
+
+            # Trim routing_activity_cache - remove entries for queues no longer monitored
+            if self.routing_activity_cache:
+                stale_routing_keys = [k for k in self.routing_activity_cache.keys() if k not in active_queue_names]
+                for k in stale_routing_keys:
+                    self.routing_activity_cache.pop(k, None)
+                if len(self.routing_activity_cache) > self.MAX_ROUTING_ACTIVITY_CACHE:
+                    keys_to_remove = list(self.routing_activity_cache.keys())[:-self.MAX_ROUTING_ACTIVITY_CACHE]
+                    for k in keys_to_remove:
+                        self.routing_activity_cache.pop(k, None)
 
             # Trim queue_members_cache to max size
             if len(self.queue_members_cache) > self.MAX_QUEUE_MEMBERS_CACHE:
@@ -238,8 +260,65 @@ class DataManager:
             with self._lock:
                 self.obs_data_cache = {}
 
-        # 2. Daily Stats (fetch less frequently to reduce API load)
-        if q_ids and (current_time - last_daily_refresh >= 60):
+        # 1.5 Routing activity (queue-scoped user routing/presence details for deduped agent metrics)
+        if q_ids:
+            try:
+                routing_response = self.api.get_routing_activity(q_ids)
+                routing_results = None
+                if isinstance(routing_response, dict):
+                    routing_results = routing_response.get("results")
+
+                # Update cache only if request succeeded (results may be empty list).
+                # If request fails (None), keep previous cache to avoid false zero states.
+                if routing_results is not None:
+                    rebuilt = {q_name: {} for q_name in monitored_queue_names}
+                    for result in routing_results:
+                        group = result.get("group") or {}
+                        q_id = group.get("queueId") or group.get("queue_id")
+                        q_name = id_map.get(q_id)
+                        if not q_name:
+                            continue
+
+                        entities = result.get("entities") or []
+                        q_users = rebuilt.setdefault(q_name, {})
+                        for ent in entities:
+                            uid = str(ent.get("userId") or ent.get("user_id") or "").strip()
+                            if not uid:
+                                continue
+
+                            normalized = {
+                                "user_id": uid,
+                                "queue_id": q_id,
+                                "routing_status": ent.get("routingStatus") or ent.get("routing_status"),
+                                "system_presence": ent.get("systemPresence") or ent.get("system_presence"),
+                                "organization_presence_id": ent.get("organizationPresenceId") or ent.get("organization_presence_id"),
+                                "activity_date": ent.get("activityDate") or ent.get("activity_date"),
+                            }
+
+                            prev = q_users.get(uid) or {}
+                            prev_ts = self._parse_iso_ts(prev.get("activity_date"))
+                            curr_ts = self._parse_iso_ts(normalized.get("activity_date"))
+                            if prev and (curr_ts < prev_ts):
+                                continue
+                            q_users[uid] = normalized
+
+                    with self._lock:
+                        merged = {q: v for q, v in self.routing_activity_cache.items() if q not in monitored_queue_names}
+                        merged.update(rebuilt)
+                        self.routing_activity_cache = merged
+            except Exception as e:
+                self._log_error(f"Routing activity refresh error: {e}")
+        else:
+            with self._lock:
+                self.routing_activity_cache = {}
+
+        # 2. Daily Stats
+        # Keep daily metrics in sync with live refresh cadence (minimum 10s).
+        try:
+            daily_refresh_s = max(10, int(self.refresh_interval))
+        except Exception:
+            daily_refresh_s = 10
+        if q_ids and (current_time - last_daily_refresh >= daily_refresh_s):
             try:
                 start_utc, end_utc = self._local_today_utc_interval()
                 query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
@@ -373,6 +452,16 @@ class DataManager:
             daily = {q: self.daily_data_cache.get(q) for q in requested_queues if q in self.daily_data_cache}
             last_update = self.last_update_time
         return obs, daily, last_update
+
+    def get_routing_activity(self, requested_queues):
+        with self._lock:
+            routing = {}
+            for q in requested_queues:
+                if q not in self.routing_activity_cache:
+                    continue
+                q_rows = self.routing_activity_cache.get(q) or {}
+                routing[q] = {uid: dict(row or {}) for uid, row in q_rows.items()}
+        return routing
 
     def get_agent_details(self, requested_queues):
         with self._lock:

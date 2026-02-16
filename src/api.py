@@ -1810,6 +1810,43 @@ class GenesysAPI:
         # Return a structure that matches the SDK response for consistency
         return {"results": all_results} if all_results else None
 
+    def get_routing_activity(self, queue_ids):
+        """
+        Queue-scoped routing activity with per-user details.
+        Endpoint: POST /api/v2/analytics/routing/activity/query
+        """
+        if not queue_ids:
+            return {"results": []}
+
+        CHUNK_SIZE = 100
+        all_results = []
+        success_any = False
+        chunks = [queue_ids[i:i + CHUNK_SIZE] for i in range(0, len(queue_ids), CHUNK_SIZE)]
+
+        for chunk in chunks:
+            predicates = [{"type": "dimension", "dimension": "queueId", "value": qid} for qid in chunk]
+            query = {
+                "groupBy": ["queueId"],
+                "filter": {"type": "or", "predicates": predicates},
+                "metrics": [
+                    {"metric": "oOnQueueUsers", "details": True},
+                    {"metric": "oUserPresences", "details": True},
+                    {"metric": "oUserRoutingStatuses", "details": True},
+                ],
+                "order": "desc",
+            }
+            try:
+                data = self._post("/api/v2/analytics/routing/activity/query", query)
+                success_any = True
+                if isinstance(data, dict) and isinstance(data.get("results"), list):
+                    all_results.extend(data.get("results") or [])
+            except Exception as e:
+                monitor.log_error("API_POST", f"Error: Routing activity query failed. {e}")
+
+        if success_any:
+            return {"results": all_results}
+        return None
+
     def get_queue_daily_stats(self, queue_ids, interval=None):
         if not interval:
             now_utc = datetime.now(timezone.utc)
