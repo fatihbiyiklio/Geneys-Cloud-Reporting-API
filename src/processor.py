@@ -1,5 +1,6 @@
 import pandas as pd
 from datetime import datetime, timedelta
+import math
 def format_report_username(raw_username=None, fallback=None):
     if raw_username:
         local = str(raw_username).split("@")[0].strip()
@@ -205,6 +206,9 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                     row[count_metric_name] = stats.get('count', 0)
                     if m_name == "tHandle": row["CountHandle"] = stats.get('count', 0)
                     if m_name == "tAlert": row["nAlert"] = stats.get('count', 0)
+                    if m_name == "tTalk":
+                        talk_max = stats.get('max', 0) / 1000
+                        row["_tTalkMax"] = max(float(row.get("_tTalkMax", 0) or 0), float(talk_max or 0))
                 elif m_name.startswith("n") or m_name.startswith("o"):
                     val = stats.get('count', 0)
                 
@@ -243,7 +247,10 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             group_cols.insert(0, "Interval")
             
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-        df = df.groupby(group_cols)[numeric_cols].sum().reset_index()
+        agg_map = {col: "sum" for col in numeric_cols}
+        if "_tTalkMax" in agg_map:
+            agg_map["_tTalkMax"] = "max"
+        df = df.groupby(group_cols).agg(agg_map).reset_index()
 
         if "_oServiceLevelNumerator" in df.columns and "_oServiceLevelDenominator" in df.columns:
             df["oServiceLevel"] = df.apply(
@@ -260,8 +267,22 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         
         if "tHandle" in df.columns and "CountHandle" in df.columns:
             df["AvgHandle"] = df.apply(lambda x: x["tHandle"] / x["CountHandle"] if x["CountHandle"] > 0 else 0, axis=1).round(2)
+        if "tTalk" in df.columns:
+            talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
+            talk_count = pd.to_numeric(df.get("nTalk", 0), errors="coerce").fillna(0)
+            if "nAnswered" in df.columns:
+                talk_count = talk_count.where(talk_count > 0, pd.to_numeric(df["nAnswered"], errors="coerce").fillna(0))
+            if "nHandled" in df.columns:
+                talk_count = talk_count.where(talk_count > 0, pd.to_numeric(df["nHandled"], errors="coerce").fillna(0))
+            safe_count = talk_count.where(talk_count > 0, talk_sum.gt(0).astype("float64"))
+            df["tAverageTalk"] = talk_sum.divide(safe_count.where(safe_count > 0), fill_value=0).fillna(0).round(2)
+        if "_tTalkMax" in df.columns:
+            df["tLongestTalk"] = pd.to_numeric(df["_tTalkMax"], errors="coerce").fillna(0).round(2)
+        if "tTalk" in df.columns:
+            # Alias to support chat-focused reports when media filter is chat/message.
+            df["tChatTalk"] = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0).round(2)
 
-        helper_cols = ["ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator"]
+        helper_cols = ["ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 
@@ -272,8 +293,15 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
     return df
 
 def format_seconds_to_hms(val):
-    if pd.isna(val) or val == 0: return "00:00:00"
-    seconds = int(round(val))
+    if pd.isna(val):
+        return "00:00:00"
+    try:
+        num = float(val)
+    except Exception:
+        return "00:00:00"
+    if not math.isfinite(num) or num <= 0:
+        return "00:00:00"
+    seconds = int(round(num))
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"

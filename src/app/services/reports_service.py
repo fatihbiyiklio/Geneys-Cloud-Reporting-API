@@ -7,6 +7,20 @@ def render_reports_service(context: Dict[str, Any]) -> None:
     """Render reports page using injected app context."""
     bind_context(globals(), context)
     st.title(get_text(lang, "menu_reports"))
+
+    def _is_table_view_state_payload_key(state_key: Any) -> bool:
+        if not (isinstance(state_key, str) and state_key.startswith("_report_table_view_")):
+            return False
+        widget_suffixes = (
+            "_move_col",
+            "_move_up",
+            "_move_down",
+            "_move_reset",
+            "_cfg",
+            "_sort_col",
+            "_sort_dir",
+        )
+        return not any(state_key.endswith(sfx) for sfx in widget_suffixes)
     # --- SAVED VIEWS (Compact) ---
     with st.expander(f"📂 {get_text(lang, 'saved_views')}", expanded=False):
         presets = load_presets(org)
@@ -31,7 +45,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     table_states = p.get("table_view_states")
                     if isinstance(table_states, dict):
                         for state_key, state_val in table_states.items():
-                            if not (isinstance(state_key, str) and state_key.startswith("_report_table_view_")):
+                            if not _is_table_view_state_payload_key(state_key):
                                 continue
                             if isinstance(state_val, dict):
                                 st.session_state[state_key] = json.loads(
@@ -63,7 +77,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 # Persist all known report table states so every saved view keeps layout/sort choices.
                 safe_table_states = {}
                 for state_key, state_val in st.session_state.items():
-                    if not (isinstance(state_key, str) and state_key.startswith("_report_table_view_")):
+                    if not _is_table_view_state_payload_key(state_key):
                         continue
                     if not isinstance(state_val, dict):
                         continue
@@ -207,6 +221,18 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         # Metrics Selection
         user_metrics = st.session_state.app_user.get('metrics', [])
         selection_options = user_metrics if user_metrics and role != "Admin" else ALL_METRICS
+        # Ensure newly added derived metrics are visible even for users with legacy metric permission sets.
+        always_visible_metrics = ["tLongestTalk", "tAverageTalk", "tChatTalk", "tBreak", "oEfficiency"]
+        for m in always_visible_metrics:
+            if m not in selection_options and m in ALL_METRICS:
+                selection_options.append(m)
+        if r_type == "report_queue":
+            # Queue aggregate endpoint does not provide agent presence/login derived metrics.
+            queue_incompatible_metrics = {
+                "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue",
+                "tBreak", "oEfficiency", "col_staffed_time", "col_login", "col_logout",
+            }
+            selection_options = [m for m in selection_options if m not in queue_incompatible_metrics]
         
         if r_type not in ["interaction_search", "chat_detail", "missed_interactions"]:
             if "last_metrics" in st.session_state and st.session_state.last_metrics:
@@ -236,7 +262,8 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             and pd.api.types.is_numeric_dtype(df_out[c])
         ]
         for col in target_cols:
-            df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).round(0).astype("int64")
+            numeric = pd.to_numeric(df_out[col], errors="coerce").replace([float("inf"), float("-inf")], 0)
+            df_out[col] = numeric.fillna(0).round(0).astype("int64")
         return df_out
 
     report_rendered_this_run = False
@@ -674,6 +701,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 # Queue aggregate endpoint does not return agent presence/login-style metrics.
                 queue_incompatible_metrics = {
                     "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue",
+                    "tBreak", "oEfficiency",
                     "col_staffed_time", "col_login", "col_logout",
                 }
                 dropped_queue_metrics = [m for m in sel_mets_effective if m in queue_incompatible_metrics]
@@ -808,7 +836,10 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     df = pd.DataFrame(agent_data)
                 
                 if not df.empty:
-                    p_keys = ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "col_staffed_time", "nNotResponding"]
+                    p_keys = [
+                        "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining",
+                        "tOnQueue", "tBreak", "oEfficiency", "col_staffed_time", "nNotResponding",
+                    ]
                     if any(m in sel_mets_effective for m in p_keys) and is_agent:
                         p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
                         for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime", "nNotResponding"]:
@@ -828,6 +859,51 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), utc_offset=u_offset)
                         if "col_login" in sel_mets: df["col_login"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
                         if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
+
+                    # Derived/custom metrics requested from report UI.
+                    selected_metric_set = set(sel_mets_effective or [])
+                    def _metric_series_or_zero(col_name):
+                        if col_name in df.columns:
+                            return pd.to_numeric(df[col_name], errors="coerce").fillna(0)
+                        return pd.Series(0, index=df.index, dtype="float64")
+
+                    if "tLongestTalk" in selected_metric_set:
+                        if "tLongestTalk" in df.columns:
+                            df["tLongestTalk"] = pd.to_numeric(df["tLongestTalk"], errors="coerce").fillna(0).round(2)
+                        elif "_tTalkMax" in df.columns:
+                            df["tLongestTalk"] = pd.to_numeric(df["_tTalkMax"], errors="coerce").fillna(0).round(2)
+                        elif "tTalk" in df.columns:
+                            df["tLongestTalk"] = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0).round(2)
+                    if "tAverageTalk" in selected_metric_set:
+                        if "tAverageTalk" in df.columns:
+                            df["tAverageTalk"] = pd.to_numeric(df["tAverageTalk"], errors="coerce").fillna(0).round(2)
+                        else:
+                            talk_sum = _metric_series_or_zero("tTalk")
+                            talk_count = _metric_series_or_zero("nTalk")
+                            talk_count = talk_count.where(talk_count > 0, _metric_series_or_zero("nAnswered"))
+                            talk_count = talk_count.where(talk_count > 0, _metric_series_or_zero("nHandled"))
+                            safe_count = talk_count.where(talk_count > 0, talk_sum.gt(0).astype("float64"))
+                            df["tAverageTalk"] = talk_sum.divide(safe_count.where(safe_count > 0), fill_value=0).fillna(0).round(2)
+                    if "tBreak" in selected_metric_set:
+                        break_parts = [
+                            _metric_series_or_zero("tAway"),
+                            _metric_series_or_zero("tMeal"),
+                            _metric_series_or_zero("tMeeting"),
+                            _metric_series_or_zero("tTraining"),
+                        ]
+                        df["tBreak"] = sum(break_parts).round(2)
+                    if "oEfficiency" in selected_metric_set:
+                        handle_sum = _metric_series_or_zero("tHandle")
+                        staffed_sum = (
+                            _metric_series_or_zero("col_staffed_time")
+                            if "col_staffed_time" in df.columns
+                            else _metric_series_or_zero("tOnQueue")
+                        )
+                        df["oEfficiency"] = (
+                            handle_sum.divide(staffed_sum.where(staffed_sum > 0), fill_value=0).fillna(0) * 100
+                        ).round(2)
+                    if "tChatTalk" in selected_metric_set:
+                        df["tChatTalk"] = _metric_series_or_zero("tTalk").round(2)
 
                     if do_fill and gran_opt[sel_gran] != "P1D": df = fill_interval_gaps(df, datetime.combine(sd, st_), datetime.combine(ed, et), gran_opt[sel_gran])
 

@@ -1706,6 +1706,11 @@ class GenesysAPI:
                 elif m == "nAlert": new_mets.append("tAlert")
                 elif m == "nConsultTransferred": new_mets.append("nConsultTransferred")
                 elif m == "AvgHandle": new_mets.append("tHandle")
+                elif m == "tLongestTalk": new_mets.append("tTalk")
+                elif m == "tAverageTalk": new_mets.append("tTalk")
+                elif m == "tChatTalk": new_mets.append("tTalk")
+                elif m == "tBreak": new_mets.append("tHandle")
+                elif m == "oEfficiency": new_mets.append("tHandle")
                 else: new_mets.append(m)
             return list(set(new_mets))
 

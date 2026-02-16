@@ -318,14 +318,25 @@ def _normalize_report_table_state(df, state):
         return {"order": [], "visible": [], "sort_by": "", "ascending": True}
 
     raw = state if isinstance(state, dict) else {}
-    order = [c for c in (raw.get("order") or []) if c in cols]
+    raw_order = [c for c in (raw.get("order") or []) if c in cols]
+    order = list(raw_order)
     for col in cols:
         if col not in order:
             order.append(col)
 
-    visible = [c for c in (raw.get("visible") or []) if c in order]
+    raw_visible = [c for c in (raw.get("visible") or []) if c in order]
+    visible = list(raw_visible)
     if not visible:
         visible = list(order)
+    else:
+        # Keep previously hidden columns hidden. Only auto-show truly new columns
+        # that did not exist in the persisted column order.
+        visible_set = set(visible)
+        prior_order_set = set(raw_order)
+        for col in order:
+            if col not in prior_order_set and col not in visible_set:
+                visible.append(col)
+                visible_set.add(col)
 
     sort_by = str(raw.get("sort_by") or "")
     if sort_by not in cols:

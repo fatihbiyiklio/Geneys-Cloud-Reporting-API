@@ -33,6 +33,11 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 | `nAlert` | `tAlert` | Sayı olarak `tAlert.count` |
 | `nConsultTransferred` | `nConsultTransferred` | Doğrudan |
 | `AvgHandle` | `tHandle` | Sonradan `AvgHandle` hesaplanır |
+| `tLongestTalk` | `tTalk` | `tTalk.stats.max` üzerinden türetilir (sn) |
+| `tAverageTalk` | `tTalk` | `tTalk / ntTalk` ile türetilir (sn) |
+| `tChatTalk` | `tTalk` | Chat medya filtresiyle kullanıldığında chat konuşma süresi olarak yorumlanır |
+| `tBreak` | `tHandle` | API çağrısı için taşıyıcı metric; değer user aggregate’dan türetilir |
+| `oEfficiency` | `tHandle` | API çağrısı için taşıyıcı metric; oran uygulamada hesaplanır |
 
 ## 4) Raporlarda Kullanılan Metrikler (Seçilebilir)
 
@@ -53,6 +58,10 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 `tFirstEngagement`, `tFirstResponse`, `tIvr`, `tMonitoring`, `tMonitoringComplete`,  
 `tNotResponding`, `tPark`, `tParkComplete`, `tScreenMonitoring`, `tShortAbandon`,  
 `tSnippetRecord`, `tUserResponseTime`
+
+Uygulama türevi (hesaplanan) metrikler:
+
+`tLongestTalk`, `tAverageTalk`, `tChatTalk`, `tBreak`, `oEfficiency`
 
 ### 4.2 Kullanıcı Durum/Operasyon Metrikleri
 
@@ -186,6 +195,9 @@ Uygulama çıktısı:
 | `tAnswered` | Cevaplanmaya kadar geçen toplam süre (sum). |
 | `tAbandon` | Terk edilen etkileşimlerin toplam bekleme süresi. |
 | `tTalk` | Konuşma süresi toplamı. |
+| `tLongestTalk` | Interval bazında en uzun konuşma süresi (`tTalk.stats.max` türevi). |
+| `tAverageTalk` | Ortalama konuşma süresi (`tTalk / ntTalk`). |
+| `tChatTalk` | `tTalk` alias’ı; chat filtresi ile chat görüşme süresi olarak kullanılır. |
 | `tOutbound` | Uygulama alias’ı; `tTalk` üzerinden türetilir. |
 | `tAcw` | After Call Work (çağrı sonrası işlem) toplam süresi. |
 | `tHandle` | Toplam handle süresi (talk+hold+acw vb.). |
@@ -237,6 +249,7 @@ Uygulama çıktısı:
 | `oMessageCount` | Mesaj adedi/yoğunluğu metriği. |
 | `oMessageSegmentCount` | Mesaj segment adedi metriği. |
 | `oMessageTurn` | Mesaj turn/adım metriği. |
+| `oEfficiency` | Verimlilik oranı (`tHandle / col_staffed_time * 100`, staffed yoksa `tOnQueue` fallback). |
 
 ### 8.4 Dijital/özel etkileşim metrikleri
 
@@ -256,6 +269,7 @@ Uygulama çıktısı:
 | `tAway` | Uzakta/away durumunda geçirilen süre. |
 | `tTraining` | Eğitim durumunda geçirilen süre. |
 | `tOnQueue` | On-queue durumda geçirilen süre. |
+| `tBreak` | Mola süresi (`tAway + tMeal + tMeeting + tTraining`). |
 | `col_login` | Seçili periyottaki ilk login zamanı. |
 | `col_logout` | Seçili periyottaki son logout zamanı. |
 | `col_staffed_time` | Staffed time (kullanıcı aggregate’dan türetilen süre). |
