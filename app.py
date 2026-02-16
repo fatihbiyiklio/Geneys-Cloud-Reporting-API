@@ -3483,7 +3483,7 @@ def _dedupe_time_labels_keep_visual(labels):
             if idx <= 0:
                 out.append(label)
             else:
-                out.append(f"{label}{'\u200b' * idx}")
+                out.append(label + ("\u200b" * idx))
         return out
     except Exception:
         return labels
