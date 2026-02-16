@@ -565,6 +565,8 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
             "HoldCount": 0,
             "MediaType": ""
         }
+        has_agent_participant = False
+        has_agent_interact_segment = False
         
         if include_attributes:
             # Explicitly initialize requested attributes so they appear as columns
@@ -581,6 +583,15 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
         # Determine metrics from participants
         for p in conv.get("participants", []):
             purpose = p.get("purpose")
+            if purpose in ["agent", "user"]:
+                has_agent_participant = True
+
+            # Track interact segments to improve connection detection for chat/message.
+            for s in p.get("sessions", []):
+                for segment in s.get("segments", []):
+                    stype_norm = str(segment.get("segmentType") or "").strip().lower()
+                    if stype_norm in ["interact", "connected"] and purpose in ["agent", "user"]:
+                        has_agent_interact_segment = True
             
             # Extract Attributes (Participant Data) if requested
             if include_attributes and p.get("attributes"):
@@ -755,12 +766,13 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
                                         row["Wrapup"] = w_code
         
         # Connection/Answer Status Logic
-        is_connected = False
-        if row["Talk"] > 0: is_connected = True
+        media_type_lower = str(row.get("MediaType") or "").strip().lower()
+        if media_type_lower in ["chat", "message", "email"]:
+            # Digital interactions often have zero talk time; rely on agent presence/interaction.
+            is_connected = has_agent_participant or has_agent_interact_segment
         else:
-            # Check if any customer/external participant had an interact segment that wasn't just alerting
-            # Or check if any agent had interact
-            pass
+            # Voice/callback: talk time remains primary signal, with segment fallback.
+            is_connected = (row["Talk"] > 0) or has_agent_interact_segment
             
         if row["Direction"] == "inbound":
              row["ConnectionStatus"] = "Cevaplandı" if is_connected else "Kaçan/Cevapsız"

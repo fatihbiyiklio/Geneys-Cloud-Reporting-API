@@ -593,7 +593,17 @@ class GenesysAPI:
             
         return {"conversations": all_conversations}
 
-    def iter_conversation_details(self, start_date, end_date, chunk_days=3, page_size=100, max_pages=200, order="asc"):
+    def iter_conversation_details(
+        self,
+        start_date,
+        end_date,
+        chunk_days=3,
+        page_size=100,
+        max_pages=200,
+        order="asc",
+        conversation_filters=None,
+        segment_filters=None,
+    ):
         """Yields conversation detail pages to reduce memory usage.
 
         Args:
@@ -603,6 +613,8 @@ class GenesysAPI:
             page_size: items per page
             max_pages: max pages per chunk
             order: "asc" or "desc"
+            conversation_filters: optional list for details query conversationFilters
+            segment_filters: optional list for details query segmentFilters
         """
         current_start = start_date
         while current_start < end_date:
@@ -611,13 +623,49 @@ class GenesysAPI:
             try:
                 page_number = 1
                 while True:
-                    query = {
+                    base_query = {
                         "interval": interval,
                         "paging": {"pageSize": page_size, "pageNumber": page_number},
                         "order": order,
                         "orderBy": "conversationStart"
                     }
-                    data = self._post("/api/v2/analytics/conversations/details/query", query)
+                    query = dict(base_query)
+                    if conversation_filters:
+                        query["conversationFilters"] = conversation_filters
+                    if segment_filters:
+                        query["segmentFilters"] = segment_filters
+
+                    try:
+                        data = self._post("/api/v2/analytics/conversations/details/query", query)
+                    except Exception as primary_err:
+                        data = None
+                        recovered = False
+                        fallback_candidates = []
+
+                        # If combined filters fail (often due unsupported conversation dim),
+                        # retry with segment filters only, then unfiltered as final fallback.
+                        if conversation_filters and segment_filters:
+                            q_segment_only = dict(base_query)
+                            q_segment_only["segmentFilters"] = segment_filters
+                            fallback_candidates.append(("segment_only", q_segment_only))
+                        if conversation_filters or segment_filters:
+                            fallback_candidates.append(("unfiltered", dict(base_query)))
+
+                        for mode, fallback_query in fallback_candidates:
+                            try:
+                                monitor.log_error(
+                                    "API_POST",
+                                    f"Conversation details fallback mode={mode} interval={interval} page={page_number} reason={primary_err}",
+                                )
+                                data = self._post("/api/v2/analytics/conversations/details/query", fallback_query)
+                                recovered = True
+                                break
+                            except Exception:
+                                continue
+
+                        if not recovered:
+                            raise primary_err
+
                     page = data.get("conversations") or []
                     if page:
                         yield page
@@ -799,6 +847,27 @@ class GenesysAPI:
         except Exception as e:
             monitor.log_error("API_GET", f"Error fetching group members for {group_id}: {e}")
         return members
+
+    def get_group_by_id(self, group_id):
+        """Fetch a single group by id."""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return None
+        try:
+            data = self._get(f"/api/v2/groups/{gid}")
+            if data and isinstance(data, dict) and data.get("id"):
+                return {
+                    "id": data.get("id"),
+                    "name": data.get("name", ""),
+                    "description": data.get("description", ""),
+                    "memberCount": data.get("memberCount", 0),
+                    "type": data.get("type", ""),
+                    "state": data.get("state", ""),
+                }
+            return None
+        except Exception as e:
+            monitor.log_error("API_GET", f"Error fetching group {gid}: {e}")
+            return None
 
     def add_group_members(self, group_id, member_ids):
         """Add members to a group. member_ids is a list of user IDs.
@@ -1097,6 +1166,418 @@ class GenesysAPI:
                 return None  # User not found
             monitor.log_error("API_GET", f"Error fetching user by ID {user_id}: {e}")
             raise e
+
+    def query_audits_realtime(
+        self,
+        interval,
+        service_name=None,
+        filters=None,
+        page_number=1,
+        page_size=100,
+        sort_order="descending",
+        expand_user=True,
+    ):
+        """Query realtime audits (last 14 days for some services)."""
+        sort_value = "descending" if str(sort_order).strip().lower() == "descending" else "ascending"
+        payload = {
+            "interval": interval,
+            "pageNumber": max(1, int(page_number or 1)),
+            "pageSize": max(1, min(int(page_size or 100), 500)),
+            "sort": [{"name": "Timestamp", "sortOrder": sort_value}],
+        }
+        if service_name:
+            payload["serviceName"] = str(service_name).strip()
+        if filters:
+            payload["filters"] = filters
+        params = {"expand": "user"} if expand_user else None
+        return self._post("/api/v2/audits/query/realtime", payload, timeout=30, retries=1, params=params)
+
+    def start_audit_query(
+        self,
+        interval,
+        service_name=None,
+        filters=None,
+        sort_order="descending",
+    ):
+        """Start async audit query execution."""
+        sort_value = "descending" if str(sort_order).strip().lower() == "descending" else "ascending"
+        payload = {
+            "interval": interval,
+            "sort": [{"name": "Timestamp", "sortOrder": sort_value}],
+        }
+        if service_name:
+            payload["serviceName"] = str(service_name).strip()
+        if filters:
+            payload["filters"] = filters
+        return self._post("/api/v2/audits/query", payload, timeout=30, retries=1)
+
+    def get_audit_query_status(self, transaction_id):
+        """Get async audit query execution status."""
+        return self._get(f"/api/v2/audits/query/{transaction_id}")
+
+    def get_audit_query_results(
+        self,
+        transaction_id,
+        cursor=None,
+        page_size=100,
+        expand_user=True,
+        allow_redirect=False,
+    ):
+        """Get async audit query execution result page."""
+        params = {
+            "pageSize": max(1, min(int(page_size or 100), 500)),
+            "allowRedirect": "true" if allow_redirect else "false",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        if expand_user:
+            params["expand"] = "user"
+        return self._get(f"/api/v2/audits/query/{transaction_id}/results", params=params)
+
+    def query_audits(
+        self,
+        interval,
+        service_name=None,
+        filters=None,
+        page_size=100,
+        max_pages=20,
+        max_polls=30,
+        poll_sleep_seconds=1.0,
+        sort_order="descending",
+        expand_user=True,
+    ):
+        """Run async audit query end-to-end and return merged entities."""
+        try:
+            start_resp = self.start_audit_query(
+                interval=interval,
+                service_name=service_name,
+                filters=filters,
+                sort_order=sort_order,
+            )
+        except Exception as e:
+            monitor.log_error("API_POST", f"Error starting async audit query: {e}")
+            return {"entities": [], "_error": self._extract_error_detail(e)}
+
+        tx_id = str((start_resp or {}).get("id") or "").strip()
+        if not tx_id:
+            return {
+                "entities": [],
+                "_error": "Async audit query transaction id alınamadı.",
+            }
+
+        state = str((start_resp or {}).get("state") or "").strip().lower()
+        polls = 0
+        while state not in {"succeeded", "failed", "cancelled"} and polls < max(1, int(max_polls or 1)):
+            polls += 1
+            time.sleep(max(0.2, float(poll_sleep_seconds or 1.0)))
+            try:
+                st = self.get_audit_query_status(tx_id)
+                state = str((st or {}).get("state") or state).strip().lower()
+            except Exception as e:
+                monitor.log_error("API_GET", f"Error polling async audit query {tx_id}: {e}")
+                break
+
+        if state in {"failed", "cancelled"}:
+            return {
+                "entities": [],
+                "_error": f"Async audit query durumu: {state}",
+                "transaction_id": tx_id,
+            }
+
+        entities = []
+        seen_ids = set()
+        cursor = None
+        page_count = 0
+
+        while page_count < max(1, int(max_pages or 1)):
+            page_count += 1
+            try:
+                page = self.get_audit_query_results(
+                    transaction_id=tx_id,
+                    cursor=cursor,
+                    page_size=page_size,
+                    expand_user=expand_user,
+                    allow_redirect=False,
+                )
+            except Exception as e:
+                monitor.log_error("API_GET", f"Error reading async audit results {tx_id}: {e}")
+                return {
+                    "entities": entities,
+                    "_error": self._extract_error_detail(e),
+                    "transaction_id": tx_id,
+                }
+
+            page_entities = (page or {}).get("entities") or []
+            for item in page_entities:
+                aid = str((item or {}).get("id") or "").strip()
+                if aid and aid in seen_ids:
+                    continue
+                if aid:
+                    seen_ids.add(aid)
+                entities.append(item)
+
+            next_cursor = (page or {}).get("cursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+
+        return {
+            "entities": entities,
+            "transaction_id": tx_id,
+            "state": state or "succeeded",
+        }
+
+    def get_user_status_audit_logs(
+        self,
+        user_id,
+        start_date,
+        end_date,
+        page_size=100,
+        max_pages=10,
+        service_name=None,
+    ):
+        """Fetch status-related audit logs for a target user via realtime audit query."""
+        uid = str(user_id or "").strip()
+        if not uid:
+            return {"entities": [], "total": 0}
+
+        def _to_utc_iso(dt):
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        interval = f"{_to_utc_iso(start_date)}/{_to_utc_iso(end_date)}"
+        filter_variants = [
+            [
+                {"property": "EntityId", "value": uid},
+                {"property": "EntityType", "value": "USER"},
+            ],
+            [
+                {"property": "EntityId", "value": uid},
+                {"property": "EntityType", "value": "User"},
+            ],
+            [
+                {"property": "EntityId", "value": uid},
+                {"property": "EntityType", "value": "user"},
+            ],
+            # Defensive fallback for orgs that validate filter key casing differently.
+            [
+                {"property": "entityId", "value": uid},
+                {"property": "entityType", "value": "USER"},
+            ],
+            [
+                {"property": "entityId", "value": uid},
+                {"property": "entityType", "value": "User"},
+            ],
+            [
+                {"property": "entityId", "value": uid},
+                {"property": "entityType", "value": "user"},
+            ],
+        ]
+
+        def _audit_mentions_user(audit_item, target_uid):
+            tid = str(target_uid or "").strip().lower()
+            if not tid:
+                return True
+            if not isinstance(audit_item, dict):
+                return False
+
+            try:
+                entity = audit_item.get("entity") or {}
+                entity_id = str(entity.get("id") or "").strip().lower()
+                if entity_id == tid:
+                    return True
+            except Exception:
+                pass
+
+            try:
+                actor = audit_item.get("user") or {}
+                actor_id = str(actor.get("id") or "").strip().lower()
+                if actor_id == tid:
+                    return True
+            except Exception:
+                pass
+
+            try:
+                context = audit_item.get("context")
+                if isinstance(context, (dict, list, tuple)):
+                    ctx_blob = str(context).lower()
+                    if tid in ctx_blob:
+                        return True
+            except Exception:
+                pass
+
+            try:
+                msg_obj = audit_item.get("message") or {}
+                msg_blob = str(msg_obj).lower()
+                if tid in msg_blob:
+                    return True
+            except Exception:
+                pass
+
+            return False
+
+        def _collect_realtime(filters, scan_pages=None, scan_service_name=None):
+            entities = []
+            seen_ids = set()
+            total = None
+            page_count = None
+            realtime_error = None
+            pages_to_scan = max(1, int(scan_pages or max_pages or 1))
+
+            for page_number in range(1, pages_to_scan + 1):
+                try:
+                    resp = self.query_audits_realtime(
+                        interval=interval,
+                        service_name=scan_service_name,
+                        filters=filters,
+                        page_number=page_number,
+                        page_size=page_size,
+                        sort_order="descending",
+                        expand_user=True,
+                    )
+                except Exception as e:
+                    realtime_error = self._extract_error_detail(e)
+                    break
+
+                if not isinstance(resp, dict):
+                    break
+
+                page_entities = resp.get("entities") or []
+                for item in page_entities:
+                    aid = str((item or {}).get("id") or "")
+                    if aid and aid in seen_ids:
+                        continue
+                    if aid:
+                        seen_ids.add(aid)
+                    entities.append(item)
+
+                if total is None:
+                    total = resp.get("total")
+                if page_count is None:
+                    page_count = resp.get("pageCount")
+
+                if not page_entities:
+                    break
+                if page_count and page_number >= int(page_count):
+                    break
+                if len(page_entities) < int(page_size or 100):
+                    break
+
+            return {
+                "entities": entities,
+                "total": total if total is not None else len(entities),
+                "page_count": page_count,
+                "_error": realtime_error,
+            }
+
+        last_error = None
+        for filters in filter_variants:
+            realtime_resp = _collect_realtime(filters=filters, scan_service_name=service_name)
+            entities = realtime_resp.get("entities") or []
+            if realtime_resp.get("_error"):
+                last_error = realtime_resp.get("_error")
+
+            if entities:
+                return {
+                    "entities": entities,
+                    "total": realtime_resp.get("total"),
+                    "page_count": realtime_resp.get("page_count"),
+                    "source": "realtime",
+                    "filter_variant": filters,
+                }
+
+            # If realtime failed, try async with same filters before switching variant.
+            async_resp = self.query_audits(
+                interval=interval,
+                service_name=service_name,
+                filters=filters,
+                page_size=page_size,
+                max_pages=max_pages,
+                sort_order="descending",
+                expand_user=True,
+            )
+            async_entities = (async_resp or {}).get("entities") or []
+            if async_entities:
+                return {
+                    "entities": async_entities,
+                    "total": len(async_entities),
+                    "page_count": None,
+                    "source": "async",
+                    "transaction_id": (async_resp or {}).get("transaction_id"),
+                    "filter_variant": filters,
+                }
+
+            if (async_resp or {}).get("_error"):
+                last_error = (async_resp or {}).get("_error")
+
+        # Some orgs return "entityId requires entityType" even with valid pair.
+        # Fallback to broader server-side filters and narrow down client-side.
+        fallback_scan_pages = min(50, max(int(max_pages or 1), 20))
+        fallback_variants = [
+            {"filters": None, "source": "realtime-unfiltered"},
+            {"filters": [{"property": "UserId", "value": uid}], "source": "realtime-userid"},
+        ]
+        for fb in fallback_variants:
+            realtime_resp = _collect_realtime(
+                filters=fb["filters"],
+                scan_pages=fallback_scan_pages,
+                scan_service_name=service_name,
+            )
+            entities = realtime_resp.get("entities") or []
+            entities = [x for x in entities if _audit_mentions_user(x, uid)]
+            if entities:
+                return {
+                    "entities": entities,
+                    "total": len(entities),
+                    "page_count": realtime_resp.get("page_count"),
+                    "source": fb["source"],
+                    "filter_variant": fb["filters"] or [],
+                    "_warning": (
+                        "EntityId+EntityType filtreleri org tarafinda reddedildigi icin "
+                        "genis fallback filtre kullanildi."
+                    ),
+                }
+            if realtime_resp.get("_error"):
+                last_error = realtime_resp.get("_error")
+
+            async_resp = self.query_audits(
+                interval=interval,
+                service_name=service_name,
+                filters=fb["filters"],
+                page_size=page_size,
+                max_pages=fallback_scan_pages,
+                sort_order="descending",
+                expand_user=True,
+            )
+            async_entities = (async_resp or {}).get("entities") or []
+            async_entities = [x for x in async_entities if _audit_mentions_user(x, uid)]
+            if async_entities:
+                return {
+                    "entities": async_entities,
+                    "total": len(async_entities),
+                    "page_count": None,
+                    "source": f"{fb['source']}-async",
+                    "transaction_id": (async_resp or {}).get("transaction_id"),
+                    "filter_variant": fb["filters"] or [],
+                    "_warning": (
+                        "EntityId+EntityType filtreleri org tarafinda reddedildigi icin "
+                        "genis fallback filtre kullanildi."
+                    ),
+                }
+            if (async_resp or {}).get("_error"):
+                last_error = (async_resp or {}).get("_error")
+
+        return {
+            "entities": [],
+            "total": 0,
+            "page_count": None,
+            "_error": last_error,
+        }
 
     def _get_users_page_scan(self, page_size=100, max_pages=50):
         """Fetches all users from Genesys Cloud."""

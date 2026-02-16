@@ -153,7 +153,16 @@ def _rm_debug(msg, *args):
     if DEBUG_REMEMBER_ME:
         logger.info("[remember-me] " + msg, *args)
 
-def _iter_conversation_pages(api, start_date, end_date, max_records=5000, chunk_days=3, page_size=100):
+def _iter_conversation_pages(
+    api,
+    start_date,
+    end_date,
+    max_records=5000,
+    chunk_days=3,
+    page_size=100,
+    conversation_filters=None,
+    segment_filters=None,
+):
     """Yield conversation pages with an upper bound on total records to avoid OOM."""
     total = 0
     for page in api.iter_conversation_details(
@@ -163,6 +172,8 @@ def _iter_conversation_pages(api, start_date, end_date, max_records=5000, chunk_
         page_size=page_size,
         max_pages=200,
         order="asc",
+        conversation_filters=conversation_filters,
+        segment_filters=segment_filters,
     ):
         if not page:
             continue
@@ -288,6 +299,411 @@ def format_duration_seconds(seconds):
         return f"{hrs:02d}:{mins:02d}:{secs:02d}"
     except:
         return "-"
+
+def _format_iso_with_utc_offset(iso_str, utc_offset_hours=3.0, out_fmt="%Y-%m-%d %H:%M:%S"):
+    if not iso_str:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        dt_local = dt + timedelta(hours=float(utc_offset_hours or 0))
+        return dt_local.strftime(out_fmt)
+    except Exception:
+        return str(iso_str)
+
+def _resolve_user_label(user_id=None, users_info=None, fallback_name=None):
+    uid = str(user_id or "").strip()
+    if uid and isinstance(users_info, dict):
+        user_obj = users_info.get(uid) or {}
+        if isinstance(user_obj, dict):
+            name = str(user_obj.get("name") or "").strip()
+            if name:
+                return name
+            username = str(user_obj.get("username") or "").strip()
+            if username:
+                return username
+    if fallback_name:
+        return str(fallback_name)
+    return uid or "-"
+
+def _normalize_status_value(raw_value, presence_map=None):
+    if isinstance(raw_value, dict):
+        pd = raw_value.get("presenceDefinition")
+        if isinstance(pd, dict):
+            return _normalize_status_value(pd, presence_map=presence_map)
+        rs = raw_value.get("routingStatus")
+        if isinstance(rs, dict):
+            return _normalize_status_value(rs, presence_map=presence_map)
+        for key in ["label", "systemPresence", "status", "name", "value", "id"]:
+            val = raw_value.get(key)
+            if val:
+                return _normalize_status_value(val, presence_map=presence_map)
+        try:
+            return json.dumps(raw_value, ensure_ascii=False)
+        except Exception:
+            return str(raw_value)
+
+    if isinstance(raw_value, list):
+        joined = [_normalize_status_value(v, presence_map=presence_map) for v in raw_value]
+        joined = [x for x in joined if x and x != "-"]
+        return ", ".join(joined) if joined else "-"
+
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return "-"
+    if raw.startswith("{") or raw.startswith("["):
+        try:
+            return _normalize_status_value(json.loads(raw), presence_map=presence_map)
+        except Exception:
+            pass
+
+    p_map = presence_map or {}
+    p_info = p_map.get(raw)
+    if isinstance(p_info, dict):
+        p_label = str(p_info.get("label") or "").strip()
+        p_sys = str(p_info.get("systemPresence") or "").strip()
+        if p_label:
+            return p_label
+        if p_sys:
+            return p_sys.replace("_", " ").title()
+
+    routing_map = {
+        "OFF_QUEUE": "Off Queue",
+        "IDLE": "On Queue",
+        "INTERACTING": "Görüşmede",
+        "NOT_RESPONDING": "Cevapsız",
+        "COMMUNICATING": "Görüşmede",
+    }
+    upper = raw.upper()
+    if upper in routing_map:
+        return routing_map[upper]
+
+    return raw
+
+def _format_status_values(values, presence_map=None):
+    if values is None:
+        return "-"
+    if not isinstance(values, list):
+        values = [values]
+    cleaned = []
+    seen = set()
+    for v in values:
+        normalized = _normalize_status_value(v, presence_map=presence_map)
+        key = normalized.strip().lower()
+        if not key or key == "-":
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(normalized)
+    return ", ".join(cleaned) if cleaned else "-"
+
+def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, presence_map=None, utc_offset_hours=3.0):
+    rows = []
+    if not isinstance(audit_entities, list):
+        return rows
+
+    status_property_hints = (
+        "presence",
+        "routingstatus",
+        "routing",
+        "onqueue",
+        "organizationpresence",
+        "systempresence",
+        "primarypresence",
+    )
+    status_text_hints = (
+        "presence",
+        "routingstatus",
+        "routing status",
+        "onqueue",
+        "on queue",
+        "organizationpresence",
+        "systempresence",
+        "primarypresence",
+    )
+    old_ctx_keys = [
+        "oldStatus",
+        "previousStatus",
+        "fromStatus",
+        "oldPresence",
+        "previousPresence",
+        "oldRoutingStatus",
+        "oldRouting",
+    ]
+    new_ctx_keys = [
+        "newStatus",
+        "currentStatus",
+        "toStatus",
+        "newPresence",
+        "currentPresence",
+        "newRoutingStatus",
+        "newRouting",
+    ]
+    target_uid = str(target_user_id or "").strip()
+
+    actor_key_tokens = (
+        "actoruserid",
+        "actinguserid",
+        "modifiedby",
+        "changedby",
+        "initiatedbyuserid",
+        "requestinguserid",
+        "performedbyuserid",
+        "updatedby",
+        "updatedbyuserid",
+    )
+    target_key_tokens = (
+        "userid",
+        "targetuserid",
+        "affecteduserid",
+        "memberuserid",
+        "agentid",
+        "subjectuserid",
+        "entityuserid",
+    )
+    uuid_pattern = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+    def _looks_like_uuid(value):
+        val = str(value or "").strip()
+        return bool(val and uuid_pattern.match(val))
+
+    def _is_actor_key(key):
+        k = str(key or "").strip().lower()
+        if not k:
+            return False
+        if any(tok in k for tok in actor_key_tokens):
+            return True
+        return ("actor" in k) and (("user" in k) or ("id" in k))
+
+    def _is_target_key(key):
+        k = str(key or "").strip().lower()
+        if not k:
+            return False
+        if any(tok == k or tok in k for tok in target_key_tokens):
+            return True
+        if ("user" in k) or ("agent" in k):
+            return not _is_actor_key(k)
+        return False
+
+    def _collect_context_user_ids(obj):
+        actor_ids = set()
+        target_ids = set()
+        if obj is None:
+            return actor_ids, target_ids
+
+        def _add_if_uuid(bucket, value):
+            val = str(value or "").strip()
+            if _looks_like_uuid(val):
+                bucket.add(val)
+
+        def _walk(node, parent_key=""):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    key = str(k or "").strip().lower()
+                    if isinstance(v, dict):
+                        preferred_keys = ("id", "userId", "userid", "agentId", "agentid")
+                        for ik in preferred_keys:
+                            vv = v.get(ik)
+                            if vv in (None, ""):
+                                continue
+                            if _is_actor_key(key):
+                                _add_if_uuid(actor_ids, vv)
+                            elif _is_target_key(key):
+                                _add_if_uuid(target_ids, vv)
+                            break
+                        _walk(v, key)
+                        continue
+                    if isinstance(v, (list, tuple)):
+                        if _is_actor_key(key) or _is_target_key(key):
+                            for item in v:
+                                if isinstance(item, dict):
+                                    for ik in ("id", "userId", "userid", "agentId", "agentid"):
+                                        if item.get(ik) not in (None, ""):
+                                            if _is_actor_key(key):
+                                                _add_if_uuid(actor_ids, item.get(ik))
+                                            else:
+                                                _add_if_uuid(target_ids, item.get(ik))
+                                            break
+                                else:
+                                    if _is_actor_key(key):
+                                        _add_if_uuid(actor_ids, item)
+                                    else:
+                                        _add_if_uuid(target_ids, item)
+                        for item in v:
+                            _walk(item, key)
+                        continue
+                    if v in (None, ""):
+                        continue
+                    if _is_actor_key(key):
+                        _add_if_uuid(actor_ids, v)
+                    elif _is_target_key(key):
+                        _add_if_uuid(target_ids, v)
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    _walk(item, parent_key)
+
+        _walk(obj)
+        return actor_ids, target_ids
+
+    for audit in audit_entities:
+        if not isinstance(audit, dict):
+            continue
+
+        entity = audit.get("entity") or {}
+        entity_id = str(entity.get("id") or "").strip()
+        entity_type = str(audit.get("entityType") or entity.get("type") or "").strip().lower()
+
+        actor = audit.get("user") or {}
+        actor_id = str(actor.get("id") or "").strip()
+        context = audit.get("context") or {}
+        context_actor_ids, context_target_ids = _collect_context_user_ids(context)
+
+        if not _looks_like_uuid(actor_id):
+            actor_id = ""
+        if (not actor_id) and context_actor_ids:
+            actor_id = sorted(context_actor_ids)[0]
+
+        target_candidates = set(context_target_ids)
+        if _looks_like_uuid(entity_id):
+            # entityType is usually USER for direct user status changes.
+            if (not entity_type) or ("user" in entity_type) or ("agent" in entity_type):
+                target_candidates.add(entity_id)
+
+        if target_uid:
+            target_match = target_uid in target_candidates
+            if (not target_match) and target_candidates:
+                continue
+            if not target_match:
+                payload_blob = ""
+                try:
+                    payload_blob = json.dumps(
+                        {"entity": entity, "context": context, "message": audit.get("message")},
+                        ensure_ascii=False,
+                    ).lower()
+                except Exception:
+                    payload_blob = f"{entity} {context} {audit.get('message')}".lower()
+                if target_uid.lower() in payload_blob:
+                    target_match = True
+                elif actor_id and actor_id == target_uid:
+                    target_match = True
+            if not target_match:
+                continue
+
+        actor_name = _resolve_user_label(
+            user_id=actor_id,
+            users_info=users_info,
+            fallback_name=actor.get("name") or actor.get("displayName"),
+        )
+        affected_user_id = target_uid or (sorted(target_candidates)[0] if target_candidates else "-")
+
+        event_date_raw = audit.get("eventDate")
+        event_date_local = _format_iso_with_utc_offset(event_date_raw, utc_offset_hours=utc_offset_hours)
+        action = str(audit.get("action") or "").strip()
+        service_name = str(audit.get("serviceName") or "").strip()
+        application = str(audit.get("application") or "").strip()
+        audit_status = str(audit.get("status") or "").strip()
+        audit_id = str(audit.get("id") or "").strip()
+        message_obj = audit.get("message") or {}
+        message_text = str(
+            message_obj.get("message")
+            or message_obj.get("messageWithParams")
+            or ""
+        ).strip()
+
+        property_changes = audit.get("propertyChanges") or []
+        entity_changes = audit.get("entityChanges") or []
+        matched = False
+        for ch in property_changes:
+            if not isinstance(ch, dict):
+                continue
+            prop_name = str(ch.get("property") or "").strip()
+            prop_lower = prop_name.lower()
+            if not prop_lower:
+                continue
+            if not any(h in prop_lower for h in status_property_hints):
+                continue
+            matched = True
+            old_text = _format_status_values(ch.get("oldValues"), presence_map=presence_map)
+            new_text = _format_status_values(ch.get("newValues"), presence_map=presence_map)
+            rows.append({
+                "Zaman": event_date_local,
+                "Servis": service_name or "-",
+                "Aksiyon": action or "-",
+                "Alan": prop_name,
+                "Eski Değer": old_text,
+                "Yeni Değer": new_text,
+                "Değiştiren": actor_name,
+                "Değiştiren ID": actor_id or "-",
+                "Etkilenen ID": affected_user_id or "-",
+                "Uygulama": application or "-",
+                "Audit Durumu": audit_status or "-",
+                "Mesaj": message_text or "-",
+                "Audit ID": audit_id or "-",
+            })
+
+        if not matched and isinstance(entity_changes, list):
+            for ech in entity_changes:
+                ech_text = str(ech).lower()
+                if any(h in ech_text for h in status_text_hints):
+                    matched = True
+                    rows.append({
+                        "Zaman": event_date_local,
+                        "Servis": service_name or "-",
+                        "Aksiyon": action or "-",
+                        "Alan": "entityChanges",
+                        "Eski Değer": "-",
+                        "Yeni Değer": "-",
+                        "Değiştiren": actor_name,
+                        "Değiştiren ID": actor_id or "-",
+                        "Etkilenen ID": affected_user_id or "-",
+                        "Uygulama": application or "-",
+                        "Audit Durumu": audit_status or "-",
+                        "Mesaj": message_text or "-",
+                        "Audit ID": audit_id or "-",
+                    })
+                    break
+
+        if matched:
+            continue
+
+        old_ctx_val = None
+        new_ctx_val = None
+        old_ctx_key = None
+        new_ctx_key = None
+        if isinstance(context, dict):
+            for k in old_ctx_keys:
+                if context.get(k) not in (None, ""):
+                    old_ctx_key = k
+                    old_ctx_val = context.get(k)
+                    break
+            for k in new_ctx_keys:
+                if context.get(k) not in (None, ""):
+                    new_ctx_key = k
+                    new_ctx_val = context.get(k)
+                    break
+
+        combined_text = f"{service_name} {action} {message_text} {str(context)}".lower()
+        if any(h in combined_text for h in status_text_hints) or old_ctx_val is not None or new_ctx_val is not None:
+            old_text = _format_status_values(old_ctx_val, presence_map=presence_map)
+            new_text = _format_status_values(new_ctx_val, presence_map=presence_map)
+            field_name = (old_ctx_key or new_ctx_key or "-")
+            rows.append({
+                "Zaman": event_date_local,
+                "Servis": service_name or "-",
+                "Aksiyon": action or "-",
+                "Alan": field_name,
+                "Eski Değer": old_text,
+                "Yeni Değer": new_text,
+                "Değiştiren": actor_name,
+                "Değiştiren ID": actor_id or "-",
+                "Etkilenen ID": affected_user_id or "-",
+                "Uygulama": application or "-",
+                "Audit Durumu": audit_status or "-",
+                "Mesaj": message_text or "-",
+                "Audit ID": audit_id or "-",
+            })
+
+    return rows
 
 def _parse_wait_seconds(val):
     """Parses wait duration from timestamps or numeric durations."""
@@ -4410,6 +4826,73 @@ elif page == get_text(lang, "menu_reports"):
                  max_records = int(st.session_state.get("rep_max_records", 5000))
                  dfs = []
                  total_rows = 0
+                 details_conversation_filters = [
+                     {
+                         "type": "and",
+                         "predicates": [
+                             {
+                                 "type": "dimension",
+                                 "dimension": "originatingDirection",
+                                 "operator": "matches",
+                                 "value": "inbound",
+                             },
+                             {
+                                 "type": "metric",
+                                 "metric": "tAbandon",
+                                 "range": {"gt": 0},
+                             },
+                         ],
+                     }
+                 ]
+                 details_segment_clauses = [
+                     {
+                         "type": "or",
+                         "predicates": [
+                             {
+                                 "type": "dimension",
+                                 "dimension": "direction",
+                                 "operator": "matches",
+                                 "value": "inbound",
+                             }
+                         ],
+                     }
+                 ]
+                 selected_queue_ids = [qid for qid in (sel_ids or []) if qid]
+                 if selected_queue_ids:
+                     queue_preds = [
+                         {
+                             "type": "dimension",
+                             "dimension": "queueId",
+                             "operator": "matches",
+                             "value": qid,
+                         }
+                         for qid in selected_queue_ids
+                     ]
+                     details_segment_clauses.append({"type": "or", "predicates": queue_preds})
+
+                 selected_media_types = [
+                     str(mt).strip().lower()
+                     for mt in (sel_media_types or [])
+                     if str(mt).strip()
+                 ]
+                 if selected_media_types:
+                     media_preds = [
+                         {
+                             "type": "dimension",
+                             "dimension": "mediaType",
+                             "operator": "matches",
+                             "value": mt,
+                         }
+                         for mt in selected_media_types
+                     ]
+                     details_segment_clauses.append({"type": "or", "predicates": media_preds})
+
+                 details_segment_filters = None
+                 if len(details_segment_clauses) == 1:
+                     details_segment_filters = [details_segment_clauses[0]]
+                 elif len(details_segment_clauses) > 1:
+                     details_segment_filters = [{"type": "and", "clauses": details_segment_clauses}]
+
                  skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                  st.session_state.skills_map = skill_lookup
                  language_lookup = api.get_languages()
@@ -4418,7 +4901,15 @@ elif page == get_text(lang, "menu_reports"):
                  else:
                      language_lookup = st.session_state.get("languages_map", {})
 
-                 for page in _iter_conversation_pages(api, s_dt, e_dt, max_records=max_records, chunk_days=3):
+                 for page in _iter_conversation_pages(
+                     api,
+                     s_dt,
+                     e_dt,
+                     max_records=max_records,
+                     chunk_days=3,
+                     conversation_filters=details_conversation_filters,
+                     segment_filters=details_segment_filters,
+                 ):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
                          user_map=st.session_state.users_info,
@@ -4437,19 +4928,23 @@ elif page == get_text(lang, "menu_reports"):
                      st.warning(f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz.")
                  
                  if not df.empty:
-                     # Filter for MISSED Only
-                     # Condition: ConnectionStatus is NOT "Cevaplandı" or "Ulaşıldı" or "Bağlandı"
-                     # OR strictly match "Kaçan/Cevapsız", "Ulaşılamadı", "Bağlanamadı"
-                     # STRICT REQUIREMENT: Only Inbound
+                     # Filter for unanswered inbound interactions only.
                      
-                     missed_statuses = ["Kaçan/Cevapsız", "Ulaşılamadı", "Bağlanamadı", "Missed", "Unreachable"]
+                     target_status = "Kaçan/Cevapsız"
                      # Filter logic
-                     if "ConnectionStatus" in df.columns and "Direction" in df.columns:
-                         # Use isin for stricter matching if possible, or string contains for flexibility
-                         # And Filter for Inbound
+                     if all(c in df.columns for c in ["ConnectionStatus", "Direction", "Queue"]):
+                         # Only unanswered inbound interactions with a non-empty workgroup name.
+                         queue_name = df["Queue"].astype(str).str.strip()
+                         invalid_queue_values = {"", "-", "nan", "none", "null", "n/a"}
+                         has_end = True
+                         if "End" in df.columns:
+                             end_value = df["End"].astype(str).str.strip().str.lower()
+                             has_end = ~end_value.isin(invalid_queue_values)
                          df_missed = df[
-                             (df["ConnectionStatus"].isin(missed_statuses)) & 
-                             (df["Direction"].astype(str).str.lower() == "inbound")
+                             (df["ConnectionStatus"].astype(str).str.strip() == target_status) &
+                             (df["Direction"].astype(str).str.lower() == "inbound") &
+                             (~queue_name.str.lower().isin(invalid_queue_values)) &
+                             has_end
                          ]
                      else:
                          df_missed = pd.DataFrame() # Should not happen
@@ -5566,9 +6061,17 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                 api = GenesysAPI(st.session_state.api_client)
                 
                 # Fetch groups
-                if 'admin_groups_cache' not in st.session_state or st.session_state.get('admin_groups_refresh'):
+                current_org = str(org or "").strip()
+                cached_groups_org = str(st.session_state.get("admin_groups_cache_org") or "").strip()
+                need_groups_refresh = (
+                    ('admin_groups_cache' not in st.session_state)
+                    or bool(st.session_state.get('admin_groups_refresh'))
+                    or (cached_groups_org != current_org)
+                )
+                if need_groups_refresh:
                     with st.spinner(get_text(lang, "group_loading")):
                         st.session_state.admin_groups_cache = api.get_groups()
+                        st.session_state.admin_groups_cache_org = current_org
                         st.session_state.admin_groups_refresh = False
                 
                 groups = st.session_state.get('admin_groups_cache', [])
@@ -6046,6 +6549,35 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
         else:
             import re as _re_user_search
             _uuid_pattern_user = _re_user_search.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+            available_users_map = st.session_state.get("users_map", {}) or {}
+            if not available_users_map:
+                recover_org_maps_if_needed(org, force=True)
+                available_users_map = st.session_state.get("users_map", {}) or {}
+                if (not available_users_map) and st.session_state.get("api_client"):
+                    try:
+                        _tmp_api = GenesysAPI(st.session_state.api_client)
+                        _users = _tmp_api.get_users()
+                        if isinstance(_users, list) and _users:
+                            available_users_map = {
+                                str(u.get("name") or u.get("username") or u.get("id")): u.get("id")
+                                for u in _users if isinstance(u, dict) and u.get("id")
+                            }
+                            st.session_state.users_map = available_users_map
+                    except Exception:
+                        available_users_map = {}
+            if available_users_map:
+                agent_options = ["Manuel ID Gireceğim"] + sorted(list(available_users_map.keys()))
+                selected_agent_label = st.selectbox(
+                    "Ajan Seç (Opsiyonel)",
+                    options=agent_options,
+                    key="admin_user_picker",
+                    help="İsterseniz listeden agent seçebilirsiniz; seçim yaparsanız ID alanı otomatik doldurulur."
+                )
+                if selected_agent_label != "Manuel ID Gireceğim":
+                    selected_agent_id = available_users_map.get(selected_agent_label)
+                    if selected_agent_id and st.session_state.get("admin_user_search_id") != selected_agent_id:
+                        st.session_state.admin_user_search_id = selected_agent_id
             
             search_col1, search_col2 = st.columns([3, 1])
             with search_col1:
@@ -6059,16 +6591,47 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
             with search_col2:
                 st.markdown("<br>", unsafe_allow_html=True)
                 search_clicked = st.button("🔍 Ara", type="primary", use_container_width=True, key="admin_user_search_btn")
-            
             if search_clicked:
-                user_id_clean = user_id_input.strip() if user_id_input else ""
+                st.session_state.admin_user_search_triggered = True
+                st.session_state.admin_user_search_last_id = (user_id_input or "").strip()
+
+            hist_cfg_col1, hist_cfg_col2 = st.columns(2)
+            with hist_cfg_col1:
+                audit_history_days = st.number_input(
+                    "Statü geçmişi (gün)",
+                    min_value=1,
+                    max_value=14,
+                    value=int(st.session_state.get("admin_status_history_days", 3)),
+                    step=1,
+                    key="admin_status_history_days",
+                    help="Realtime audit endpoint en fazla 14 gün verisi döner."
+                )
+            with hist_cfg_col2:
+                audit_history_pages = st.number_input(
+                    "Maksimum sayfa",
+                    min_value=1,
+                    max_value=50,
+                    value=int(st.session_state.get("admin_status_history_pages", 8)),
+                    step=1,
+                    key="admin_status_history_pages",
+                    help="Her sayfa en fazla 100 kayıt döner."
+                )
+            
+            active_user_search = bool(st.session_state.get("admin_user_search_triggered"))
+            if active_user_search:
+                user_id_clean = (user_id_input or "").strip()
+                if not user_id_clean:
+                    user_id_clean = str(st.session_state.get("admin_user_search_last_id") or "").strip()
                 
                 if not user_id_clean:
+                    st.session_state.admin_user_search_triggered = False
                     st.error("Lütfen bir kullanıcı ID girin.")
                 elif not _uuid_pattern_user.match(user_id_clean):
+                    st.session_state.admin_user_search_triggered = False
                     st.error("Geçersiz UUID formatı. Örnek: 24331d74-80bf-4069-a67c-51bc851fdc3e")
                 else:
                     try:
+                        st.session_state.admin_user_search_last_id = user_id_clean
                         api = GenesysAPI(st.session_state.api_client)
                         with st.spinner("Kullanıcı bilgileri getiriliyor..."):
                             user_data = api.get_user_by_id(
@@ -6112,14 +6675,278 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                         st.markdown(f"**Routing Status:** {routing.get('status', 'N/A')}")
                                         if routing.get('startTime'):
                                             st.markdown(f"**Başlangıç:** {routing.get('startTime', 'N/A')}")
+
+                            # Status Change History (Audit)
+                            st.divider()
+                            st.markdown("### 🧭 Statü Değişim Geçmişi (Audit)")
+                            st.caption("Bu bölümde seçilen agent için status/presence/routing değişiklikleri ve değişikliği yapan kullanıcı listelenir.")
+                            try:
+                                offset_hours = _resolve_org_utc_offset_hours(org_code=org, default=3.0, force_reload=False)
+                            except Exception:
+                                offset_hours = 3.0
+                            history_end_utc = datetime.now(timezone.utc)
+                            history_start_utc = history_end_utc - timedelta(days=int(audit_history_days))
+                            with st.spinner("Statü değişim geçmişi getiriliyor..."):
+                                audit_payload = api.get_user_status_audit_logs(
+                                    user_id=user_id_clean,
+                                    start_date=history_start_utc,
+                                    end_date=history_end_utc,
+                                    page_size=100,
+                                    max_pages=int(audit_history_pages),
+                                    service_name="Presence",
+                                )
+                                primary_entities = (audit_payload or {}).get("entities") or []
+                                if not primary_entities:
+                                    fallback_payload = api.get_user_status_audit_logs(
+                                        user_id=user_id_clean,
+                                        start_date=history_start_utc,
+                                        end_date=history_end_utc,
+                                        page_size=100,
+                                        max_pages=int(audit_history_pages),
+                                        service_name=None,
+                                    )
+                                    fallback_entities = (fallback_payload or {}).get("entities") or []
+                                    if fallback_entities:
+                                        fb_warning = str((fallback_payload or {}).get("_warning") or "").strip()
+                                        extra_warning = "Presence servisinde kayıt bulunamadığı için tüm servislerde tarama yapıldı."
+                                        if fb_warning:
+                                            fallback_payload["_warning"] = f"{extra_warning} {fb_warning}".strip()
+                                        else:
+                                            fallback_payload["_warning"] = extra_warning
+                                        audit_payload = fallback_payload
+                                    elif (fallback_payload or {}).get("_error") and not (audit_payload or {}).get("_error"):
+                                        audit_payload = fallback_payload
+
+                            audit_error = (audit_payload or {}).get("_error")
+                            audit_entities = (audit_payload or {}).get("entities") or []
+                            audit_source = str((audit_payload or {}).get("source") or "-")
+                            audit_filter_variant = (audit_payload or {}).get("filter_variant") or []
+                            audit_warning = str((audit_payload or {}).get("_warning") or "").strip()
+                            if audit_error:
+                                audit_err_text = str(audit_error)
+                                audit_err_lower = audit_err_text.lower()
+                                if ("audits:audit:view" in audit_err_lower) or ("missing the following permission" in audit_err_lower):
+                                    st.warning(
+                                        "Audit geçmişi alınamadı. Yetki gerekli: `audits:audit:view`.\n\n"
+                                        f"Hata detayı: {audit_error}"
+                                    )
+                                else:
+                                    st.warning(f"Audit geçmişi sorgusunda hata oluştu.\n\nHata detayı: {audit_error}")
+                            else:
+                                status_rows = _build_status_audit_rows(
+                                    audit_entities=audit_entities,
+                                    target_user_id=user_id_clean,
+                                    users_info=st.session_state.get("users_info", {}),
+                                    presence_map=st.session_state.get("presence_map", {}),
+                                    utc_offset_hours=offset_hours,
+                                )
+                                if status_rows:
+                                    df_status_history = pd.DataFrame(status_rows)
+                                    st.success(
+                                        f"{len(df_status_history)} adet statü değişim kaydı bulundu "
+                                        f"(tarama aralığı: son {int(audit_history_days)} gün)."
+                                    )
+                                    st.caption(f"Audit kaynağı: `{audit_source}`")
+                                    if audit_filter_variant:
+                                        st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
+                                    if audit_warning:
+                                        st.info(audit_warning)
+                                    st.dataframe(df_status_history, width='stretch')
+                                    st.download_button(
+                                        "📥 Statü Geçmişini CSV İndir",
+                                        data=df_status_history.to_csv(index=False).encode("utf-8"),
+                                        file_name=f"status_history_{user_id_clean}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                        mime="text/csv",
+                                        key=f"admin_status_history_download_{user_id_clean}",
+                                    )
+                                else:
+                                    if audit_entities:
+                                        st.warning(
+                                            f"Audit tarafında {len(audit_entities)} kayıt bulundu ancak status filtresine uymadı. "
+                                            "Aşağıda ham audit önizlemesi gösteriliyor."
+                                        )
+                                        st.caption(f"Audit kaynağı: `{audit_source}`")
+                                        if audit_filter_variant:
+                                            st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
+                                        if audit_warning:
+                                            st.info(audit_warning)
+                                        raw_preview_rows = []
+                                        for item in audit_entities[:300]:
+                                            if not isinstance(item, dict):
+                                                continue
+                                            actor_obj = item.get("user") or {}
+                                            actor_id = str(actor_obj.get("id") or "").strip()
+                                            actor_name = _resolve_user_label(
+                                                user_id=actor_id,
+                                                users_info=st.session_state.get("users_info", {}),
+                                                fallback_name=actor_obj.get("name") or actor_obj.get("displayName"),
+                                            )
+                                            entity_obj = item.get("entity") or {}
+                                            message_obj = item.get("message") or {}
+                                            raw_preview_rows.append({
+                                                "Zaman": _format_iso_with_utc_offset(item.get("eventDate"), utc_offset_hours=offset_hours),
+                                                "Servis": item.get("serviceName") or "-",
+                                                "Aksiyon": item.get("action") or "-",
+                                                "EntityType": item.get("entityType") or "-",
+                                                "EntityId": entity_obj.get("id") if isinstance(entity_obj, dict) else "-",
+                                                "Değiştiren": actor_name,
+                                                "Değiştiren ID": actor_id or "-",
+                                                "Mesaj": (
+                                                    message_obj.get("message")
+                                                    or message_obj.get("messageWithParams")
+                                                    or "-"
+                                                ) if isinstance(message_obj, dict) else "-",
+                                                "Audit ID": item.get("id") or "-",
+                                            })
+                                        if raw_preview_rows:
+                                            st.dataframe(pd.DataFrame(raw_preview_rows), width='stretch')
+                                    else:
+                                        st.info(
+                                            "Seçilen aralıkta statü değişim kaydı bulunamadı. "
+                                            "Gün aralığını artırıp tekrar deneyin."
+                                        )
+                                        if audit_filter_variant:
+                                            st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
+                                        if audit_warning:
+                                            st.info(audit_warning)
                             
                             # Groups
-                            groups = user_data.get('groups', [])
-                            if groups:
-                                st.divider()
-                                st.markdown(f"### 👥 Gruplar ({len(groups)})")
-                                group_names = [g.get('name', g.get('id', 'N/A')) for g in groups]
-                                st.write(", ".join(group_names) if group_names else "Grup yok")
+                            current_org = str(org or "").strip()
+                            cached_groups_org = str(st.session_state.get("admin_groups_cache_org") or "").strip()
+                            all_groups = st.session_state.get("admin_groups_cache") or []
+                            if (cached_groups_org != current_org) or (not all_groups):
+                                try:
+                                    all_groups = api.get_groups()
+                                    st.session_state.admin_groups_cache = all_groups
+                                    st.session_state.admin_groups_cache_org = current_org
+                                except Exception as ge:
+                                    all_groups = []
+                                    st.warning(f"Grup listesi alınamadı: {ge}")
+                            all_group_options = {
+                                str(g.get("id")): str(g.get("name") or g.get("id"))
+                                for g in all_groups
+                                if isinstance(g, dict) and g.get("id")
+                            }
+                            group_name_cache = st.session_state.get("admin_group_name_cache") or {}
+                            if not isinstance(group_name_cache, dict):
+                                group_name_cache = {}
+                            st.session_state.admin_group_name_cache = group_name_cache
+
+                            user_groups = user_data.get('groups', [])
+                            if not isinstance(user_groups, list):
+                                user_groups = []
+                            user_group_rows = []
+                            user_group_name_map = {}
+                            for g in user_groups:
+                                if not isinstance(g, dict):
+                                    continue
+                                gid = str(g.get("id") or "").strip()
+                                gname_raw = str(g.get("name") or "").strip()
+                                if (not gname_raw) or (gname_raw == gid):
+                                    gname_raw = str(all_group_options.get(gid) or gname_raw or "").strip()
+                                if gid and ((not gname_raw) or (gname_raw == gid)):
+                                    cached_name = str(group_name_cache.get(gid) or "").strip()
+                                    if cached_name:
+                                        gname_raw = cached_name
+                                if gid and ((not gname_raw) or (gname_raw == gid)):
+                                    try:
+                                        g_detail = api.get_group_by_id(gid)
+                                    except Exception:
+                                        g_detail = None
+                                    if isinstance(g_detail, dict):
+                                        resolved_name = str(g_detail.get("name") or "").strip()
+                                        if resolved_name:
+                                            gname_raw = resolved_name
+                                            group_name_cache[gid] = resolved_name
+                                            all_group_options[gid] = resolved_name
+                                gname = str(gname_raw or gid or "-").strip()
+                                gtype = str(g.get("type") or "GROUP").strip()
+                                if gid:
+                                    user_group_name_map[gid] = gname
+                                user_group_rows.append({
+                                    "Grup Adı": gname,
+                                    "Grup ID": gid or "-",
+                                    "Tür": gtype or "-",
+                                })
+                            st.divider()
+                            st.markdown(f"### 👥 Grup Üyelikleri ({len(user_group_rows)})")
+                            if user_group_rows:
+                                st.dataframe(pd.DataFrame(user_group_rows), width='stretch', hide_index=True)
+                            else:
+                                st.info("Kullanıcı henüz herhangi bir gruba dahil değil.")
+
+                            if all_group_options:
+                                current_group_ids = [row["Grup ID"] for row in user_group_rows if row.get("Grup ID") and row.get("Grup ID") != "-"]
+                                current_group_id_set = set(current_group_ids)
+                                add_candidates = [gid for gid in all_group_options.keys() if gid not in current_group_id_set]
+                                remove_candidates = list(current_group_ids)
+
+                                grp_col_add, grp_col_remove = st.columns(2)
+                                with grp_col_add:
+                                    add_selection = st.multiselect(
+                                        "Kullanıcıyı Ekle (Gruplar)",
+                                        options=add_candidates,
+                                        format_func=lambda x: all_group_options.get(x, x),
+                                        key=f"admin_user_group_add_sel_{user_id_clean}",
+                                        help="Seçilen kullanıcı bu gruplara üye olarak eklenecek."
+                                    )
+                                    if st.button(
+                                        "➕ Seçili Gruplara Ekle",
+                                        key=f"admin_user_group_add_btn_{user_id_clean}",
+                                        disabled=not add_selection,
+                                        use_container_width=True,
+                                    ):
+                                        added = 0
+                                        failed = []
+                                        with st.spinner("Grup üyeliği ekleniyor..."):
+                                            for gid in add_selection:
+                                                try:
+                                                    api.add_group_members(gid, [user_id_clean])
+                                                    added += 1
+                                                except Exception as e:
+                                                    failed.append((all_group_options.get(gid, gid), str(e)))
+                                        if added:
+                                            st.success(f"{added} grup için kullanıcı üyeliği eklendi.")
+                                            st.session_state.admin_groups_refresh = True
+                                        if failed:
+                                            st.warning(f"{len(failed)} grup için ekleme başarısız.")
+                                            for gname, err in failed:
+                                                st.caption(f"❌ {gname}: {err}")
+                                        if added:
+                                            st.rerun()
+
+                                with grp_col_remove:
+                                    remove_selection = st.multiselect(
+                                        "Kullanıcıyı Çıkar (Gruplar)",
+                                        options=remove_candidates,
+                                        format_func=lambda x: user_group_name_map.get(x, all_group_options.get(x, x)),
+                                        key=f"admin_user_group_remove_sel_{user_id_clean}",
+                                        help="Seçilen kullanıcı bu gruplardan çıkarılacak."
+                                    )
+                                    if st.button(
+                                        "➖ Seçili Gruplardan Çıkar",
+                                        key=f"admin_user_group_remove_btn_{user_id_clean}",
+                                        disabled=not remove_selection,
+                                        use_container_width=True,
+                                    ):
+                                        removed = 0
+                                        failed = []
+                                        with st.spinner("Grup üyeliği çıkarılıyor..."):
+                                            for gid in remove_selection:
+                                                try:
+                                                    api.remove_group_members(gid, [user_id_clean])
+                                                    removed += 1
+                                                except Exception as e:
+                                                    failed.append((user_group_name_map.get(gid, gid), str(e)))
+                                        if removed:
+                                            st.success(f"{removed} grup için kullanıcı üyeliği çıkarıldı.")
+                                            st.session_state.admin_groups_refresh = True
+                                        if failed:
+                                            st.warning(f"{len(failed)} grup için çıkarma başarısız.")
+                                            for gname, err in failed:
+                                                st.caption(f"❌ {gname}: {err}")
+                                        if removed:
+                                            st.rerun()
                             
                             # Skills
                             skills = user_data.get('skills', [])
@@ -6140,12 +6967,6 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                 lang_info = [f"{l.get('name', 'N/A')} (Seviye: {l.get('proficiency', 'N/A')})" for l in languages]
                                 st.write(", ".join(lang_info) if lang_info else "Dil yok")
                             
-                            # Raw JSON expander
-                            with st.expander("📄 Ham JSON Verisi"):
-                                raw = user_data.get('raw', user_data)
-                                # Remove 'raw' key to avoid recursion
-                                display_raw = {k: v for k, v in raw.items() if k != 'raw'} if isinstance(raw, dict) else raw
-                                st.json(display_raw)
                         else:
                             st.warning(f"⚠️ Kullanıcı bulunamadı: `{user_id_clean}`")
                     except Exception as e:
