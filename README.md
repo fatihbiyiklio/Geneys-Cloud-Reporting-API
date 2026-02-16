@@ -105,6 +105,8 @@ Notlar:
    - Varsayılan: `GENESYS_WINDOWS_SERVICE_AUTO_INSTALL=1`
    - Servis adı özelleştirme: `GENESYS_WINDOWS_SERVICE_NAME=GenesysReporting`
    - Startup tipi: `GENESYS_WINDOWS_SERVICE_START_MODE=auto`
+   - İndirilen yeni `.exe` ilk açılışta mevcut servisin `binPath` değerini güncel exe'ye otomatik senkronlar.
+   - Servis eski bir exe'ye bağlıysa ve çalışıyorsa, yönetici yetkisiyle açıldığında servis durdurulup yol güncellenir.
    - Not: Servis oluşturmak için bir kez **Administrator** olarak çalıştırmak gerekir.
 
 ---

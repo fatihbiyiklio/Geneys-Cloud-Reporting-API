@@ -50,8 +50,21 @@ def _run_sc_command(*args):
         return False, str(e)
 
 
+def _extract_sc_field(output, field_name):
+    prefix = f"{field_name.upper()}:"
+    for line in (output or "").splitlines():
+        cleaned = line.strip()
+        if cleaned.upper().startswith(prefix):
+            return cleaned.split(":", 1)[1].strip()
+    return ""
+
+
+def _normalize_service_bin_path(value):
+    return " ".join((value or "").replace('"', "").split()).lower()
+
+
 def ensure_windows_service_registration(log_func):
-    """Register this app as a Windows service (startup: automatic)."""
+    """Register or sync this app as a Windows service (startup: automatic)."""
     if not platform.system().lower().startswith("win"):
         return
     if not _env_flag("GENESYS_WINDOWS_SERVICE_AUTO_INSTALL", "1"):
@@ -67,20 +80,54 @@ def ensure_windows_service_registration(log_func):
     if start_mode not in ("auto", "demand", "disabled", "delayed-auto"):
         start_mode = "auto"
 
-    exists, _ = _run_sc_command("query", service_name)
-    if exists:
-        # Keep startup mode in sync.
-        _run_sc_command("config", service_name, "start=", start_mode)
-        return
-
-    if not _is_windows_admin():
-        log_func("Windows service auto-install skipped: run once as Administrator.")
-        return
-
     if getattr(sys, "frozen", False):
         bin_path = f"\"{sys.executable}\""
     else:
         bin_path = f"\"{sys.executable}\" \"{os.path.abspath(__file__)}\""
+
+    is_admin = _is_windows_admin()
+    exists, query_out = _run_sc_command("query", service_name)
+    if exists:
+        qc_ok, qc_out = _run_sc_command("qc", service_name)
+        current_bin_path = _extract_sc_field(qc_out if qc_ok else "", "BINARY_PATH_NAME")
+        needs_bin_update = (
+            not current_bin_path
+            or _normalize_service_bin_path(current_bin_path) != _normalize_service_bin_path(bin_path)
+        )
+
+        if needs_bin_update and not is_admin:
+            log_func(
+                f"Windows service '{service_name}' points to a different executable. "
+                "Run once as Administrator to sync it."
+            )
+            return
+
+        if is_admin:
+            if needs_bin_update and "RUNNING" in (query_out or "").upper():
+                _run_sc_command("stop", service_name)
+                time.sleep(2)
+
+            ok, out = _run_sc_command(
+                "config",
+                service_name,
+                "binPath=",
+                bin_path,
+                "start=",
+                start_mode,
+                "DisplayName=",
+                display_name,
+            )
+            if not ok:
+                log_func(f"Windows service update failed for '{service_name}': {out}")
+                return
+            _run_sc_command("description", service_name, description)
+            if needs_bin_update:
+                log_func(f"Windows service executable synced: {service_name}")
+        return
+
+    if not is_admin:
+        log_func("Windows service auto-install skipped: run once as Administrator.")
+        return
 
     ok, out = _run_sc_command(
         "create",
@@ -184,10 +231,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == CHILD_FLAG:
         sys.exit(run_streamlit_child())
 
-    acquire_single_instance_lock()
-    app_path = resolve_path("app.py")
-    force_port_cleanup = os.environ.get("GENESYS_FORCE_PORT_CLEANUP", "0").strip().lower() in ("1", "true", "yes", "on")
-
     # Log file for debugging startup issues (especially on Windows)
     log_path = os.path.join(os.getcwd(), "app_startup.log")
     def log(msg):
@@ -198,6 +241,9 @@ if __name__ == "__main__":
             pass
 
     ensure_windows_service_registration(log)
+    acquire_single_instance_lock()
+    app_path = resolve_path("app.py")
+    force_port_cleanup = os.environ.get("GENESYS_FORCE_PORT_CLEANUP", "0").strip().lower() in ("1", "true", "yes", "on")
     
     def _is_port_busy(port, host="127.0.0.1", timeout=0.25):
         """Fast port probe to skip expensive process scans when port is already free."""
