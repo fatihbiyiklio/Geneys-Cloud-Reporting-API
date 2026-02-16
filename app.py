@@ -6546,6 +6546,7 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
     with tab6:
         st.subheader("🔍 Kullanıcı Arama (User ID)")
         st.info("Genesys Cloud kullanıcı kimliği (UUID) ile kullanıcı bilgilerini sorgulayabilirsiniz.")
+        st.caption("Kuyruk aktif/pasif yönetimi, kullanıcıyı arattıktan sonra açılan detay ekranında `🎛️ Kuyruk Üyelikleri (Aktif/Pasif)` başlığı altındadır.")
         
         if not st.session_state.get('api_client'):
             st.error("Bu özellik için Genesys Cloud bağlantısı gereklidir.")
@@ -6683,135 +6684,167 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                             st.divider()
                             st.markdown("### 🧭 Statü Değişim Geçmişi (Audit)")
                             st.caption("Bu bölümde seçilen agent için status/presence/routing değişiklikleri ve değişikliği yapan kullanıcı listelenir.")
+                            audit_enabled = st.toggle(
+                                "Audit sorgusunu yükle",
+                                value=False,
+                                key=f"admin_status_audit_enabled_{user_id_clean}",
+                                help="Açık olduğunda Genesys Audit API çağrılır. Kapalı olduğunda çağrı atılmaz.",
+                            )
+                            audit_refresh_clicked = st.button(
+                                "🔄 Audit Geçmişini Yenile",
+                                key=f"admin_status_audit_refresh_{user_id_clean}",
+                                disabled=not audit_enabled,
+                                use_container_width=True,
+                            )
                             try:
                                 offset_hours = _resolve_org_utc_offset_hours(org_code=org, default=3.0, force_reload=False)
                             except Exception:
                                 offset_hours = 3.0
-                            history_end_utc = datetime.now(timezone.utc)
-                            history_start_utc = history_end_utc - timedelta(days=int(audit_history_days))
-                            with st.spinner("Statü değişim geçmişi getiriliyor..."):
-                                audit_payload = api.get_user_status_audit_logs(
-                                    user_id=user_id_clean,
-                                    start_date=history_start_utc,
-                                    end_date=history_end_utc,
-                                    page_size=100,
-                                    max_pages=int(audit_history_pages),
-                                    service_name="Presence",
-                                )
-                                primary_entities = (audit_payload or {}).get("entities") or []
-                                if not primary_entities:
-                                    fallback_payload = api.get_user_status_audit_logs(
-                                        user_id=user_id_clean,
-                                        start_date=history_start_utc,
-                                        end_date=history_end_utc,
-                                        page_size=100,
-                                        max_pages=int(audit_history_pages),
-                                        service_name=None,
-                                    )
-                                    fallback_entities = (fallback_payload or {}).get("entities") or []
-                                    if fallback_entities:
-                                        fb_warning = str((fallback_payload or {}).get("_warning") or "").strip()
-                                        extra_warning = "Presence servisinde kayıt bulunamadığı için tüm servislerde tarama yapıldı."
-                                        if fb_warning:
-                                            fallback_payload["_warning"] = f"{extra_warning} {fb_warning}".strip()
-                                        else:
-                                            fallback_payload["_warning"] = extra_warning
-                                        audit_payload = fallback_payload
-                                    elif (fallback_payload or {}).get("_error") and not (audit_payload or {}).get("_error"):
-                                        audit_payload = fallback_payload
 
-                            audit_error = (audit_payload or {}).get("_error")
-                            audit_entities = (audit_payload or {}).get("entities") or []
-                            audit_source = str((audit_payload or {}).get("source") or "-")
-                            audit_filter_variant = (audit_payload or {}).get("filter_variant") or []
-                            audit_warning = str((audit_payload or {}).get("_warning") or "").strip()
-                            if audit_error:
-                                audit_err_text = str(audit_error)
-                                audit_err_lower = audit_err_text.lower()
-                                if ("audits:audit:view" in audit_err_lower) or ("missing the following permission" in audit_err_lower):
-                                    st.warning(
-                                        "Audit geçmişi alınamadı. Yetki gerekli: `audits:audit:view`.\n\n"
-                                        f"Hata detayı: {audit_error}"
-                                    )
-                                else:
-                                    st.warning(f"Audit geçmişi sorgusunda hata oluştu.\n\nHata detayı: {audit_error}")
+                            if not audit_enabled:
+                                st.info("Audit sorgusu kapalı. İhtiyaç olduğunda yukarıdan açıp manuel yenileyin.")
                             else:
-                                status_rows = _build_status_audit_rows(
-                                    audit_entities=audit_entities,
-                                    target_user_id=user_id_clean,
-                                    users_info=st.session_state.get("users_info", {}),
-                                    presence_map=st.session_state.get("presence_map", {}),
-                                    utc_offset_hours=offset_hours,
+                                audit_cache_store = st.session_state.get("admin_status_audit_cache")
+                                if not isinstance(audit_cache_store, dict):
+                                    audit_cache_store = {}
+                                st.session_state.admin_status_audit_cache = audit_cache_store
+                                audit_cache_key = (
+                                    f"{org}|{user_id_clean}|days:{int(audit_history_days)}|"
+                                    f"pages:{int(audit_history_pages)}"
                                 )
-                                if status_rows:
-                                    df_status_history = pd.DataFrame(status_rows)
-                                    st.success(
-                                        f"{len(df_status_history)} adet statü değişim kaydı bulundu "
-                                        f"(tarama aralığı: son {int(audit_history_days)} gün)."
-                                    )
-                                    st.caption(f"Audit kaynağı: `{audit_source}`")
-                                    if audit_filter_variant:
-                                        st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
-                                    if audit_warning:
-                                        st.info(audit_warning)
-                                    st.dataframe(df_status_history, width='stretch')
-                                    st.download_button(
-                                        "📥 Statü Geçmişini CSV İndir",
-                                        data=df_status_history.to_csv(index=False).encode("utf-8"),
-                                        file_name=f"status_history_{user_id_clean}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                        mime="text/csv",
-                                        key=f"admin_status_history_download_{user_id_clean}",
-                                    )
-                                else:
-                                    if audit_entities:
+                                if audit_refresh_clicked and audit_cache_key in audit_cache_store:
+                                    audit_cache_store.pop(audit_cache_key, None)
+                                    st.session_state.admin_status_audit_cache = audit_cache_store
+
+                                if audit_cache_key not in audit_cache_store:
+                                    history_end_utc = datetime.now(timezone.utc)
+                                    history_start_utc = history_end_utc - timedelta(days=int(audit_history_days))
+                                    with st.spinner("Statü değişim geçmişi getiriliyor..."):
+                                        audit_payload = api.get_user_status_audit_logs(
+                                            user_id=user_id_clean,
+                                            start_date=history_start_utc,
+                                            end_date=history_end_utc,
+                                            page_size=100,
+                                            max_pages=int(audit_history_pages),
+                                            service_name="Presence",
+                                        )
+                                        primary_entities = (audit_payload or {}).get("entities") or []
+                                        if not primary_entities:
+                                            fallback_payload = api.get_user_status_audit_logs(
+                                                user_id=user_id_clean,
+                                                start_date=history_start_utc,
+                                                end_date=history_end_utc,
+                                                page_size=100,
+                                                max_pages=int(audit_history_pages),
+                                                service_name=None,
+                                            )
+                                            fallback_entities = (fallback_payload or {}).get("entities") or []
+                                            if fallback_entities:
+                                                fb_warning = str((fallback_payload or {}).get("_warning") or "").strip()
+                                                extra_warning = "Presence servisinde kayıt bulunamadığı için tüm servislerde tarama yapıldı."
+                                                if fb_warning:
+                                                    fallback_payload["_warning"] = f"{extra_warning} {fb_warning}".strip()
+                                                else:
+                                                    fallback_payload["_warning"] = extra_warning
+                                                audit_payload = fallback_payload
+                                            elif (fallback_payload or {}).get("_error") and not (audit_payload or {}).get("_error"):
+                                                audit_payload = fallback_payload
+                                    audit_cache_store[audit_cache_key] = audit_payload or {}
+                                    st.session_state.admin_status_audit_cache = audit_cache_store
+
+                                audit_payload = audit_cache_store.get(audit_cache_key) or {}
+                                audit_error = (audit_payload or {}).get("_error")
+                                audit_entities = (audit_payload or {}).get("entities") or []
+                                audit_source = str((audit_payload or {}).get("source") or "-")
+                                audit_filter_variant = (audit_payload or {}).get("filter_variant") or []
+                                audit_warning = str((audit_payload or {}).get("_warning") or "").strip()
+                                if audit_error:
+                                    audit_err_text = str(audit_error)
+                                    audit_err_lower = audit_err_text.lower()
+                                    if ("audits:audit:view" in audit_err_lower) or ("missing the following permission" in audit_err_lower):
                                         st.warning(
-                                            f"Audit tarafında {len(audit_entities)} kayıt bulundu ancak status filtresine uymadı. "
-                                            "Aşağıda ham audit önizlemesi gösteriliyor."
+                                            "Audit geçmişi alınamadı. Yetki gerekli: `audits:audit:view`.\n\n"
+                                            f"Hata detayı: {audit_error}"
+                                        )
+                                    else:
+                                        st.warning(f"Audit geçmişi sorgusunda hata oluştu.\n\nHata detayı: {audit_error}")
+                                else:
+                                    status_rows = _build_status_audit_rows(
+                                        audit_entities=audit_entities,
+                                        target_user_id=user_id_clean,
+                                        users_info=st.session_state.get("users_info", {}),
+                                        presence_map=st.session_state.get("presence_map", {}),
+                                        utc_offset_hours=offset_hours,
+                                    )
+                                    if status_rows:
+                                        df_status_history = pd.DataFrame(status_rows)
+                                        st.success(
+                                            f"{len(df_status_history)} adet statü değişim kaydı bulundu "
+                                            f"(tarama aralığı: son {int(audit_history_days)} gün)."
                                         )
                                         st.caption(f"Audit kaynağı: `{audit_source}`")
                                         if audit_filter_variant:
                                             st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
                                         if audit_warning:
                                             st.info(audit_warning)
-                                        raw_preview_rows = []
-                                        for item in audit_entities[:300]:
-                                            if not isinstance(item, dict):
-                                                continue
-                                            actor_obj = item.get("user") or {}
-                                            actor_id = str(actor_obj.get("id") or "").strip()
-                                            actor_name = _resolve_user_label(
-                                                user_id=actor_id,
-                                                users_info=st.session_state.get("users_info", {}),
-                                                fallback_name=actor_obj.get("name") or actor_obj.get("displayName"),
-                                            )
-                                            entity_obj = item.get("entity") or {}
-                                            message_obj = item.get("message") or {}
-                                            raw_preview_rows.append({
-                                                "Zaman": _format_iso_with_utc_offset(item.get("eventDate"), utc_offset_hours=offset_hours),
-                                                "Servis": item.get("serviceName") or "-",
-                                                "Aksiyon": item.get("action") or "-",
-                                                "EntityType": item.get("entityType") or "-",
-                                                "EntityId": entity_obj.get("id") if isinstance(entity_obj, dict) else "-",
-                                                "Değiştiren": actor_name,
-                                                "Değiştiren ID": actor_id or "-",
-                                                "Mesaj": (
-                                                    message_obj.get("message")
-                                                    or message_obj.get("messageWithParams")
-                                                    or "-"
-                                                ) if isinstance(message_obj, dict) else "-",
-                                                "Audit ID": item.get("id") or "-",
-                                            })
-                                        if raw_preview_rows:
-                                            st.dataframe(pd.DataFrame(raw_preview_rows), width='stretch')
-                                    else:
-                                        st.info(
-                                            "Seçilen aralıkta statü değişim kaydı bulunamadı. "
-                                            "Gün aralığını artırıp tekrar deneyin."
+                                        st.dataframe(df_status_history, width='stretch')
+                                        st.download_button(
+                                            "📥 Statü Geçmişini CSV İndir",
+                                            data=df_status_history.to_csv(index=False).encode("utf-8"),
+                                            file_name=f"status_history_{user_id_clean}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                            mime="text/csv",
+                                            key=f"admin_status_history_download_{user_id_clean}",
                                         )
-                                        if audit_filter_variant:
-                                            st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
-                                        if audit_warning:
-                                            st.info(audit_warning)
+                                    else:
+                                        if audit_entities:
+                                            st.warning(
+                                                f"Audit tarafında {len(audit_entities)} kayıt bulundu ancak status filtresine uymadı. "
+                                                "Aşağıda ham audit önizlemesi gösteriliyor."
+                                            )
+                                            st.caption(f"Audit kaynağı: `{audit_source}`")
+                                            if audit_filter_variant:
+                                                st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
+                                            if audit_warning:
+                                                st.info(audit_warning)
+                                            raw_preview_rows = []
+                                            for item in audit_entities[:300]:
+                                                if not isinstance(item, dict):
+                                                    continue
+                                                actor_obj = item.get("user") or {}
+                                                actor_id = str(actor_obj.get("id") or "").strip()
+                                                actor_name = _resolve_user_label(
+                                                    user_id=actor_id,
+                                                    users_info=st.session_state.get("users_info", {}),
+                                                    fallback_name=actor_obj.get("name") or actor_obj.get("displayName"),
+                                                )
+                                                entity_obj = item.get("entity") or {}
+                                                message_obj = item.get("message") or {}
+                                                raw_preview_rows.append({
+                                                    "Zaman": _format_iso_with_utc_offset(item.get("eventDate"), utc_offset_hours=offset_hours),
+                                                    "Servis": item.get("serviceName") or "-",
+                                                    "Aksiyon": item.get("action") or "-",
+                                                    "EntityType": item.get("entityType") or "-",
+                                                    "EntityId": entity_obj.get("id") if isinstance(entity_obj, dict) else "-",
+                                                    "Değiştiren": actor_name,
+                                                    "Değiştiren ID": actor_id or "-",
+                                                    "Mesaj": (
+                                                        message_obj.get("message")
+                                                        or message_obj.get("messageWithParams")
+                                                        or "-"
+                                                    ) if isinstance(message_obj, dict) else "-",
+                                                    "Audit ID": item.get("id") or "-",
+                                                })
+                                            if raw_preview_rows:
+                                                st.dataframe(pd.DataFrame(raw_preview_rows), width='stretch')
+                                        else:
+                                            st.info(
+                                                "Seçilen aralıkta statü değişim kaydı bulunamadı. "
+                                                "Gün aralığını artırıp tekrar deneyin."
+                                            )
+                                            if audit_filter_variant:
+                                                st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
+                                            if audit_warning:
+                                                st.info(audit_warning)
                             
                             # Groups
                             current_org = str(org or "").strip()
@@ -6951,6 +6984,177 @@ elif st.session_state.page == get_text(lang, "admin_panel") and role == "Admin":
                                         if removed:
                                             st.rerun()
                             
+                            # Queue Memberships (Active/Passive without removing membership)
+                            st.divider()
+                            st.markdown("### 🎛️ Kuyruk Üyelikleri (Aktif/Pasif)")
+                            st.caption("Bu bölümde kullanıcının üye olduğu kuyruklar listelenir. Üyelik silinmez, sadece aktif/pasif (joined) durumu değiştirilir.")
+                            st.caption("Not: Genesys bu güncellemeyi asenkron işler; değişikliklerin görünmesi birkaç saniye sürebilir.")
+
+                            queue_memberships_cache_key = f"admin_user_queue_memberships_{org}_{user_id_clean}"
+                            queue_memberships_refresh_key = f"{queue_memberships_cache_key}_refresh"
+                            if st.button(
+                                "🔄 Kuyruk Üyeliklerini Yenile",
+                                key=f"admin_user_queue_refresh_btn_{user_id_clean}",
+                                use_container_width=True,
+                            ):
+                                st.session_state[queue_memberships_refresh_key] = True
+
+                            should_refresh_queue_memberships = bool(st.session_state.get(queue_memberships_refresh_key))
+                            if queue_memberships_cache_key not in st.session_state:
+                                should_refresh_queue_memberships = True
+
+                            if should_refresh_queue_memberships:
+                                with st.spinner("Kullanıcının kuyruk üyelikleri getiriliyor..."):
+                                    try:
+                                        st.session_state[queue_memberships_cache_key] = api.get_user_queues(
+                                            user_id_clean,
+                                            joined=None,
+                                        )
+                                        st.session_state[queue_memberships_refresh_key] = False
+                                    except Exception as qe:
+                                        st.warning(f"Kuyruk üyelikleri alınamadı: {qe}")
+                                        st.session_state[queue_memberships_refresh_key] = True
+                                        if queue_memberships_cache_key not in st.session_state:
+                                            st.session_state[queue_memberships_cache_key] = []
+
+                            user_queue_memberships = st.session_state.get(queue_memberships_cache_key, []) or []
+                            if user_queue_memberships:
+                                active_queue_count = sum(
+                                    1 for q in user_queue_memberships
+                                    if isinstance(q, dict) and bool(q.get("joined"))
+                                )
+                                passive_queue_count = max(0, len(user_queue_memberships) - active_queue_count)
+                                st.caption(
+                                    f"Toplam kuyruk: {len(user_queue_memberships)} | "
+                                    f"Aktif: {active_queue_count} | Pasif: {passive_queue_count}"
+                                )
+
+                                queue_search = st.text_input(
+                                    "Kuyruk Ara (Ad veya ID)",
+                                    key=f"admin_user_queue_search_{user_id_clean}",
+                                    placeholder="Kuyruk adı veya ID ile filtrele",
+                                )
+                                queue_search_lower = str(queue_search or "").strip().lower()
+                                filtered_queue_memberships = []
+                                for q in user_queue_memberships:
+                                    if not isinstance(q, dict):
+                                        continue
+                                    qid = str(q.get("id") or "").strip()
+                                    qname = str(q.get("name") or qid).strip()
+                                    if queue_search_lower and (queue_search_lower not in qname.lower()) and (queue_search_lower not in qid.lower()):
+                                        continue
+                                    filtered_queue_memberships.append({
+                                        "Kuyruk Adı": qname,
+                                        "Kuyruk ID": qid,
+                                        "Durum": "Aktif" if bool(q.get("joined")) else "Pasif",
+                                    })
+
+                                if filtered_queue_memberships:
+                                    st.dataframe(
+                                        pd.DataFrame(filtered_queue_memberships),
+                                        width='stretch',
+                                        hide_index=True,
+                                    )
+                                else:
+                                    st.info("Filtreye uygun kuyruk bulunamadı.")
+
+                                selectable_queue_options = {}
+                                for q in user_queue_memberships:
+                                    if not isinstance(q, dict):
+                                        continue
+                                    qid = str(q.get("id") or "").strip()
+                                    if not qid:
+                                        continue
+                                    qname = str(q.get("name") or qid).strip()
+                                    status_text = "Aktif" if bool(q.get("joined")) else "Pasif"
+                                    selectable_queue_options[qid] = f"{qname} ({status_text})"
+
+                                selectable_queue_ids = list(selectable_queue_options.keys())
+                                queue_toggle_multiselect_key = f"admin_user_queue_toggle_sel_{user_id_clean}"
+                                queue_sel_col1, queue_sel_col2 = st.columns(2)
+                                with queue_sel_col1:
+                                    if st.button(
+                                        "☑️ Tümünü Seç",
+                                        key=f"admin_user_queue_select_all_btn_{user_id_clean}",
+                                        use_container_width=True,
+                                    ):
+                                        st.session_state[queue_toggle_multiselect_key] = list(selectable_queue_ids)
+                                with queue_sel_col2:
+                                    if st.button(
+                                        "🧹 Seçimi Temizle",
+                                        key=f"admin_user_queue_clear_sel_btn_{user_id_clean}",
+                                        use_container_width=True,
+                                    ):
+                                        st.session_state[queue_toggle_multiselect_key] = []
+
+                                selected_queue_ids_for_toggle = st.multiselect(
+                                    "Durumu değiştirilecek kuyruklar",
+                                    options=selectable_queue_ids,
+                                    format_func=lambda x: selectable_queue_options.get(x, x),
+                                    key=queue_toggle_multiselect_key,
+                                )
+
+                                queue_col_activate, queue_col_deactivate = st.columns(2)
+                                with queue_col_activate:
+                                    if st.button(
+                                        "✅ Seçili Kuyrukları Aktif Yap",
+                                        key=f"admin_user_queue_activate_btn_{user_id_clean}",
+                                        disabled=not selected_queue_ids_for_toggle,
+                                        use_container_width=True,
+                                    ):
+                                        with st.spinner("Seçili kuyruklar aktif yapılıyor..."):
+                                            results = api.set_user_queues_joined(
+                                                user_id_clean,
+                                                selected_queue_ids_for_toggle,
+                                                joined=True,
+                                            )
+                                        success_ids = [qid for qid, r in results.items() if isinstance(r, dict) and r.get("success")]
+                                        failed_rows = [
+                                            (qid, (r or {}).get("error", "Bilinmeyen hata"))
+                                            for qid, r in results.items()
+                                            if not (isinstance(r, dict) and r.get("success"))
+                                        ]
+                                        if success_ids:
+                                            st.success(f"{len(success_ids)} kuyruk aktif yapıldı.")
+                                            st.session_state[queue_memberships_refresh_key] = True
+                                        if failed_rows:
+                                            st.warning(f"{len(failed_rows)} kuyruk için aktif etme başarısız oldu.")
+                                            for qid, err in failed_rows[:10]:
+                                                st.caption(f"❌ {selectable_queue_options.get(qid, qid)}: {err}")
+                                        if success_ids:
+                                            st.rerun()
+
+                                with queue_col_deactivate:
+                                    if st.button(
+                                        "⏸️ Seçili Kuyrukları Pasif Yap",
+                                        key=f"admin_user_queue_deactivate_btn_{user_id_clean}",
+                                        disabled=not selected_queue_ids_for_toggle,
+                                        use_container_width=True,
+                                    ):
+                                        with st.spinner("Seçili kuyruklar pasif yapılıyor..."):
+                                            results = api.set_user_queues_joined(
+                                                user_id_clean,
+                                                selected_queue_ids_for_toggle,
+                                                joined=False,
+                                            )
+                                        success_ids = [qid for qid, r in results.items() if isinstance(r, dict) and r.get("success")]
+                                        failed_rows = [
+                                            (qid, (r or {}).get("error", "Bilinmeyen hata"))
+                                            for qid, r in results.items()
+                                            if not (isinstance(r, dict) and r.get("success"))
+                                        ]
+                                        if success_ids:
+                                            st.success(f"{len(success_ids)} kuyruk pasif yapıldı.")
+                                            st.session_state[queue_memberships_refresh_key] = True
+                                        if failed_rows:
+                                            st.warning(f"{len(failed_rows)} kuyruk için pasif etme başarısız oldu.")
+                                            for qid, err in failed_rows[:10]:
+                                                st.caption(f"❌ {selectable_queue_options.get(qid, qid)}: {err}")
+                                        if success_ids:
+                                            st.rerun()
+                            else:
+                                st.info("Kullanıcının kuyruk üyeliği bulunamadı.")
+
                             # Skills
                             skills = user_data.get('skills', [])
                             if skills:

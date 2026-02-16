@@ -1105,6 +1105,85 @@ class GenesysAPI:
             time.sleep(0.2)
         return results
 
+    def get_user_queues(self, user_id, joined=None, page_size=100):
+        """Fetch queue memberships for a user.
+
+        Endpoint: GET /api/v2/users/{userId}/queues
+        joined=None fetches all visible queues (active + passive) by merging joined=true/false.
+        """
+        if not user_id:
+            return []
+
+        if joined is None:
+            active_rows = self.get_user_queues(user_id, joined=True, page_size=page_size) or []
+            passive_rows = self.get_user_queues(user_id, joined=False, page_size=page_size) or []
+            merged = {}
+            for row in active_rows + passive_rows:
+                if not isinstance(row, dict):
+                    continue
+                qid = str(row.get("id") or "").strip()
+                if not qid:
+                    continue
+                item = {
+                    "id": qid,
+                    "name": str(row.get("name") or qid),
+                    "joined": bool(row.get("joined", False)),
+                }
+                prev = merged.get(qid)
+                if (not prev) or item["joined"]:
+                    merged[qid] = item
+            return sorted(merged.values(), key=lambda x: str(x.get("name") or "").lower())
+
+        entities = []
+        page_number = 1
+        while True:
+            params = {
+                "pageSize": int(page_size or 100),
+                "pageNumber": page_number,
+                "joined": "true" if bool(joined) else "false",
+            }
+            data = self._get(f"/api/v2/users/{user_id}/queues", params=params)
+            rows = data.get("entities") if isinstance(data, dict) else None
+            if isinstance(rows, list):
+                entities.extend(rows)
+            if not (isinstance(data, dict) and data.get("nextUri")):
+                break
+            page_number += 1
+        return entities
+
+    def set_user_queues_joined(self, user_id, queue_ids, joined):
+        """Set joined(active/passive) status for user queue memberships.
+
+        Endpoint: PATCH /api/v2/users/{userId}/queues
+        Body: [{"id": "<queueId>", "joined": true|false}, ...]
+        """
+        results = {}
+        if not user_id:
+            return results
+
+        normalized_queue_ids = [str(qid).strip() for qid in (queue_ids or []) if str(qid).strip()]
+        if not normalized_queue_ids:
+            return results
+
+        target_joined = bool(joined)
+        for queue_batch in self._chunk_list(normalized_queue_ids, self.ASSIGNMENT_BATCH_SIZE):
+            body = [{"id": qid, "joined": target_joined} for qid in queue_batch]
+            try:
+                self._patch(f"/api/v2/users/{user_id}/queues", data=body)
+                for qid in queue_batch:
+                    results[qid] = {"success": True, "joined": target_joined}
+            except Exception as e:
+                err = self._extract_error_detail(e)
+                monitor.log_error(
+                    "API_PATCH",
+                    f"Error updating joined status for user {user_id} queues {queue_batch}: {err}",
+                )
+                for qid in queue_batch:
+                    results[qid] = {"success": False, "joined": target_joined, "error": err}
+            time.sleep(0.2)
+
+        return results
+
     def remove_group_members(self, group_id, member_ids):
         """Remove members from a group.
         DELETE /api/v2/groups/{groupId}/members with ids query param.
@@ -1351,31 +1430,14 @@ class GenesysAPI:
             return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         interval = f"{_to_utc_iso(start_date)}/{_to_utc_iso(end_date)}"
+        # Keep variants minimal to avoid bursty 400/429 retries on strict orgs.
         filter_variants = [
             [
                 {"property": "EntityId", "value": uid},
                 {"property": "EntityType", "value": "USER"},
             ],
             [
-                {"property": "EntityId", "value": uid},
-                {"property": "EntityType", "value": "User"},
-            ],
-            [
-                {"property": "EntityId", "value": uid},
-                {"property": "EntityType", "value": "user"},
-            ],
-            # Defensive fallback for orgs that validate filter key casing differently.
-            [
-                {"property": "entityId", "value": uid},
-                {"property": "entityType", "value": "USER"},
-            ],
-            [
-                {"property": "entityId", "value": uid},
-                {"property": "entityType", "value": "User"},
-            ],
-            [
-                {"property": "entityId", "value": uid},
-                {"property": "entityType", "value": "user"},
+                {"property": "UserId", "value": uid},
             ],
         ]
 
