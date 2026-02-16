@@ -117,30 +117,52 @@ Notlar:
 ## 🧱 Proje Yapısı
 
 ```
-├── app.py                 # Ana Streamlit arayüzü (3800+ satır)
-├── run_app.py             # Başlatıcı script (port kontrolü, auto-restart)
-├── Dockerfile             # Container yapılandırması
-├── requirements.txt       # Python bağımlılıkları
-├── deploy/iis/            # IIS reverse proxy entegrasyonu
+├── app.py                     # Composition root (session/bootstrap + ortak yardımcılar)
+├── run_app.py                 # Başlatıcı script (port kontrolü, auto-restart)
+├── Dockerfile
+├── requirements.txt
+├── deploy/iis/
 │   ├── setup-iis-proxy.ps1
 │   └── web.config.template
 │
 ├── src/
-│   ├── api.py             # Genesys Cloud REST API entegrasyonu
-│   ├── auth.py            # OAuth2 token yönetimi
-│   ├── auth_manager.py    # Kullanıcı/rol yönetimi
-│   ├── data_manager.py    # Background veri çekme (thread-safe cache)
-│   ├── notifications.py   # WebSocket notification manager'lar
-│   ├── processor.py       # Veri işleme ve metrik hesaplama
-│   ├── monitor.py         # API kullanım istatistikleri
-│   └── lang.py            # Çoklu dil desteği (TR/EN)
+│   ├── app/                   # Yeni uygulama katmanı
+│   │   ├── router.py          # Sayfa yönlendirme
+│   │   ├── context.py         # Sayfa/servis context bağlama
+│   │   ├── pages/             # İnce UI entrypoint dosyaları
+│   │   │   ├── dashboard.py
+│   │   │   ├── reports.py
+│   │   │   ├── users.py
+│   │   │   ├── org_settings.py
+│   │   │   ├── admin_panel.py
+│   │   │   └── metrics_guide.py
+│   │   ├── services/          # Sayfa servisleri (asıl iş akışı)
+│   │   │   ├── dashboard_service.py
+│   │   │   ├── reports_service.py
+│   │   │   ├── users_service.py
+│   │   │   ├── org_settings_service.py
+│   │   │   ├── admin_panel_service.py
+│   │   │   └── metrics_guide_service.py
+│   │   └── utils/             # Ortak yardımcılar (status/call/chart/report)
+│   │       ├── status_helpers.py
+│   │       ├── conversation_helpers.py
+│   │       └── report_ui_helpers.py
+│   │
+│   ├── pages/                 # Geriye dönük uyumluluk wrapper katmanı
+│   ├── api.py                 # Genesys Cloud REST API entegrasyonu
+│   ├── auth.py                # OAuth2 token yönetimi
+│   ├── auth_manager.py        # Kullanıcı/rol yönetimi
+│   ├── data_manager.py        # Background veri çekme (thread-safe cache)
+│   ├── notifications.py       # WebSocket notification manager'lar
+│   ├── processor.py           # Veri işleme ve metrik hesaplama
+│   ├── monitor.py             # API kullanım istatistikleri
+│   └── lang.py                # Çoklu dil desteği (TR/EN)
 │
-├── orgs/                  # Organizasyon verileri
+├── orgs/
 │   └── {org_code}/
-│       ├── credentials.enc    # Şifrelenmiş API credentials
-│       ├── users.json         # Kullanıcı hesapları
+│       ├── credentials.enc
+│       ├── users.json
 │       └── dashboard_config.json
-
 ```
 
 ---

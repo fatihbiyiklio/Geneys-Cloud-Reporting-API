@@ -121,7 +121,7 @@ jobs:
 
       - name: Validate Python syntax (Linux)
         run: |
-          python -m py_compile app.py run_app.py src/auth_manager.py src/api.py src/processor.py
+          python -m compileall -q app.py run_app.py src
 
       - name: Build Linux binary with PyInstaller
         run: |
@@ -184,7 +184,7 @@ jobs:
 
       - name: Validate Python syntax (Windows)
         run: |
-          python -m py_compile app.py run_app.py src/auth_manager.py src/api.py src/processor.py
+          python -m compileall -q app.py run_app.py src
 
       - name: Build with PyInstaller
         run: |
