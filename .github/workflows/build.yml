@@ -211,7 +211,6 @@ jobs:
         run: |
           $sha = "${{ github.sha }}"
           $tag = "${{ needs.create-tag-release.outputs.tag_name }}"
-          Copy-Item "dist/GenesysReporting.exe" "dist/GenesysReporting-$sha.exe"
           @"
           sha=$sha
           ref=${{ github.ref }}
@@ -226,7 +225,6 @@ jobs:
           name: GenesysReporting-windows-exe
           path: |
             dist/GenesysReporting.exe
-            dist/GenesysReporting-${{ github.sha }}.exe
             dist/build-info-windows.txt
 
   release-assets:
@@ -257,7 +255,6 @@ jobs:
             --repo "$GH_REPO" \
             release/GenesysReporting-linux \
             release/GenesysReporting.exe \
-            release/GenesysReporting-${GITHUB_SHA}.exe \
             release/build-info-linux.txt \
             release/build-info-windows.txt \
             --clobber

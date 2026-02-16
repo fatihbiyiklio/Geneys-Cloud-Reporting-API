@@ -6582,6 +6582,46 @@ elif st.session_state.page == get_text(lang, "menu_dashboard"):
                         "Avg Handle Time": f"{avg_handle/60:.1f}m" if avg_handle else "0",
                         "Avg Wait Time": f"{avg_wait:.0f}s" if avg_wait else "0",
                     }
+                    # Short-lived fallback cache to avoid empty flashes between refresh cycles.
+                    now_ts = pytime.time()
+                    card_cache = st.session_state.get("_dashboard_card_last_by_target", {})
+                    if not isinstance(card_cache, dict):
+                        card_cache = {}
+                    refresh_s_local = _resolve_refresh_interval_seconds(org, minimum=3, default=15)
+                    fallback_ttl = max(30, int(refresh_s_local) * 4)
+                    mode = st.session_state.get("dashboard_mode", "Live")
+                    if mode == "Date":
+                        mode_sig = f"Date:{st.session_state.get('dashboard_date', datetime.today()).isoformat()}"
+                    else:
+                        mode_sig = str(mode)
+                    media_sig = ",".join(sorted(str(m).strip().lower() for m in (selected_media or []) if m))
+                    queue_sig = ",".join(sorted(str(q).strip().lower() for q in resolved_card_queues))
+                    card_cache_key = f"v2|mode:{mode_sig}|card:{card.get('id')}|q:{queue_sig}|media:{media_sig}"
+                    has_source_data = bool(items_daily) if mode != "Live" else bool(items_live or items_daily or unique_agents)
+                    if has_source_data:
+                        card_cache[card_cache_key] = {
+                            "ts": now_ts,
+                            "live_values": dict(live_values),
+                            "daily_values": dict(daily_values),
+                            "off": off,
+                            "ans": ans,
+                            "abn": abn,
+                            "sl": sl,
+                        }
+                        if len(card_cache) > 200:
+                            oldest = sorted(card_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(card_cache) - 200]
+                            for k, _ in oldest:
+                                card_cache.pop(k, None)
+                        st.session_state["_dashboard_card_last_by_target"] = card_cache
+                    else:
+                        cached = card_cache.get(card_cache_key) or {}
+                        if cached and (now_ts - float(cached.get("ts", 0) or 0)) <= fallback_ttl:
+                            live_values = dict(cached.get("live_values") or live_values)
+                            daily_values = dict(cached.get("daily_values") or daily_values)
+                            off = float(cached.get("off", off) or 0)
+                            ans = float(cached.get("ans", ans) or 0)
+                            abn = float(cached.get("abn", abn) or 0)
+                            sl = float(cached.get("sl", sl) or 0)
                     _dashboard_profile_record("cards.compute", pytime.perf_counter() - calc_t0)
                     
                     render_t0 = pytime.perf_counter()

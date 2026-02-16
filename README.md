@@ -45,7 +45,7 @@ GitHub Actions her `main/master` push'unda otomatik tag + release üretir.
 - Önce benzersiz bir `v*` tag oluşturulur ve release açılır.
 - Aynı akışta Linux binary (`GenesysReporting-linux`) ve Windows EXE (`GenesysReporting.exe`) build edilir.
 - Dosyalar otomatik olarak bu tag release'ine eklenir.
-- Release/Artifact içinde ayrıca commit izleme için `GenesysReporting-<commit_sha>.exe`, `build-info-linux.txt` ve `build-info-windows.txt` bulunur.
+- Release/Artifact içinde izleme için `build-info-linux.txt` ve `build-info-windows.txt` bulunur.
 - Güncellik doğrulaması için `build-info-*.txt` dosyalarındaki `sha` alanını kontrol edin.
 
 ### Windows + IIS Reverse Proxy

@@ -32,6 +32,7 @@ class DataManager:
         self.queue_members_cache = {} 
         self.last_member_refresh = 0
         self.last_daily_refresh = 0
+        self.last_daily_interval_key = None
         self.last_update_time = 0
         self.last_cache_cleanup = 0
         self.error_log = [] # For console sync in app.py
@@ -242,17 +243,25 @@ class DataManager:
             try:
                 start_utc, end_utc = self._local_today_utc_interval()
                 query_interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+                daily_interval_key = start_utc.strftime("%Y-%m-%d")
 
                 daily_response = self.api.get_queue_daily_stats(q_ids, interval=query_interval)
                 from src.processor import process_daily_stats
                 new_daily = process_daily_stats(daily_response, id_map) if daily_response else {}
                 new_daily = new_daily or {}
                 with self._lock:
-                    # Replace monitored queues atomically so empty successful responses
-                    # don't keep stale prior-day values.
-                    preserved = {q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names}
-                    preserved.update(new_daily)
-                    self.daily_data_cache = preserved
+                    previous_interval_key = self.last_daily_interval_key
+                    if new_daily:
+                        # Fresh data: replace monitored queue values atomically.
+                        preserved = {q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names}
+                        preserved.update(new_daily)
+                        self.daily_data_cache = preserved
+                    elif previous_interval_key != daily_interval_key:
+                        # Day rollover: clear monitored queues to avoid carrying previous day totals.
+                        preserved = {q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names}
+                        self.daily_data_cache = preserved
+                    # Same-day empty response is treated as transient; keep existing monitored values.
+                    self.last_daily_interval_key = daily_interval_key
                     self.last_daily_refresh = current_time
             except Exception as e:
                 self._log_error(f"Daily stats refresh error: {e}")
