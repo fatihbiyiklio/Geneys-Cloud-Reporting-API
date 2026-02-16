@@ -89,10 +89,10 @@ Notlar:
 
 3. **İlk Admin Girişi (Güvenli Bootstrap):**
    - Kullanıcı: `admin`
-   - Şifre:
-   - `GENESYS_BOOTSTRAP_ADMIN_PASSWORD` ortam değişkeni verilirse bu değer kullanılır.
-   - Verilmezse uygulama ilk açılışta rastgele güçlü şifre üretir ve `orgs/default/_bootstrap_admin_password.txt` dosyasına yazar.
-   - İlk girişte şifre değişikliği zorunludur.
+   - Organizasyon: `default`
+   - `GENESYS_BOOTSTRAP_ADMIN_PASSWORD` ortam değişkeni verilirse bu değer başlangıç şifresi olur.
+   - Verilmezse uygulama ilk açılışta login ekranı yerine "İlk Kurulum: Admin Şifresi Belirleyin" formunu gösterir.
+   - Bu form tamamlanmadan normal kullanıcı girişi açılmaz.
 
 4. **Org Code Kuralı:**
    - Organizasyon kodu şu regex’e uymalıdır: `^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$`

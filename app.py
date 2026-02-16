@@ -3744,8 +3744,43 @@ if st.session_state.app_user:
             st.session_state.get("dashboard_cards", [{"id": 0, "title": "", "queues": [], "size": "medium"}])
         )
 
+def _is_bootstrap_admin_setup_required():
+    try:
+        default_users = auth_manager.get_all_users("default") or {}
+        admin_user = default_users.get("admin") or {}
+        return bool(admin_user and admin_user.get("must_change_password"))
+    except Exception:
+        return False
+
 # --- APP LOGIN ---
 if not st.session_state.app_user:
+    if _is_bootstrap_admin_setup_required():
+        st.markdown("<h1 style='text-align: center;'>Genesys Reporting API</h1>", unsafe_allow_html=True)
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c2:
+            with st.form("bootstrap_admin_password_setup_form"):
+                st.subheader("İlk Kurulum: Admin Şifresi Belirleyin")
+                st.info("Uygulama ilk açılışta güvenlik için admin şifresi oluşturulmasını zorunlu tutar.")
+                st.caption("Organizasyon: default | Kullanıcı: admin")
+                new_pw = st.text_input("Yeni Admin Şifresi", type="password")
+                new_pw2 = st.text_input("Yeni Admin Şifresi (Tekrar)", type="password")
+                if st.form_submit_button("Kurulumu Tamamla", width='stretch'):
+                    if not new_pw or not new_pw2:
+                        st.error("Lütfen iki alanı da doldurun.")
+                    elif new_pw != new_pw2:
+                        st.error("Şifreler eşleşmiyor.")
+                    elif len(new_pw) < 8:
+                        st.error("Şifre en az 8 karakter olmalıdır.")
+                    else:
+                        ok, msg = auth_manager.reset_password("default", "admin", new_pw)
+                        if ok:
+                            _clear_login_failures("default", "admin")
+                            st.success("Admin şifresi oluşturuldu. Giriş ekranına yönlendiriliyorsunuz.")
+                            st.rerun()
+                        else:
+                            st.error(msg)
+        st.stop()
+
     _ensure_cookie_component_ready(max_retries=8)
     # Try Auto-Login from Encrypted Session File
     saved_session = load_app_session()

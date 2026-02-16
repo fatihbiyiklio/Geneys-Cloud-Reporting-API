@@ -119,6 +119,10 @@ jobs:
           pip install -r requirements.txt
           pip install "pyinstaller>=6.3.0"
 
+      - name: Validate Python syntax (Linux)
+        run: |
+          python -m py_compile app.py run_app.py src/auth_manager.py
+
       - name: Build Linux binary with PyInstaller
         run: |
           pyinstaller --clean --noconfirm --onefile --name "GenesysReporting-linux" \
@@ -177,6 +181,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install "pyinstaller>=6.3.0"
+
+      - name: Validate Python syntax (Windows)
+        run: |
+          python -m py_compile app.py run_app.py src/auth_manager.py
 
       - name: Build with PyInstaller
         run: |
