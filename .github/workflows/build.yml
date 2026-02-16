@@ -44,12 +44,14 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG_NAME="${{ steps.tag.outputs.tag_name }}"
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+          if gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
             echo "Release already exists: $TAG_NAME"
           else
             gh release create "$TAG_NAME" \
+              --repo "$GH_REPO" \
               --target "$GITHUB_SHA" \
               --title "$TAG_NAME" \
               --generate-notes
@@ -234,12 +236,17 @@ jobs:
           path: release
           merge-multiple: true
 
+      - name: List downloaded files
+        run: ls -lah release
+
       - name: Upload assets to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG_NAME="${{ needs.create-tag-release.outputs.tag_name }}"
           gh release upload "$TAG_NAME" \
+            --repo "$GH_REPO" \
             release/GenesysReporting-linux \
             release/GenesysReporting.exe \
             release/GenesysReporting-${GITHUB_SHA}.exe \
@@ -250,9 +257,10 @@ jobs:
       - name: Verify release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG_NAME="${{ needs.create-tag-release.outputs.tag_name }}"
-          gh release view "$TAG_NAME" --json assets
+          gh release view "$TAG_NAME" --repo "$GH_REPO" --json assets
 
       - name: Publish build summary
         run: |
