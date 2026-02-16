@@ -16,6 +16,8 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 - `oServiceLevel`: `stats.numerator / stats.denominator * 100` olarak hesaplanır.
 - `AvgHandle`: `tHandle / CountHandle` (CountHandle = `tHandle` count).
 - Süre metrikleri gösterimde `HH:MM:SS` formatına çevrilir.
+- `report_detailed` içinde `Kuyruk Toplamı` satırları, ayrı `groupBy=["queueId"]` aggregate sorgusundan üretilir (userId boş bucket kullanılmaz).
+- `nChatAnswered` / `nChatOffered` sadece `report_detailed` için ayrı chat aggregate sorgularından türetilir (`mediaType in ["chat","message"]`).
 
 ## 3) UI -> API Metric Dönüşümleri
 
@@ -28,7 +30,7 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 | `nWrapup` | `tAcw` | Sayı olarak `tAcw.count` kullanılır |
 | `nHandled` | `tHandle` | Sayı olarak `tHandle.count` kullanılır |
 | `nOutbound` | `nOutbound` + `tTalk` | Süre alias’ı için `tTalk` da çağrılır |
-| `tOutbound` | `tTalk` | Uygulama alias’ı |
+| `tOutbound` | `nOutbound` + `tTalk` | `nOutbound > 0` olan satırlarda `tTalk` süresi outbound süre olarak yazılır |
 | `nNotResponding` | `tNotResponding` | Sayı olarak `tNotResponding.count` |
 | `nAlert` | `tAlert` | Sayı olarak `tAlert.count` |
 | `nConsultTransferred` | `nConsultTransferred` | Doğrudan |
@@ -36,6 +38,8 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 | `tLongestTalk` | `tTalk` | `tTalk.stats.max` üzerinden türetilir (sn) |
 | `tAverageTalk` | `tTalk` | `tTalk / ntTalk` ile türetilir (sn) |
 | `tChatTalk` | `tTalk` | Chat medya filtresiyle kullanıldığında chat konuşma süresi olarak yorumlanır |
+| `nChatAnswered` | `nConnected` | Detaylı raporda ayrı chat sorgusunda `nConnected > nHandled > nTalk` önceliğiyle türetilir |
+| `nChatOffered` | `nOffered` | Detaylı raporda ayrı chat sorgusunda `max(nOffered, nChatAnswered)` olarak türetilir |
 | `tBreak` | `tHandle` | API çağrısı için taşıyıcı metric; değer user aggregate’dan türetilir |
 | `oEfficiency` | `tHandle` | API çağrısı için taşıyıcı metric; oran uygulamada hesaplanır |
 
@@ -43,7 +47,7 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 
 ### 4.1 Konuşma Aggregate Metrikleri
 
-`nOffered`, `nAnswered`, `nAbandon`, `nTransferred`, `oServiceLevel`,  
+`nOffered`, `nAnswered`, `nChatAnswered`, `nChatOffered`, `nAbandon`, `nTransferred`, `oServiceLevel`,  
 `tAnswered`, `tAbandon`, `tTalk`, `tAcw`, `tHandle`, `tHeld`, `tWait`, `tAcd`, `tAlert`,  
 `nOutbound`, `tOutbound`, `nNotResponding`, `nConsult`, `nConsultTransferred`,  
 `nBlindTransferred`, `nConnected`, `nOverSla`, `nError`, `nWrapup`, `nAlert`, `nHandled`,  
@@ -61,7 +65,7 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 
 Uygulama türevi (hesaplanan) metrikler:
 
-`tLongestTalk`, `tAverageTalk`, `tChatTalk`, `tBreak`, `oEfficiency`
+`tLongestTalk`, `tAverageTalk`, `tChatTalk`, `tBreak`, `oEfficiency`, `nChatAnswered`, `nChatOffered`
 
 ### 4.2 Kullanıcı Durum/Operasyon Metrikleri
 
@@ -150,7 +154,7 @@ Uygulama çıktısı:
 
 ### 7.5 `tOutbound` (UI seçimi)
 
-UI’de `tOutbound` seçilince API’de `tTalk` istenir (uygulama alias’ı).
+UI’de `tOutbound` seçilince API’de `nOutbound` ve `tTalk` birlikte istenir.
 
 Genesys response (örnek):
 
@@ -160,7 +164,8 @@ Genesys response (örnek):
 Uygulama çıktısı:
 
 - `tTalk = 540` saniye
-- `tOutbound = 540` saniye (alias)
+- Eğer `nOutbound > 0` ise `tOutbound = 540` saniye
+- Eğer `nOutbound = 0` ise `tOutbound = 0` saniye
 
 ## 8) Metrik Sözlüğü (Her Metriğin Açıklaması)
 
@@ -170,6 +175,8 @@ Uygulama çıktısı:
 |---|---|
 | `nOffered` | Kuyruğa sunulan toplam etkileşim adedi. |
 | `nAnswered` | Cevaplanan etkileşim adedi (`tAnswered.count` türevi). |
+| `nChatAnswered` | Chat/Mesaj için cevaplanan adet (detaylı raporda ayrı chat aggregate’tan türetilir). |
+| `nChatOffered` | Chat/Mesaj için gelen adet (`max(nOffered, nChatAnswered)` kuralı). |
 | `nAbandon` | Agent’a bağlanmadan düşen/terk edilen etkileşim adedi (`tAbandon.count` türevi). |
 | `nTransferred` | Transfer edilen etkileşim adedi. |
 | `nConsult` | Danışma (consult) başlatılan etkileşim adedi. |
@@ -198,7 +205,7 @@ Uygulama çıktısı:
 | `tLongestTalk` | Interval bazında en uzun konuşma süresi (`tTalk.stats.max` türevi). |
 | `tAverageTalk` | Ortalama konuşma süresi (`tTalk / ntTalk`). |
 | `tChatTalk` | `tTalk` alias’ı; chat filtresi ile chat görüşme süresi olarak kullanılır. |
-| `tOutbound` | Uygulama alias’ı; `tTalk` üzerinden türetilir. |
+| `tOutbound` | Outbound süre; `nOutbound > 0` ise `tTalk`’dan türetilir, aksi halde `0`. |
 | `tAcw` | After Call Work (çağrı sonrası işlem) toplam süresi. |
 | `tHandle` | Toplam handle süresi (talk+hold+acw vb.). |
 | `tHeld` | Bekletme (hold) toplam süresi. |

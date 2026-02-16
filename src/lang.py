@@ -26,6 +26,8 @@ STRINGS = {
         "remember_me": "Beni Hatırla",
         "nOffered": "Gelen Çağrı (nOffered)",
         "nAnswered": "Cevaplanan (nAnswered)",
+        "nChatAnswered": "Chat Cevaplanan (nChatAnswered)",
+        "nChatOffered": "Chat Gelen (nChatOffered)",
         "nAbandon": "Kaçan Çağrı (nAbandon)",
         "nTransferred": "Transfer Sayısı (nTransferred)",
         "oServiceLevel": "Servis Seviyesi (oServiceLevel)",
@@ -325,6 +327,8 @@ STRINGS = {
         "remember_me": "Remember Me",
         "nOffered": "Offered (nOffered)",
         "nAnswered": "Answered (nAnswered)",
+        "nChatAnswered": "Chat Answered (nChatAnswered)",
+        "nChatOffered": "Chat Offered (nChatOffered)",
         "nAbandon": "Abandoned (nAbandon)",
         "nTransferred": "Transferred (nTransferred)",
         "oServiceLevel": "Service Level (oServiceLevel)",
@@ -610,7 +614,7 @@ STRINGS = {
 }
 
 ALL_METRICS = [
-    "nOffered", "nAnswered", "nAbandon", "nTransferred", "oServiceLevel",
+    "nOffered", "nAnswered", "nChatAnswered", "nChatOffered", "nAbandon", "nTransferred", "oServiceLevel",
     "tAnswered", "tAbandon", "tTalk", "tLongestTalk", "tAverageTalk", "tChatTalk",
     "tAcw", "tHandle", "tHeld", "tWait", "tAcd", "tAlert", "tBreak", "oEfficiency",
     "nOutbound", "tOutbound", "nNotResponding", "nConsult", "nConsultTransferred", 

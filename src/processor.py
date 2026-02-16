@@ -127,12 +127,15 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             name = lookup_map.get(queue_id, queue_id) if queue_id else "Unknown"
             row_base = {"Name": name, "Id": queue_id}
         elif report_type == 'detailed':
+            if not user_id:
+                continue
             user_info = lookup_map.get(user_id, {}) if user_id else {}
             agent_name = user_info.get('name', user_id if user_id else "Unknown")
             raw_username = user_info.get('username') or user_info.get('email') or ""
             username = format_report_username(raw_username, user_id)
             queue_name = queue_map.get(queue_id, queue_id) if queue_map and queue_id else (lookup_map.get(queue_id, queue_id) if queue_id else "Unknown")
-            row_base = {"AgentName": agent_name, "Username": username, "WorkgroupName": queue_name, "Id": f"{user_id}|{queue_id}"}
+            row_id = f"{user_id}|{queue_id}"
+            row_base = {"AgentName": agent_name, "Username": username, "WorkgroupName": queue_name, "Id": row_id}
         elif report_type == 'detailed_skill':
             if not user_id:
                 continue
@@ -218,13 +221,11 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 if m_name == "tAcw": row["nWrapup"] = stats.get('count', 0)
                 if m_name == "tNotResponding": row["nNotResponding"] = stats.get('count', 0)
                 if m_name == "nOutbound": row["nOutbound"] = val
-                if m_name == "nOffered": row["nAlert"] = val  # For agents, Offered = Alerted
                 if m_name == "tAlert": row["nAlert"] = stats.get('count', 0)
                 if m_name == "tHandle": row["nHandled"] = stats.get('count', 0)
                 
                 # Aliases for missing metrics that map to tTalk in aggregate view
                 if m_name == "tTalk":
-                    row["tOutbound"] = val
                     row["tTalkComplete"] = val
             data.append(row)
 
@@ -259,12 +260,6 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 axis=1
             )
         
-        if report_type in ['user', 'agent', 'detailed', 'detailed_skill', 'detailed_dnis_skill', 'productivity']:
-            # nOffered fix: Use nAlert as fallback, and ensure it's at least nAnswered
-            if "nOffered" not in df.columns: df["nOffered"] = 0
-            
-
-        
         if "tHandle" in df.columns and "CountHandle" in df.columns:
             df["AvgHandle"] = df.apply(lambda x: x["tHandle"] / x["CountHandle"] if x["CountHandle"] > 0 else 0, axis=1).round(2)
         if "tTalk" in df.columns:
@@ -281,6 +276,10 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         if "tTalk" in df.columns:
             # Alias to support chat-focused reports when media filter is chat/message.
             df["tChatTalk"] = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0).round(2)
+        if "tTalk" in df.columns and "nOutbound" in df.columns:
+            talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
+            outbound_count = pd.to_numeric(df["nOutbound"], errors="coerce").fillna(0)
+            df["tOutbound"] = talk_sum.where(outbound_count > 0, 0).round(2)
 
         helper_cols = ["ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]

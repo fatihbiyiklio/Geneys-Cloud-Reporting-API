@@ -220,12 +220,18 @@ def render_reports_service(context: Dict[str, Any]) -> None:
 
         # Metrics Selection
         user_metrics = st.session_state.app_user.get('metrics', [])
-        selection_options = user_metrics if user_metrics and role != "Admin" else ALL_METRICS
+        selection_options = list(user_metrics) if user_metrics and role != "Admin" else list(ALL_METRICS)
         # Ensure newly added derived metrics are visible even for users with legacy metric permission sets.
-        always_visible_metrics = ["tLongestTalk", "tAverageTalk", "tChatTalk", "tBreak", "oEfficiency"]
+        always_visible_metrics = [
+            "tLongestTalk", "tAverageTalk", "tChatTalk", "tBreak", "oEfficiency",
+            "nChatAnswered", "nChatOffered",
+        ]
         for m in always_visible_metrics:
             if m not in selection_options and m in ALL_METRICS:
                 selection_options.append(m)
+        detailed_only_metrics = {"nChatAnswered", "nChatOffered"}
+        if r_type != "report_detailed":
+            selection_options = [m for m in selection_options if m not in detailed_only_metrics]
         if r_type == "report_queue":
             # Queue aggregate endpoint does not provide agent presence/login derived metrics.
             queue_incompatible_metrics = {
@@ -233,6 +239,8 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 "tBreak", "oEfficiency", "col_staffed_time", "col_login", "col_logout",
             }
             selection_options = [m for m in selection_options if m not in queue_incompatible_metrics]
+        if "rep_met" in st.session_state:
+            st.session_state.rep_met = [m for m in st.session_state.rep_met if m in selection_options]
         
         if r_type not in ["interaction_search", "chat_detail", "missed_interactions"]:
             if "last_metrics" in st.session_state and st.session_state.last_metrics:
@@ -265,6 +273,194 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             numeric = pd.to_numeric(df_out[col], errors="coerce").replace([float("inf"), float("-inf")], 0)
             df_out[col] = numeric.fillna(0).round(0).astype("int64")
         return df_out
+
+    def _sanitize_numeric_series(series_in, index=None):
+        if isinstance(series_in, pd.Series):
+            series = pd.to_numeric(series_in, errors="coerce")
+            if index is not None and not series.index.equals(index):
+                series = series.reindex(index)
+        else:
+            series = pd.Series(series_in, index=index, dtype="float64")
+            series = pd.to_numeric(series, errors="coerce")
+        return series.replace([float("inf"), float("-inf")], 0).fillna(0)
+
+    def _extract_aggregate_issues(resp):
+        dropped = resp.get("_dropped_metrics") if isinstance(resp, dict) else None
+        agg_errors = resp.get("_errors") if isinstance(resp, dict) else None
+        cleaned_errors = []
+        for err in agg_errors or []:
+            err_l = str(err).lower()
+            is_metric_400 = ("metric=" in err_l) and ("400 client error" in err_l or " bad request" in err_l)
+            if not is_metric_400:
+                cleaned_errors.append(err)
+        return cleaned_errors, list(dropped or [])
+
+    def _show_aggregate_errors(agg_errors, label="Aggregate"):
+        if not agg_errors:
+            return
+        err_blob = " | ".join(str(e) for e in agg_errors[:5]).lower()
+        if "429" in err_blob:
+            reason_hint = "Rate limit (429) nedeniyle bazı parçalar alınamadı."
+        elif "401" in err_blob or "403" in err_blob:
+            reason_hint = "Yetki/Oturum hatası nedeniyle bazı parçalar alınamadı."
+        elif "timeout" in err_blob or "timed out" in err_blob:
+            reason_hint = "Zaman aşımı nedeniyle bazı parçalar alınamadı."
+        else:
+            reason_hint = "API bazı parçalarda hata döndü."
+        st.warning(
+            f"{label} sorgusunda {len(agg_errors)} parça hatası oluştu. "
+            f"{reason_hint} Kısmi veri gösteriliyor olabilir."
+        )
+        with st.expander(f"{label} hata detayı", expanded=False):
+            for err_line in agg_errors[:8]:
+                st.caption(str(err_line))
+
+    def _cache_dropped_metrics(cache_key, cached_bad_metrics, dropped_metrics, sync_selection=False, label="API 400"):
+        if not dropped_metrics:
+            return cached_bad_metrics
+        merged_bad = sorted(set(cached_bad_metrics).union(set(dropped_metrics)))
+        st.session_state[cache_key] = merged_bad
+        if sync_selection:
+            try:
+                current_selected = st.session_state.get("rep_met")
+                if isinstance(current_selected, list):
+                    st.session_state.rep_met = [m for m in current_selected if m not in set(dropped_metrics)]
+            except Exception:
+                pass
+        st.warning(
+            f"{label} nedeniyle bazı metrikler çıkarıldı: "
+            + ", ".join(str(m) for m in dropped_metrics[:20])
+        )
+        return set(merged_bad)
+
+    def _build_detailed_queue_totals(df_queue):
+        if not isinstance(df_queue, pd.DataFrame) or df_queue.empty:
+            return pd.DataFrame()
+        q_df = df_queue.copy()
+        q_df["AgentName"] = "Kuyruk Toplamı"
+        q_df["Username"] = "-"
+        q_df["WorkgroupName"] = q_df.get("Name", "-")
+        queue_ids = q_df["Id"] if "Id" in q_df.columns else pd.Series("-", index=q_df.index)
+        q_df["Id"] = queue_ids.apply(
+            lambda qid: f"queue_total|{qid}" if pd.notna(qid) and str(qid).strip() else "queue_total|-"
+        )
+        if "Name" in q_df.columns:
+            q_df = q_df.drop(columns=["Name"])
+        return q_df
+
+    def _append_chat_metric_columns(df_in):
+        if not isinstance(df_in, pd.DataFrame) or df_in.empty:
+            return pd.DataFrame()
+        df_chat = df_in.copy()
+        connected = _sanitize_numeric_series(df_chat["nConnected"] if "nConnected" in df_chat.columns else 0, df_chat.index)
+        handled = _sanitize_numeric_series(df_chat["nHandled"] if "nHandled" in df_chat.columns else 0, df_chat.index)
+        talk_count = _sanitize_numeric_series(df_chat["nTalk"] if "nTalk" in df_chat.columns else 0, df_chat.index)
+        answered = connected.where(connected > 0, handled.where(handled > 0, talk_count))
+        offered_api = _sanitize_numeric_series(df_chat["nOffered"] if "nOffered" in df_chat.columns else 0, df_chat.index)
+        offered_alert = _sanitize_numeric_series(df_chat["nAlert"] if "nAlert" in df_chat.columns else 0, df_chat.index)
+        offered_raw = pd.concat([offered_api, offered_alert], axis=1).max(axis=1)
+        offered = pd.concat([offered_raw, answered], axis=1).max(axis=1)
+        df_chat["nChatAnswered"] = answered.clip(lower=0).round(0).astype("int64")
+        df_chat["nChatOffered"] = offered.clip(lower=0).round(0).astype("int64")
+        return df_chat
+
+    def _merge_detailed_chat_metrics(base_df, chat_df):
+        if not isinstance(base_df, pd.DataFrame):
+            base_df = pd.DataFrame()
+        if not isinstance(chat_df, pd.DataFrame) or chat_df.empty:
+            out = base_df.copy()
+            for c in ["nChatAnswered", "nChatOffered"]:
+                if c not in out.columns:
+                    out[c] = 0
+            return out
+
+        key_cols = ["AgentName", "Username", "WorkgroupName", "Id"]
+        if "Interval" in base_df.columns or "Interval" in chat_df.columns:
+            key_cols = ["Interval"] + key_cols
+
+        base_work = base_df.copy()
+        chat_work = chat_df.copy()
+        for key_col in key_cols:
+            if key_col not in base_work.columns:
+                base_work[key_col] = "-"
+            if key_col not in chat_work.columns:
+                chat_work[key_col] = "-"
+
+        chat_metric_cols = ["nChatAnswered", "nChatOffered"]
+        for c in chat_metric_cols:
+            if c not in chat_work.columns:
+                chat_work[c] = 0
+
+        chat_merge = chat_work[key_cols + chat_metric_cols].copy()
+        chat_merge = chat_merge.groupby(key_cols, as_index=False)[chat_metric_cols].sum()
+
+        if base_work.empty:
+            merged = chat_merge
+        else:
+            merged = base_work.merge(chat_merge, on=key_cols, how="outer")
+
+        for c in chat_metric_cols:
+            merged[c] = _sanitize_numeric_series(merged.get(c, 0), merged.index).clip(lower=0).round(0).astype("int64")
+        return merged
+
+    def _backfill_queue_totals_from_agent_rows(df_in, selected_metrics):
+        if not isinstance(df_in, pd.DataFrame) or df_in.empty:
+            return df_in
+        required_cols = {"AgentName", "Id"}
+        if not required_cols.issubset(set(df_in.columns)):
+            return df_in
+
+        df_out = df_in.copy()
+        work = df_out.copy()
+
+        def _extract_queue_key(raw_id):
+            s = str(raw_id or "")
+            if s.startswith("queue_total|"):
+                return s.split("|", 1)[1]
+            if "|" in s:
+                return s.split("|", 1)[1]
+            return ""
+
+        work["_queue_key"] = work["Id"].apply(_extract_queue_key)
+        is_total = work["AgentName"].astype(str) == "Kuyruk Toplamı"
+        totals = work[is_total].copy()
+        agents = work[(~is_total) & (work["_queue_key"].astype(str).str.len() > 0)].copy()
+        if totals.empty or agents.empty:
+            return df_out
+
+        join_keys = ["_queue_key"]
+        if "Interval" in work.columns:
+            join_keys = ["Interval"] + join_keys
+
+        non_additive = {"oServiceLevel", "oServiceTarget", "oEfficiency", "AvgHandle"}
+        candidate_metrics = []
+        for m in selected_metrics or []:
+            if m in non_additive:
+                continue
+            if m in work.columns and (m.startswith("n") or m.startswith("t") or m == "col_staffed_time"):
+                candidate_metrics.append(m)
+        if not candidate_metrics:
+            return df_out
+
+        for metric in candidate_metrics:
+            agent_sum = (
+                agents[join_keys + [metric]]
+                .copy()
+                .assign(**{metric: lambda x: _sanitize_numeric_series(x[metric], x.index)})
+                .groupby(join_keys, as_index=False)[metric]
+                .sum()
+                .rename(columns={metric: f"{metric}__agent_sum"})
+            )
+            totals = totals.merge(agent_sum, on=join_keys, how="left")
+            current = _sanitize_numeric_series(totals.get(metric, 0), totals.index)
+            summed = _sanitize_numeric_series(totals.get(f"{metric}__agent_sum", 0), totals.index)
+            totals[metric] = pd.concat([current, summed], axis=1).max(axis=1)
+            if f"{metric}__agent_sum" in totals.columns:
+                totals = totals.drop(columns=[f"{metric}__agent_sum"])
+
+        passthrough_cols = [c for c in work.columns if c != "_queue_key"]
+        rebuilt = pd.concat([work[~is_total][passthrough_cols], totals[passthrough_cols]], ignore_index=True, sort=False)
+        return rebuilt
 
     report_rendered_this_run = False
 
@@ -731,7 +927,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             if r_type == "report_agent" and not sel_ids:
                 sel_ids = None
                 st.info("Agent seçilmediği için tüm agentlar baz alındı.")
-            if not sel_mets_effective:
+            sel_mets_effective_base = list(sel_mets_effective)
+            chat_metric_keys = {"nChatAnswered", "nChatOffered"}
+            chat_metrics_requested = (r_type == "report_detailed") and any(
+                m in chat_metric_keys for m in (sel_mets or [])
+            )
+            if not sel_mets_effective and not chat_metrics_requested:
                 st.warning("Desteklenen bir metrik seçiniz.")
                 st.stop()
 
@@ -761,46 +962,18 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 f_type = 'user' if r_kind == "Agent" else 'queue'
                 
                 resp = api.get_analytics_conversations_aggregate(s_dt, e_dt, granularity=gran_opt[sel_gran], group_by=g_by, filter_type=f_type, filter_ids=sel_ids or None, metrics=sel_mets_effective, media_types=sel_media_types or None)
-                agg_errors = resp.get("_errors") if isinstance(resp, dict) else None
-                dropped_bad_request_metrics = resp.get("_dropped_metrics") if isinstance(resp, dict) else None
+                agg_errors, dropped_bad_request_metrics = _extract_aggregate_issues(resp)
+                cached_bad_metrics = _cache_dropped_metrics(
+                    bad_metric_cache_key,
+                    cached_bad_metrics,
+                    dropped_bad_request_metrics,
+                    sync_selection=True,
+                    label="API 400",
+                )
                 if dropped_bad_request_metrics:
-                    merged_bad = sorted(set(cached_bad_metrics).union(set(dropped_bad_request_metrics)))
-                    st.session_state[bad_metric_cache_key] = merged_bad
-                    try:
-                        current_selected = st.session_state.get("rep_met")
-                        if isinstance(current_selected, list):
-                            st.session_state.rep_met = [m for m in current_selected if m not in set(dropped_bad_request_metrics)]
-                    except Exception:
-                        pass
-                    st.warning(
-                        "API 400 nedeniyle bazı metrikler çıkarıldı: "
-                        + ", ".join(str(m) for m in dropped_bad_request_metrics[:20])
-                    )
-                if agg_errors:
-                    filtered_runtime_errors = []
-                    for err in agg_errors:
-                        err_l = str(err).lower()
-                        is_metric_400 = ("metric=" in err_l) and ("400 client error" in err_l or " bad request" in err_l)
-                        if not is_metric_400:
-                            filtered_runtime_errors.append(err)
-                    agg_errors = filtered_runtime_errors
-                if agg_errors:
-                    err_blob = " | ".join(str(e) for e in agg_errors[:5]).lower()
-                    if "429" in err_blob:
-                        reason_hint = "Rate limit (429) nedeniyle bazı parçalar alınamadı."
-                    elif "401" in err_blob or "403" in err_blob:
-                        reason_hint = "Yetki/Oturum hatası nedeniyle bazı parçalar alınamadı."
-                    elif "timeout" in err_blob or "timed out" in err_blob:
-                        reason_hint = "Zaman aşımı nedeniyle bazı parçalar alınamadı."
-                    else:
-                        reason_hint = "API bazı parçalarda hata döndü."
-                    st.warning(
-                        f"Aggregate sorgusunda {len(agg_errors)} parça hatası oluştu. "
-                        f"{reason_hint} Kısmi veri gösteriliyor olabilir."
-                    )
-                    with st.expander("Aggregate hata detayı", expanded=False):
-                        for err_line in agg_errors[:8]:
-                            st.caption(str(err_line))
+                    dropped_set = set(dropped_bad_request_metrics)
+                    sel_mets_effective = [m for m in sel_mets_effective if m not in dropped_set]
+                _show_aggregate_errors(agg_errors, label="Aggregate")
                 q_lookup = {v: k for k, v in st.session_state.queues_map.items()}
                 skill_lookup = {}
                 language_lookup = {}
@@ -825,6 +998,129 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     skill_map=skill_lookup,
                     language_map=language_lookup
                 )
+
+                if r_type == "report_detailed":
+                    queue_total_resp = api.get_analytics_conversations_aggregate(
+                        s_dt,
+                        e_dt,
+                        granularity=gran_opt[sel_gran],
+                        group_by=["queueId"],
+                        filter_type="queue",
+                        filter_ids=sel_ids or None,
+                        metrics=sel_mets_effective_base,
+                        media_types=sel_media_types or None,
+                    )
+                    queue_total_errors, queue_total_dropped = _extract_aggregate_issues(queue_total_resp)
+                    _cache_dropped_metrics(
+                        f"{bad_metric_cache_key}_queue_total",
+                        set(st.session_state.get(f"{bad_metric_cache_key}_queue_total", []) or []),
+                        queue_total_dropped,
+                        sync_selection=False,
+                        label="Kuyruk toplamı API 400",
+                    )
+                    _show_aggregate_errors(queue_total_errors, label="Kuyruk toplamı aggregate")
+                    df_queue_totals = process_analytics_response(
+                        queue_total_resp,
+                        q_lookup,
+                        "queue",
+                        queue_map=q_lookup,
+                        utc_offset=utc_offset_hours,
+                        skill_map=skill_lookup,
+                        language_map=language_lookup
+                    )
+                    df_queue_totals = _build_detailed_queue_totals(df_queue_totals)
+                    if not df_queue_totals.empty:
+                        df = pd.concat([df, df_queue_totals], ignore_index=True, sort=False)
+
+                if chat_metrics_requested:
+                    selected_media_lower = [
+                        str(mt).strip().lower()
+                        for mt in (sel_media_types or [])
+                        if str(mt).strip()
+                    ]
+                    chat_media_types = ["chat", "message"]
+                    if selected_media_lower:
+                        chat_media_types = [mt for mt in chat_media_types if mt in selected_media_lower]
+
+                    chat_frames = []
+                    if chat_media_types:
+                        chat_agent_metrics = ["nConnected", "nHandled", "tTalk", "nAlert"]
+                        chat_queue_metrics = ["nConnected", "nHandled", "tTalk", "nOffered", "nAlert"]
+                        chat_agent_resp = api.get_analytics_conversations_aggregate(
+                            s_dt,
+                            e_dt,
+                            granularity=gran_opt[sel_gran],
+                            group_by=["userId", "queueId"],
+                            filter_type="queue",
+                            filter_ids=sel_ids or None,
+                            metrics=chat_agent_metrics,
+                            media_types=chat_media_types,
+                        )
+                        chat_agent_errors, chat_agent_dropped = _extract_aggregate_issues(chat_agent_resp)
+                        _cache_dropped_metrics(
+                            f"{bad_metric_cache_key}_chat_agent",
+                            set(st.session_state.get(f"{bad_metric_cache_key}_chat_agent", []) or []),
+                            chat_agent_dropped,
+                            sync_selection=False,
+                            label="Chat agent API 400",
+                        )
+                        _show_aggregate_errors(chat_agent_errors, label="Chat agent aggregate")
+                        df_chat_agent = process_analytics_response(
+                            chat_agent_resp,
+                            st.session_state.users_info,
+                            "detailed",
+                            queue_map=q_lookup,
+                            utc_offset=utc_offset_hours,
+                            skill_map=skill_lookup,
+                            language_map=language_lookup
+                        )
+                        if not df_chat_agent.empty:
+                            chat_frames.append(df_chat_agent)
+
+                        chat_queue_resp = api.get_analytics_conversations_aggregate(
+                            s_dt,
+                            e_dt,
+                            granularity=gran_opt[sel_gran],
+                            group_by=["queueId"],
+                            filter_type="queue",
+                            filter_ids=sel_ids or None,
+                            metrics=chat_queue_metrics,
+                            media_types=chat_media_types,
+                        )
+                        chat_queue_errors, chat_queue_dropped = _extract_aggregate_issues(chat_queue_resp)
+                        _cache_dropped_metrics(
+                            f"{bad_metric_cache_key}_chat_queue",
+                            set(st.session_state.get(f"{bad_metric_cache_key}_chat_queue", []) or []),
+                            chat_queue_dropped,
+                            sync_selection=False,
+                            label="Chat kuyruk API 400",
+                        )
+                        _show_aggregate_errors(chat_queue_errors, label="Chat kuyruk aggregate")
+                        df_chat_queue = process_analytics_response(
+                            chat_queue_resp,
+                            q_lookup,
+                            "queue",
+                            queue_map=q_lookup,
+                            utc_offset=utc_offset_hours,
+                            skill_map=skill_lookup,
+                            language_map=language_lookup
+                        )
+                        df_chat_queue = _build_detailed_queue_totals(df_chat_queue)
+                        if not df_chat_queue.empty:
+                            chat_frames.append(df_chat_queue)
+                    elif sel_media_types:
+                        st.info("Seçili medya tipi chat/message içermediği için chat sayaçları 0 gösterildi.")
+
+                    if chat_frames:
+                        chat_df = pd.concat(chat_frames, ignore_index=True, sort=False)
+                        chat_df = _append_chat_metric_columns(chat_df)
+                        df = _merge_detailed_chat_metrics(df, chat_df)
+                    else:
+                        for c in ["nChatAnswered", "nChatOffered"]:
+                            if c not in df.columns:
+                                df[c] = 0
+                if r_type == "report_detailed":
+                    df = _backfill_queue_totals_from_agent_rows(df, sel_mets)
                 
                 if df.empty and is_agent:
                     agent_data = []
@@ -861,10 +1157,10 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
 
                     # Derived/custom metrics requested from report UI.
-                    selected_metric_set = set(sel_mets_effective or [])
+                    selected_metric_set = set(sel_mets or [])
                     def _metric_series_or_zero(col_name):
                         if col_name in df.columns:
-                            return pd.to_numeric(df[col_name], errors="coerce").fillna(0)
+                            return _sanitize_numeric_series(df[col_name], df.index)
                         return pd.Series(0, index=df.index, dtype="float64")
 
                     if "tLongestTalk" in selected_metric_set:
@@ -916,8 +1212,11 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     else:
                         base = (["AgentName", "Username", "WorkgroupName"] if r_kind == "Detailed" else (["Name", "Username"] if is_agent else ["Name"]))
                     if "Interval" in df.columns: base = ["Interval"] + base
-                    for sm in sel_mets_effective:
-                        if sm not in df.columns: df[sm] = 0
+                    for sm in sel_mets:
+                        if sm not in df.columns:
+                            df[sm] = 0
+                        elif sm.startswith(("n", "t", "o", "Avg")) or sm in ["col_staffed_time"]:
+                            df[sm] = _sanitize_numeric_series(df[sm], df.index)
                     # Show only explicitly selected metrics.
                     # AvgHandle is computed as a helper in processor; it should not be auto-added.
                     mets_to_show = [m for m in sel_mets if m in df.columns]
@@ -927,7 +1226,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     final_df = _apply_selected_duration_view(final_df)
 
                     rename = {"Interval": get_text(lang, "col_interval"), "AgentName": get_text(lang, "col_agent"), "Username": get_text(lang, "col_username"), "WorkgroupName": get_text(lang, "col_workgroup"), "Name": get_text(lang, "col_agent" if is_agent else "col_workgroup"), "AvgHandle": get_text(lang, "col_avg_handle"), "col_staffed_time": get_text(lang, "col_staffed_time"), "col_login": get_text(lang, "col_login"), "col_logout": get_text(lang, "col_logout"), "SkillName": get_text(lang, "col_skill"), "SkillId": get_text(lang, "col_skill_id"), "LanguageName": get_text(lang, "col_language"), "LanguageId": get_text(lang, "col_language_id"), "Dnis": get_text(lang, "col_dnis")}
-                    rename.update({m: get_text(lang, m) for m in sel_mets_effective if m not in rename})
+                    rename.update({m: get_text(lang, m) for m in sel_mets if m not in rename})
                     df_out = final_df.rename(columns=rename)
                     df_out = _apply_report_row_limit(df_out, label="Standart rapor")
                     df_out_view = render_table_with_export_view(df_out, r_type)

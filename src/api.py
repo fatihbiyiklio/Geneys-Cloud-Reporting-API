@@ -1698,10 +1698,12 @@ class GenesysAPI:
                 elif m == "nAbandon": new_mets.append("tAbandon")
                 elif m == "nOffered" and not is_queue: new_mets.append("tAlert") # For users, Offered=Alert
                 elif m == "nOffered" and is_queue: new_mets.append("nOffered")
+                elif m == "nChatAnswered": new_mets.append("nConnected")
+                elif m == "nChatOffered": new_mets.append("nOffered" if is_queue else "tAlert")
                 elif m == "nWrapup": new_mets.append("tAcw") 
                 elif m == "nHandled": new_mets.append("tHandle")
                 elif m == "nOutbound": new_mets.extend(["nOutbound", "tTalk"])
-                elif m == "tOutbound": new_mets.append("tTalk")
+                elif m == "tOutbound": new_mets.extend(["nOutbound", "tTalk"])
                 elif m == "nNotResponding": new_mets.append("tNotResponding")
                 elif m == "nAlert": new_mets.append("tAlert")
                 elif m == "nConsultTransferred": new_mets.append("nConsultTransferred")
