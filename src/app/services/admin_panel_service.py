@@ -677,6 +677,127 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                                 st.caption(f"❌ {qname}: {result.get('error', '')}")
                                         
                                         logging.info(f"[ADMIN GROUP] Removed group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' from {success_count}/{len(selected_queue_ids)} queues")
+
+                            # --- Queue Wrap-up Timeout Management ---
+                            st.divider()
+                            st.markdown("### ⏱️ Kuyruk Bazlı Wrap-up Süresi")
+                            st.caption("Kuyrukların wrap-up süresini (saniye) API'den çekip çoklu seçimle toplu güncelleyebilirsiniz.")
+
+                            wrapup_queue_select_key = "admin_wrapup_queue_ids"
+                            existing_wrapup_selection = st.session_state.get(wrapup_queue_select_key, [])
+                            if not isinstance(existing_wrapup_selection, list):
+                                st.session_state[wrapup_queue_select_key] = []
+
+                            selected_wrapup_queue_ids = st.multiselect(
+                                "Wrap-up süresi yönetilecek kuyruklar",
+                                options=list(queue_options.keys()),
+                                format_func=lambda x: queue_options.get(x, x),
+                                key=wrapup_queue_select_key,
+                            )
+
+                            wrapup_snapshot_key = f"admin_wrapup_snapshot_{current_org}"
+                            wrapup_update_result_key = f"admin_wrapup_update_results_{current_org}"
+                            if st.button(
+                                "📥 Seçili Kuyrukların Süresini Getir",
+                                key="admin_wrapup_fetch_btn",
+                                disabled=not selected_wrapup_queue_ids,
+                                use_container_width=True,
+                            ):
+                                with st.spinner("Wrap-up süreleri getiriliyor..."):
+                                    st.session_state[wrapup_snapshot_key] = api.get_queues_wrapup_timeouts(selected_wrapup_queue_ids)
+
+                            wrapup_snapshot = st.session_state.get(wrapup_snapshot_key, {}) or {}
+                            wrapup_rows = []
+                            wrapup_errors = []
+                            for qid in selected_wrapup_queue_ids:
+                                row = wrapup_snapshot.get(qid)
+                                if not isinstance(row, dict):
+                                    continue
+                                if row.get("success"):
+                                    queue_name = str(row.get("queue_name") or queue_options.get(qid, qid))
+                                    timeout_seconds = row.get("timeout_seconds")
+                                    wrapup_rows.append({
+                                        "Kuyruk": queue_name,
+                                        "Kuyruk ID": qid,
+                                        "Wrap-up Süresi (sn)": timeout_seconds if timeout_seconds is not None else "-",
+                                        "Kaynak Alan": row.get("field_path") or "-",
+                                    })
+                                else:
+                                    wrapup_errors.append((qid, row.get("error", "Bilinmeyen hata")))
+
+                            if wrapup_rows:
+                                st.dataframe(pd.DataFrame(wrapup_rows), width='stretch', hide_index=True)
+                            if wrapup_errors:
+                                st.warning(f"{len(wrapup_errors)} kuyruk için wrap-up süresi okunamadı.")
+                                for qid, err in wrapup_errors[:10]:
+                                    st.caption(f"❌ {queue_options.get(qid, qid)}: {err}")
+
+                            target_wrapup_seconds = st.number_input(
+                                "Yeni wrap-up süresi (saniye)",
+                                min_value=0,
+                                max_value=7200,
+                                value=int(st.session_state.get("admin_wrapup_timeout_seconds", 30)),
+                                step=5,
+                                key="admin_wrapup_timeout_seconds",
+                            )
+                            apply_only_fetched = st.checkbox(
+                                "Sadece süresi başarıyla okunan kuyruklara uygula",
+                                value=True,
+                                key="admin_wrapup_apply_only_fetched",
+                            )
+
+                            update_target_queue_ids = list(selected_wrapup_queue_ids)
+                            if apply_only_fetched:
+                                update_target_queue_ids = [
+                                    qid for qid in update_target_queue_ids
+                                    if isinstance(wrapup_snapshot.get(qid), dict) and wrapup_snapshot[qid].get("success")
+                                ]
+
+                            if st.button(
+                                "💾 Seçili Kuyruklara Süreyi Uygula",
+                                type="primary",
+                                key="admin_wrapup_apply_btn",
+                                disabled=not update_target_queue_ids,
+                                use_container_width=True,
+                            ):
+                                with st.spinner("Wrap-up süreleri güncelleniyor..."):
+                                    update_results = api.set_queues_wrapup_timeout(
+                                        update_target_queue_ids,
+                                        int(target_wrapup_seconds),
+                                    )
+                                st.session_state[wrapup_update_result_key] = update_results
+                                try:
+                                    refreshed = api.get_queues_wrapup_timeouts(update_target_queue_ids)
+                                    merged_snapshot = dict(wrapup_snapshot)
+                                    merged_snapshot.update(refreshed)
+                                    st.session_state[wrapup_snapshot_key] = merged_snapshot
+                                except Exception:
+                                    pass
+
+                            wrapup_update_results = st.session_state.get(wrapup_update_result_key, {}) or {}
+                            if wrapup_update_results:
+                                success_count = sum(
+                                    1 for item in wrapup_update_results.values()
+                                    if isinstance(item, dict) and item.get("success")
+                                )
+                                fail_count = max(0, len(wrapup_update_results) - success_count)
+                                if success_count:
+                                    st.success(f"{success_count} kuyruk için wrap-up süresi güncellendi.")
+                                if fail_count:
+                                    st.warning(f"{fail_count} kuyruk için wrap-up güncellemesi başarısız.")
+                                for qid, item in list(wrapup_update_results.items())[:20]:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    queue_name = str(item.get("queue_name") or queue_options.get(qid, qid))
+                                    if item.get("success"):
+                                        prev_text = item.get("previous_seconds")
+                                        prev_label = f"{prev_text} sn" if prev_text is not None else "-"
+                                        st.caption(
+                                            f"✅ {queue_name}: {prev_label} → {item.get('updated_seconds', '-') } sn "
+                                            f"({item.get('field_path', '-')})"
+                                        )
+                                    else:
+                                        st.caption(f"❌ {queue_name}: {item.get('error', 'Bilinmeyen hata')}")
                         else:
                             st.warning("Kuyruk bulunamadı.")
 

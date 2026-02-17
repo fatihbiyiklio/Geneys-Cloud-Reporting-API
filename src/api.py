@@ -1,3 +1,4 @@
+import copy
 import time
 import random
 import requests
@@ -17,6 +18,17 @@ class GenesysAPI:
     HTTP_429_WAIT_CAP_SECONDS = 120
     QUEUE_MEMBER_429_RETRY_SECONDS = 60
     QUEUE_MEMBER_429_MAX_RETRIES = 1
+    QUEUE_READ_ONLY_FIELDS = {
+        "id",
+        "selfUri",
+        "dateCreated",
+        "dateModified",
+        "modifiedBy",
+        "createdBy",
+        "memberCount",
+        "userMemberCount",
+        "joinedMemberCount",
+    }
 
     def __init__(self, auth_data):
         self.access_token = auth_data['access_token']
@@ -548,6 +560,76 @@ class GenesysAPI:
         for i in range(0, len(items), size):
             yield items[i:i + size]
 
+    @staticmethod
+    def _get_nested_value(payload, path_parts):
+        current = payload
+        for key in path_parts:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current
+
+    @staticmethod
+    def _set_nested_value(payload, path_parts, value):
+        if not isinstance(payload, dict):
+            return
+        if not path_parts:
+            return
+        current = payload
+        for key in path_parts[:-1]:
+            next_obj = current.get(key)
+            if not isinstance(next_obj, dict):
+                next_obj = {}
+                current[key] = next_obj
+            current = next_obj
+        current[path_parts[-1]] = value
+
+    def _prepare_queue_payload_for_put(self, queue_data):
+        """Remove read-only queue fields before PUT."""
+        payload = copy.deepcopy(queue_data or {})
+        for ro_field in self.QUEUE_READ_ONLY_FIELDS:
+            payload.pop(ro_field, None)
+        return payload
+
+    def _queue_wrapup_candidate_paths(self, queue_data):
+        """Return possible queue wrap-up timeout paths in priority order."""
+        candidates = []
+        if isinstance(queue_data, dict):
+            if isinstance(queue_data.get("acwSettings"), dict):
+                candidates.append(("acwSettings", "timeoutMs"))
+            if isinstance(queue_data.get("wrapupSettings"), dict):
+                candidates.append(("wrapupSettings", "timeoutMs"))
+            if "acwTimeoutMs" in queue_data:
+                candidates.append(("acwTimeoutMs",))
+            if "wrapupTimeoutMs" in queue_data:
+                candidates.append(("wrapupTimeoutMs",))
+
+        fallback_candidates = [
+            ("acwSettings", "timeoutMs"),
+            ("wrapupSettings", "timeoutMs"),
+            ("acwTimeoutMs",),
+            ("wrapupTimeoutMs",),
+        ]
+        for path in fallback_candidates:
+            if path not in candidates:
+                candidates.append(path)
+        return candidates
+
+    def _parse_queue_wrapup_timeout_ms(self, queue_data):
+        """Extract queue wrap-up timeout (milliseconds) from known queue fields."""
+        for path in self._queue_wrapup_candidate_paths(queue_data):
+            raw_value = self._get_nested_value(queue_data, path)
+            if raw_value is None:
+                continue
+            try:
+                timeout_ms = int(float(raw_value))
+            except Exception:
+                continue
+            if timeout_ms < 0:
+                continue
+            return timeout_ms, ".".join(path)
+        return None, None
+
     # ... (other methods remain unchanged) ...
 
     def get_conversation_details(self, start_date, end_date):
@@ -741,6 +823,116 @@ class GenesysAPI:
             monitor.log_error("API_GET", "Error: Could not fetch queues from Genesys Cloud.")
         return queues
 
+    def get_queue_wrapup_timeout(self, queue_id):
+        """Fetch wrap-up timeout (seconds) for a single queue."""
+        qid = str(queue_id or "").strip()
+        if not qid:
+            raise ValueError("queue_id is required")
+
+        queue_data = self._get(f"/api/v2/routing/queues/{qid}")
+        timeout_ms, field_path = self._parse_queue_wrapup_timeout_ms(queue_data)
+        timeout_seconds = None
+        if timeout_ms is not None:
+            timeout_seconds = max(0, int(timeout_ms // 1000))
+        return {
+            "queue_id": qid,
+            "queue_name": str((queue_data or {}).get("name") or qid),
+            "timeout_ms": timeout_ms,
+            "timeout_seconds": timeout_seconds,
+            "field_path": field_path,
+        }
+
+    def get_queues_wrapup_timeouts(self, queue_ids):
+        """Fetch wrap-up timeout values for multiple queues."""
+        results = {}
+        normalized_queue_ids = [str(qid).strip() for qid in (queue_ids or []) if str(qid).strip()]
+        for queue_batch in self._chunk_list(normalized_queue_ids, self.ASSIGNMENT_BATCH_SIZE):
+            for qid in queue_batch:
+                try:
+                    details = self.get_queue_wrapup_timeout(qid)
+                    results[qid] = {"success": True, **details}
+                except Exception as e:
+                    err = self._extract_error_detail(e)
+                    results[qid] = {"success": False, "queue_id": qid, "error": err}
+                    monitor.log_error("API_GET", f"Error fetching queue wrap-up timeout for {qid}: {err}")
+            time.sleep(0.2)
+        return results
+
+    def set_queues_wrapup_timeout(self, queue_ids, timeout_seconds):
+        """Set wrap-up timeout (seconds) for multiple queues."""
+        results = {}
+        normalized_queue_ids = [str(qid).strip() for qid in (queue_ids or []) if str(qid).strip()]
+        if not normalized_queue_ids:
+            return results
+
+        try:
+            normalized_seconds = int(timeout_seconds)
+        except Exception:
+            err = f"Invalid timeout seconds: {timeout_seconds}"
+            for qid in normalized_queue_ids:
+                results[qid] = {"success": False, "queue_id": qid, "error": err}
+            return results
+
+        normalized_seconds = max(0, normalized_seconds)
+        target_timeout_ms = normalized_seconds * 1000
+
+        for queue_batch in self._chunk_list(normalized_queue_ids, self.ASSIGNMENT_BATCH_SIZE):
+            for qid in queue_batch:
+                queue_name = qid
+                try:
+                    queue_data = self._get(f"/api/v2/routing/queues/{qid}")
+                    queue_name = str((queue_data or {}).get("name") or qid)
+                    current_timeout_ms, current_path = self._parse_queue_wrapup_timeout_ms(queue_data)
+
+                    update_paths = []
+                    if current_path:
+                        update_paths.append(tuple(current_path.split(".")))
+                    for candidate_path in self._queue_wrapup_candidate_paths(queue_data):
+                        if candidate_path not in update_paths:
+                            update_paths.append(candidate_path)
+
+                    applied_path = None
+                    path_errors = []
+                    for path in update_paths:
+                        queue_payload = self._prepare_queue_payload_for_put(queue_data)
+                        self._set_nested_value(queue_payload, path, target_timeout_ms)
+                        try:
+                            self._put(f"/api/v2/routing/queues/{qid}", data=queue_payload)
+                            applied_path = ".".join(path)
+                            break
+                        except Exception as path_error:
+                            path_errors.append(
+                                f"{'.'.join(path)} => {self._extract_error_detail(path_error)}"
+                            )
+
+                    if not applied_path:
+                        joined_errors = " | ".join(path_errors) if path_errors else "Unknown queue update error"
+                        raise Exception(joined_errors)
+
+                    current_seconds = None
+                    if current_timeout_ms is not None:
+                        current_seconds = max(0, int(current_timeout_ms // 1000))
+
+                    results[qid] = {
+                        "success": True,
+                        "queue_id": qid,
+                        "queue_name": queue_name,
+                        "previous_seconds": current_seconds,
+                        "updated_seconds": normalized_seconds,
+                        "field_path": applied_path,
+                    }
+                except Exception as e:
+                    err = self._extract_error_detail(e)
+                    results[qid] = {
+                        "success": False,
+                        "queue_id": qid,
+                        "queue_name": queue_name,
+                        "error": err,
+                    }
+                    monitor.log_error("API_PUT", f"Error setting queue wrap-up timeout for {qid}: {err}")
+            time.sleep(0.2)
+        return results
+
     def get_wrapup_codes(self):
         """Fetches all wrap-up codes for mapping."""
         codes = {}
@@ -915,11 +1107,8 @@ class GenesysAPI:
                         continue
                     member_groups.append({"id": group_id, "type": "GROUP"})
                     queue_data["memberGroups"] = member_groups
-                    # Remove read-only fields that cannot be sent in PUT
-                    for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
-                                     "memberCount", "userMemberCount", "joinedMemberCount"]:
-                        queue_data.pop(ro_field, None)
-                    self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
+                    queue_payload = self._prepare_queue_payload_for_put(queue_data)
+                    self._put(f"/api/v2/routing/queues/{qid}", data=queue_payload)
                     results[qid] = {"success": True}
                 except Exception as e:
                     results[qid] = {"success": False, "error": self._extract_error_detail(e)}
@@ -946,11 +1135,8 @@ class GenesysAPI:
                         results[qid] = {"success": True, "not_found": True}
                         continue
                     queue_data["memberGroups"] = new_member_groups
-                    # Remove read-only fields that cannot be sent in PUT
-                    for ro_field in ["id", "selfUri", "dateCreated", "dateModified", "modifiedBy", "createdBy",
-                                     "memberCount", "userMemberCount", "joinedMemberCount"]:
-                        queue_data.pop(ro_field, None)
-                    self._put(f"/api/v2/routing/queues/{qid}", data=queue_data)
+                    queue_payload = self._prepare_queue_payload_for_put(queue_data)
+                    self._put(f"/api/v2/routing/queues/{qid}", data=queue_payload)
                     results[qid] = {"success": True}
                 except Exception as e:
                     results[qid] = {"success": False, "error": self._extract_error_detail(e)}
