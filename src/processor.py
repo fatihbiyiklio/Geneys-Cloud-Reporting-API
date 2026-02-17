@@ -568,6 +568,66 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
         key = str(raw_value)
         return skill_map.get(key, key) if skill_map else key
 
+    def normalize_disconnect_reason(raw_reason):
+        if raw_reason is None:
+            return ""
+        raw = str(raw_reason).strip()
+        if not raw:
+            return ""
+        reason_map = {
+            "timeout": "Conversation Inactivity",
+            "conversationinactivity": "Conversation Inactivity",
+            "conversation_inactivity": "Conversation Inactivity",
+            "peer": "Peer",
+            "client": "Client",
+            "endpoint": "Endpoint",
+            "system": "System",
+            "transfer": "Transfer",
+            "error": "Error",
+        }
+        lowered = raw.lower()
+        if lowered in reason_map:
+            return reason_map[lowered]
+        return raw
+
+    def first_disconnect_reason(participant):
+        direct_reason = participant.get("disconnectReason") or participant.get("disconnectType")
+        if direct_reason:
+            return direct_reason
+        for session in participant.get("sessions", []):
+            session_reason = session.get("disconnectReason") or session.get("disconnectType")
+            if session_reason:
+                return session_reason
+            for segment in session.get("segments", []):
+                segment_reason = segment.get("disconnectReason") or segment.get("disconnectType")
+                if segment_reason:
+                    return segment_reason
+        return ""
+
+    def participant_display_name(participant):
+        uid = participant.get("userId")
+        if uid and user_map and uid in user_map:
+            u_obj = user_map[uid]
+            if isinstance(u_obj, dict):
+                display_name = str(u_obj.get("name") or u_obj.get("username") or uid).strip()
+                if display_name:
+                    return display_name
+            else:
+                display_name = str(u_obj).strip()
+                if display_name:
+                    return display_name
+        for key in ["participantName", "name", "address", "ani", "dnis"]:
+            value = participant.get(key)
+            if value:
+                clean_value = str(value).strip()
+                if clean_value:
+                    return clean_value
+        return ""
+
+    def append_unique(target, value):
+        if value and value not in target:
+            target.append(value)
+
     for conv in response['conversations']:
         row = {
             "Id": conv.get("conversationId"),
@@ -583,6 +643,10 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
             "Language": "",
             "Wrapup": "",
             "DisconnectType": "",
+            "InternalParticipants": "",
+            "InternalDisconnectReason": "",
+            "ExternalParticipants": "",
+            "ExternalDisconnectReason": "",
             "Duration": 0,
             "Talk": 0,
             "Hold": 0,
@@ -594,6 +658,10 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
         }
         has_agent_participant = False
         has_agent_interact_segment = False
+        internal_participants = []
+        internal_disconnect_reasons = []
+        external_participants = []
+        external_disconnect_reasons = []
         
         if include_attributes:
             # Explicitly initialize requested attributes so they appear as columns
@@ -610,8 +678,18 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
         # Determine metrics from participants
         for p in conv.get("participants", []):
             purpose = p.get("purpose")
+            purpose_norm = str(purpose or "").strip().lower()
             if purpose in ["agent", "user"]:
                 has_agent_participant = True
+
+            participant_name = participant_display_name(p)
+            participant_reason = normalize_disconnect_reason(first_disconnect_reason(p))
+            if purpose_norm in ["agent", "user"]:
+                append_unique(internal_participants, participant_name)
+                append_unique(internal_disconnect_reasons, participant_reason)
+            elif purpose_norm in ["external", "customer", "outbound", "guest"]:
+                append_unique(external_participants, participant_name)
+                append_unique(external_disconnect_reasons, participant_reason)
 
             # Track interact segments to improve connection detection for chat/message.
             for s in p.get("sessions", []):
@@ -791,6 +869,11 @@ def process_conversation_details(response, user_map=None, queue_map=None, wrapup
                                         row["Wrapup"] = wrapup_map[w_code]
                                     else:
                                         row["Wrapup"] = w_code
+
+        row["InternalParticipants"] = ", ".join(internal_participants)
+        row["InternalDisconnectReason"] = ", ".join(internal_disconnect_reasons)
+        row["ExternalParticipants"] = ", ".join(external_participants)
+        row["ExternalDisconnectReason"] = ", ".join(external_disconnect_reasons)
         
         # Connection/Answer Status Logic
         media_type_lower = str(row.get("MediaType") or "").strip().lower()

@@ -172,6 +172,8 @@ def render_reports_service(context: Dict[str, Any]) -> None:
     st_ = c_d2.time_input(get_text(lang, "start_time"), time(0, 0))
     ed = c_d3.date_input("End Date", datetime.today())
     et = c_d4.time_input(get_text(lang, "end_time"), time(23, 59))
+    interaction_agent_names = []
+    interaction_agent_ids = []
     
     # --- ADVANCED FILTERS (Collapsible) ---
     with st.expander(f"⚙️ {get_text(lang, 'advanced_filters')}", expanded=False):
@@ -192,6 +194,45 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         )
 
         if r_type in ["interaction_search", "chat_detail", "missed_interactions"]:
+            if not st.session_state.get("users_map"):
+                recover_org_maps_if_needed(org, force=True)
+                if (not st.session_state.get("users_map")) and st.session_state.get("users_info"):
+                    fallback_users_map = {}
+                    for uid, uinfo in (st.session_state.get("users_info") or {}).items():
+                        base_name = str((uinfo or {}).get("name") or (uinfo or {}).get("username") or uid or "").strip() or str(uid)
+                        candidate = base_name
+                        suffix = 2
+                        while candidate in fallback_users_map and fallback_users_map.get(candidate) != uid:
+                            candidate = f"{base_name} ({suffix})"
+                            suffix += 1
+                        fallback_users_map[candidate] = uid
+                    if fallback_users_map:
+                        st.session_state.users_map = fallback_users_map
+                if (not st.session_state.get("users_map")) and st.session_state.get("api_client"):
+                    try:
+                        api = GenesysAPI(st.session_state.api_client)
+                        users = api.get_users()
+                        if isinstance(users, list) and users:
+                            st.session_state.users_map = {
+                                str(u.get("name") or u.get("username") or u.get("id")): u.get("id")
+                                for u in users if isinstance(u, dict) and u.get("id")
+                            }
+                    except Exception:
+                        pass
+            interaction_agent_opts = list((st.session_state.get("users_map") or {}).keys())
+            if "rep_int_agent_names" in st.session_state:
+                st.session_state.rep_int_agent_names = [
+                    n for n in st.session_state.rep_int_agent_names if n in interaction_agent_opts
+                ]
+            interaction_agent_names = st.multiselect(
+                get_text(lang, "select_agents"),
+                interaction_agent_opts,
+                key="rep_int_agent_names",
+            )
+            users_map = st.session_state.get("users_map", {})
+            interaction_agent_ids = [
+                users_map[n] for n in interaction_agent_names if n in users_map
+            ]
             st.session_state.rep_max_records = st.number_input(
                 "Maksimum kayıt (performans için)",
                 min_value=100,
@@ -283,6 +324,161 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             series = pd.Series(series_in, index=index, dtype="float64")
             series = pd.to_numeric(series, errors="coerce")
         return series.replace([float("inf"), float("-inf")], 0).fillna(0)
+
+    def _normalize_detail_media_token(raw_media):
+        token = str(raw_media or "").strip().lower()
+        if not token:
+            return ""
+        if "callback" in token:
+            return "callback"
+        if token in {"voice", "call", "phone", "telephony"} or "voice" in token:
+            return "voice"
+        if token in {"chat", "webchat"} or "chat" in token:
+            return "chat"
+        if token == "email" or "email" in token:
+            return "email"
+        message_aliases = {
+            "message", "messages", "sms", "whatsapp", "facebook", "twitter", "line", "telegram",
+            "webmessaging", "openmessaging",
+        }
+        if token in message_aliases or any(alias in token for alias in ["whatsapp", "facebook", "twitter", "line", "telegram", "messag"]):
+            return "message"
+        return token
+
+    def _build_detail_query_filters(
+        selected_queue_ids=None,
+        selected_media_types=None,
+        selected_agent_ids=None,
+        base_conversation_filters=None,
+        base_segment_clauses=None,
+    ):
+        details_conversation_filters = list(base_conversation_filters or [])
+        details_segment_clauses = list(base_segment_clauses or [])
+
+        queue_ids = [qid for qid in (selected_queue_ids or []) if qid]
+        if queue_ids:
+            queue_preds = [
+                {
+                    "type": "dimension",
+                    "dimension": "queueId",
+                    "operator": "matches",
+                    "value": qid,
+                }
+                for qid in queue_ids
+            ]
+            details_segment_clauses.append({"type": "or", "predicates": queue_preds})
+
+        media_types = [
+            str(mt).strip().lower()
+            for mt in (selected_media_types or [])
+            if str(mt).strip()
+        ]
+        if media_types:
+            media_preds = [
+                {
+                    "type": "dimension",
+                    "dimension": "mediaType",
+                    "operator": "matches",
+                    "value": mt,
+                }
+                for mt in media_types
+            ]
+            details_segment_clauses.append({"type": "or", "predicates": media_preds})
+
+        agent_ids = [aid for aid in (selected_agent_ids or []) if aid]
+        if agent_ids:
+            agent_preds = [
+                {
+                    "type": "dimension",
+                    "dimension": "userId",
+                    "operator": "matches",
+                    "value": aid,
+                }
+                for aid in agent_ids
+            ]
+            details_segment_clauses.append({"type": "or", "predicates": agent_preds})
+
+        details_segment_filters = None
+        if len(details_segment_clauses) == 1:
+            details_segment_filters = [details_segment_clauses[0]]
+        elif len(details_segment_clauses) > 1:
+            details_segment_filters = [{"type": "and", "clauses": details_segment_clauses}]
+
+        if not details_conversation_filters:
+            details_conversation_filters = None
+
+        return details_conversation_filters, details_segment_filters
+
+    def _build_agent_filter_tokens(selected_agent_names=None, selected_agent_ids=None):
+        tokens = {
+            str(name).strip().lower()
+            for name in (selected_agent_names or [])
+            if str(name).strip()
+        }
+        users_info = st.session_state.get("users_info") or {}
+        for aid in (selected_agent_ids or []):
+            if not aid:
+                continue
+            tokens.add(str(aid).strip().lower())
+            u_obj = users_info.get(aid) or {}
+            if isinstance(u_obj, dict):
+                for candidate in [
+                    u_obj.get("name"),
+                    u_obj.get("username"),
+                    u_obj.get("email"),
+                ]:
+                    if not candidate:
+                        continue
+                    clean_candidate = str(candidate).strip()
+                    if not clean_candidate:
+                        continue
+                    tokens.add(clean_candidate.lower())
+                    if "@" in clean_candidate:
+                        tokens.add(clean_candidate.split("@", 1)[0].lower())
+        return tokens
+
+    def _apply_interaction_dataframe_filters(
+        df_in,
+        selected_queue_names=None,
+        selected_agent_names=None,
+        selected_agent_ids=None,
+        selected_media_types=None,
+    ):
+        if not isinstance(df_in, pd.DataFrame) or df_in.empty:
+            return df_in
+        df_out = df_in.copy()
+
+        queue_tokens = {
+            str(q).strip().lower()
+            for q in (selected_queue_names or [])
+            if str(q).strip()
+        }
+        if queue_tokens and "Queue" in df_out.columns:
+            queue_series = df_out["Queue"].astype(str).str.strip().str.lower()
+            df_out = df_out[queue_series.isin(queue_tokens)]
+
+        agent_tokens = _build_agent_filter_tokens(selected_agent_names, selected_agent_ids)
+        if agent_tokens:
+            mask = pd.Series(False, index=df_out.index)
+            if "Agent" in df_out.columns:
+                mask = mask | df_out["Agent"].astype(str).str.strip().str.lower().isin(agent_tokens)
+            if "Username" in df_out.columns:
+                username_series = df_out["Username"].astype(str).str.strip().str.lower()
+                mask = mask | username_series.isin(agent_tokens)
+                mask = mask | username_series.str.split("@").str[0].isin(agent_tokens)
+            df_out = df_out[mask]
+
+        media_tokens = {
+            _normalize_detail_media_token(mt)
+            for mt in (selected_media_types or [])
+            if str(mt).strip()
+        }
+        media_tokens = {mt for mt in media_tokens if mt}
+        if media_tokens and "MediaType" in df_out.columns:
+            media_series = df_out["MediaType"].apply(_normalize_detail_media_token)
+            df_out = df_out[media_series.isin(media_tokens)]
+
+        return df_out
 
     def _extract_aggregate_issues(resp):
         dropped = resp.get("_dropped_metrics") if isinstance(resp, dict) else None
@@ -481,6 +677,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                  dfs = []
                  total_rows = 0
                  u_offset = utc_offset_hours
+                 selected_queue_ids = [qid for qid in (sel_ids or []) if qid]
+                 details_conversation_filters, details_segment_filters = _build_detail_query_filters(
+                     selected_queue_ids=selected_queue_ids,
+                     selected_media_types=sel_media_types,
+                     selected_agent_ids=interaction_agent_ids,
+                 )
                  skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                  st.session_state.skills_map = skill_lookup
                  language_lookup = api.get_languages()
@@ -489,7 +691,15 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                  else:
                      language_lookup = st.session_state.get("languages_map", {})
 
-                 for page in _iter_conversation_pages(api, start_date, end_date, max_records=max_records, chunk_days=3):
+                 for page in _iter_conversation_pages(
+                     api,
+                     start_date,
+                     end_date,
+                     max_records=max_records,
+                     chunk_days=3,
+                     conversation_filters=details_conversation_filters,
+                     segment_filters=details_segment_filters,
+                 ):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
                          st.session_state.users_info,
@@ -508,9 +718,19 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      st.warning(f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz.")
                  
                  if not df.empty:
-                     # Filter for Chat/Message types FIRST to reduce API calls
-                     chat_types = ['chat', 'message', 'webchat', 'whatsapp', 'facebook', 'twitter', 'line', 'telegram']
-                     df_chat = df[df['MediaType'].isin(chat_types)].copy()
+                     df = _apply_interaction_dataframe_filters(
+                         df,
+                         selected_queue_names=sel_names,
+                         selected_agent_names=interaction_agent_names,
+                         selected_agent_ids=interaction_agent_ids,
+                         selected_media_types=sel_media_types,
+                     )
+                     media_tokens = (
+                         df["MediaType"].apply(_normalize_detail_media_token)
+                         if "MediaType" in df.columns
+                         else pd.Series(dtype="object")
+                     )
+                     df_chat = df[media_tokens.isin({"chat", "message"})].copy() if not df.empty else pd.DataFrame()
 
                      if not df_chat.empty:
                          st.info(get_text(lang, "fetching_details_info").format(len(df_chat)))
@@ -638,7 +858,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                          ],
                      }
                  ]
-                 details_segment_clauses = [
+                 base_segment_clauses = [
                      {
                          "type": "or",
                          "predicates": [
@@ -652,40 +872,13 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      }
                  ]
                  selected_queue_ids = [qid for qid in (sel_ids or []) if qid]
-                 if selected_queue_ids:
-                     queue_preds = [
-                         {
-                             "type": "dimension",
-                             "dimension": "queueId",
-                             "operator": "matches",
-                             "value": qid,
-                         }
-                         for qid in selected_queue_ids
-                     ]
-                     details_segment_clauses.append({"type": "or", "predicates": queue_preds})
-
-                 selected_media_types = [
-                     str(mt).strip().lower()
-                     for mt in (sel_media_types or [])
-                     if str(mt).strip()
-                 ]
-                 if selected_media_types:
-                     media_preds = [
-                         {
-                             "type": "dimension",
-                             "dimension": "mediaType",
-                             "operator": "matches",
-                             "value": mt,
-                         }
-                         for mt in selected_media_types
-                     ]
-                     details_segment_clauses.append({"type": "or", "predicates": media_preds})
-
-                 details_segment_filters = None
-                 if len(details_segment_clauses) == 1:
-                     details_segment_filters = [details_segment_clauses[0]]
-                 elif len(details_segment_clauses) > 1:
-                     details_segment_filters = [{"type": "and", "clauses": details_segment_clauses}]
+                 details_conversation_filters, details_segment_filters = _build_detail_query_filters(
+                     selected_queue_ids=selected_queue_ids,
+                     selected_media_types=sel_media_types,
+                     selected_agent_ids=interaction_agent_ids,
+                     base_conversation_filters=details_conversation_filters,
+                     base_segment_clauses=base_segment_clauses,
+                 )
 
                  skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                  st.session_state.skills_map = skill_lookup
@@ -742,6 +935,13 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                          ]
                      else:
                          df_missed = pd.DataFrame() # Should not happen
+                     df_missed = _apply_interaction_dataframe_filters(
+                         df_missed,
+                         selected_queue_names=sel_names,
+                         selected_agent_names=interaction_agent_names,
+                         selected_agent_ids=interaction_agent_ids,
+                         selected_media_types=sel_media_types,
+                     )
 
                      if not df_missed.empty:
                          # Rename columns
@@ -753,6 +953,10 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                              "MediaType": "col_media",
                              "Duration": "col_duration",
                              "DisconnectType": "col_disconnect",
+                             "InternalParticipants": "col_internal_participants",
+                             "InternalDisconnectReason": "col_internal_disconnect",
+                             "ExternalParticipants": "col_external_participants",
+                             "ExternalDisconnectReason": "col_external_disconnect",
                              "Alert": "col_alert",
                              "HoldCount": "col_hold_count",
                              "ConnectionStatus": "col_connection",
@@ -809,6 +1013,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                  max_records = int(st.session_state.get("rep_max_records", 5000))
                  dfs = []
                  total_rows = 0
+                 selected_queue_ids = [qid for qid in (sel_ids or []) if qid]
+                 details_conversation_filters, details_segment_filters = _build_detail_query_filters(
+                     selected_queue_ids=selected_queue_ids,
+                     selected_media_types=sel_media_types,
+                     selected_agent_ids=interaction_agent_ids,
+                 )
                  skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                  st.session_state.skills_map = skill_lookup
                  language_lookup = api.get_languages()
@@ -817,7 +1027,15 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                  else:
                      language_lookup = st.session_state.get("languages_map", {})
 
-                 for page in _iter_conversation_pages(api, start_date, end_date, max_records=max_records, chunk_days=3):
+                 for page in _iter_conversation_pages(
+                     api,
+                     start_date,
+                     end_date,
+                     max_records=max_records,
+                     chunk_days=3,
+                     conversation_filters=details_conversation_filters,
+                     segment_filters=details_segment_filters,
+                 ):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
                          st.session_state.users_info,
@@ -835,6 +1053,13 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      st.warning(f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz.")
                  
                  if not df.empty:
+                     df = _apply_interaction_dataframe_filters(
+                         df,
+                         selected_queue_names=sel_names,
+                         selected_agent_names=interaction_agent_names,
+                         selected_agent_ids=interaction_agent_ids,
+                         selected_media_types=sel_media_types,
+                     )
                      # Rename columns first to internal keys then to display names
                      col_map_internal = {
                          "Direction": "col_direction",
@@ -844,6 +1069,10 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                          "MediaType": "col_media",
                          "Duration": "col_duration",
                          "DisconnectType": "col_disconnect",
+                         "InternalParticipants": "col_internal_participants",
+                         "InternalDisconnectReason": "col_internal_disconnect",
+                         "ExternalParticipants": "col_external_participants",
+                         "ExternalDisconnectReason": "col_external_disconnect",
                          "Alert": "col_alert",
                          "HoldCount": "col_hold_count",
                          "ConnectionStatus": "col_connection",

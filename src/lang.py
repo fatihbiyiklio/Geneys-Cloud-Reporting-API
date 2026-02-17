@@ -163,6 +163,10 @@ STRINGS = {
         "col_media": "Medya Türü",
         "col_duration": "Süre",
         "col_disconnect": "Kapanış Nedeni",
+        "col_internal_participants": "İç Katılımcı(lar)",
+        "col_internal_disconnect": "İç Kapanış Nedeni",
+        "col_external_participants": "Dış Katılımcı(lar)",
+        "col_external_disconnect": "Dış Kapanış Nedeni",
         "col_alert": "Çalma Süresi",
         "col_hold_count": "Bekletme Sayısı",
         "col_connection": "Cevap Durumu",
@@ -469,6 +473,10 @@ STRINGS = {
         "col_media": "Media Type",
         "col_duration": "Duration",
         "col_disconnect": "Disconnect Reason",
+        "col_internal_participants": "Internal Participant(s)",
+        "col_internal_disconnect": "Internal Disconnect Reason",
+        "col_external_participants": "External Participant(s)",
+        "col_external_disconnect": "External Disconnect Reason",
         "col_alert": "Alert/Ring Duration",
         "col_hold_count": "Hold Count",
         "col_connection": "Answer Status",
@@ -638,7 +646,9 @@ DEFAULT_METRICS = ["nOffered", "nAnswered", "tAnswered", "tTalk", "tHandle"]
 
 INTERACTION_COLUMNS = [
     "col_direction", "col_ani", "col_dnis", "col_agent", "col_username", "col_skill", "col_language", "col_workgroup", 
-    "col_wrapup", "col_disconnect", "col_media", "col_connection", "col_duration", "col_alert", "col_hold_count",
+    "col_wrapup", "col_disconnect", "col_internal_participants", "col_internal_disconnect",
+    "col_external_participants", "col_external_disconnect",
+    "col_media", "col_connection", "col_duration", "col_alert", "col_hold_count",
     "start_time", "end_time"
 ]
 
