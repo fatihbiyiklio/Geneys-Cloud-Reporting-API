@@ -38,6 +38,23 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 def_p = p
                 for k in ["type", "names", "metrics", "granularity_label", "fill_gaps"]:
                     if k in p: st.session_state[f"rep_{k[:3]}"] = p[k]
+                preset_state_map = {
+                    "interaction_columns": "rep_interaction_cols",
+                    "missed_columns": "rep_missed_cols",
+                    "chat_columns": "rep_chat_cols",
+                    "chat_attributes": "rep_chat_attrs",
+                    "chat_custom_attributes": "rep_chat_attrs_custom",
+                    "chat_enrich_limit": "rep_enrich_limit",
+                }
+                for preset_key, state_key in preset_state_map.items():
+                    if preset_key not in p:
+                        continue
+                    try:
+                        st.session_state[state_key] = json.loads(
+                            json.dumps(p.get(preset_key), ensure_ascii=False)
+                        )
+                    except Exception:
+                        st.session_state[state_key] = p.get(preset_key)
                 # Restore saved table layout (column order/visibility/sort) for this preset.
                 try:
                     preset_type = str(p.get("type") or st.session_state.get("rep_typ") or "report_agent")
@@ -92,6 +109,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     "metrics": st.session_state.get("rep_met", DEFAULT_METRICS),
                     "granularity_label": st.session_state.get("rep_gra", "Toplam"),
                     "fill_gaps": st.session_state.get("rep_fil", False),
+                    "interaction_columns": st.session_state.get("rep_interaction_cols", []),
+                    "missed_columns": st.session_state.get("rep_missed_cols", []),
+                    "chat_columns": st.session_state.get("rep_chat_cols", []),
+                    "chat_attributes": st.session_state.get("rep_chat_attrs", []),
+                    "chat_custom_attributes": st.session_state.get("rep_chat_attrs_custom", ""),
+                    "chat_enrich_limit": int(st.session_state.get("rep_enrich_limit", 500) or 0),
                     "table_view_state": safe_table_state,
                     "table_view_states": safe_table_states,
                 }
@@ -254,11 +277,11 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         if r_type == "chat_detail":
             st.session_state.rep_enrich_limit = st.number_input(
                 "Zenginleştirilecek chat sayısı (attributes)",
-                min_value=50,
+                min_value=0,
                 max_value=5000,
                 value=int(st.session_state.get("rep_enrich_limit", 500)),
                 step=50,
-                help="Her chat için ek API çağrısı yapılır. Limit yükseldikçe bellek ve süre artar."
+                help="0 = ek conversation API çağrısı kapalı. Yüksek limitler 429 riskini artırabilir."
             )
         st.session_state.rep_auto_row_limit = st.number_input(
             "Maksimum satır (gösterim/indirme, 0=limitsiz)",
@@ -700,6 +723,130 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         rebuilt = pd.concat([work[~is_total][passthrough_cols], totals[passthrough_cols]], ignore_index=True, sort=False)
         return rebuilt
 
+    interaction_col_map_internal = {
+        "Id": "col_interaction_id",
+        "Direction": "col_direction",
+        "Ani": "col_ani",
+        "Dnis": "col_dnis",
+        "Wrapup": "col_wrapup",
+        "MediaType": "col_media",
+        "Duration": "col_duration",
+        "DisconnectType": "col_disconnect",
+        "InternalParticipants": "col_internal_participants",
+        "InternalDisconnectReason": "col_internal_disconnect",
+        "ExternalParticipants": "col_external_participants",
+        "ExternalDisconnectReason": "col_external_disconnect",
+        "Alert": "col_alert",
+        "HoldCount": "col_hold_count",
+        "ConnectionStatus": "col_connection",
+        "Start": "start_time",
+        "End": "end_time",
+        "Agent": "col_agent",
+        "Username": "col_username",
+        "Queue": "col_workgroup",
+        "Skill": "col_skill",
+        "Language": "col_language",
+    }
+
+    chat_attribute_preset_keys = [
+        "Guest",
+        "callbackNumber",
+        "queueId",
+        "agentId",
+        "isChat",
+        "ptype",
+        "pid",
+        "callbackNote",
+        "Screen Pop URL",
+        "sid",
+        "customerPhone",
+        "callbackTime",
+        "customerEmail",
+        "triggerSource",
+        "chatType",
+        "callbackCustomerName",
+        "pname",
+        "pdatein",
+        "padult",
+        "pchild",
+        "customerName",
+        "scriptId",
+        "commercialConsent",
+        "sbj",
+        "pageUrl",
+        "pdateout",
+    ]
+
+    def _normalize_multiselect_state(state_key, options, default_values=None):
+        option_list = list(options or [])
+        option_set = set(option_list)
+        if state_key in st.session_state and isinstance(st.session_state.get(state_key), list):
+            current = [v for v in st.session_state.get(state_key, []) if v in option_set]
+            if current:
+                st.session_state[state_key] = current
+                return current
+        fallback_source = option_list if default_values is None else list(default_values)
+        fallback = [v for v in fallback_source if v in option_set]
+        if not fallback and default_values is None:
+            fallback = list(option_list)
+        st.session_state[state_key] = fallback
+        return fallback
+
+    def _parse_custom_attribute_keys(raw_value):
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return []
+        seen = set()
+        parsed = []
+        for token in raw.split(","):
+            key = str(token or "").strip()
+            if not key:
+                continue
+            lower_key = key.lower()
+            if lower_key in seen:
+                continue
+            seen.add(lower_key)
+            parsed.append(key)
+        return parsed
+
+    def _is_empty_attribute_value(value):
+        if value is None:
+            return True
+        try:
+            if pd.isna(value):
+                return True
+        except Exception:
+            pass
+        text = str(value).strip().lower()
+        return text in {"", "-", "nan", "none", "null", "n/a"}
+
+    def _extract_conversation_attributes_for_chat(conversation_payload):
+        attrs = {}
+        if not isinstance(conversation_payload, dict):
+            return attrs
+        participants = conversation_payload.get("participants") or []
+        if not isinstance(participants, list):
+            participants = []
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            if str(participant.get("purpose") or "").lower() == "customer":
+                candidate = participant.get("attributes")
+                if isinstance(candidate, dict) and candidate:
+                    attrs.update(candidate)
+                    return attrs
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            candidate = participant.get("attributes")
+            if isinstance(candidate, dict) and candidate:
+                attrs.update(candidate)
+                return attrs
+        conv_level = conversation_payload.get("attributes")
+        if isinstance(conv_level, dict) and conv_level:
+            attrs.update(conv_level)
+        return attrs
+
     report_rendered_this_run = False
 
     if r_type == "report_agent_skill_detail":
@@ -708,165 +855,267 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         st.info(get_text(lang, "dnis_skill_report_info"))
 
     if r_type == "chat_detail":
-            st.info(get_text(lang, "chat_detail_info"))
-            if st.button(get_text(lang, "fetch_chat_data"), type="primary", width='stretch'):
-             with st.spinner(get_text(lang, "fetching_data")):
-                 start_date = datetime.combine(sd, st_) - timedelta(hours=utc_offset_hours)
-                 end_date = datetime.combine(ed, et) - timedelta(hours=utc_offset_hours)
-                 
-                 api = GenesysAPI(st.session_state.api_client)
-                 max_records = int(st.session_state.get("rep_max_records", 5000))
-                 dfs = []
-                 total_rows = 0
-                 u_offset = utc_offset_hours
-                 selected_queue_ids = [qid for qid in (sel_ids or []) if qid]
-                 chat_media_query_types = [
-                     _normalize_detail_media_token(mt)
-                     for mt in (sel_media_types or [])
-                     if _normalize_detail_media_token(mt) in {"chat", "message"}
-                 ]
-                 if not chat_media_query_types:
-                     chat_media_query_types = ["chat", "message"]
-                 details_conversation_filters, details_segment_filters = _build_detail_query_filters(
-                     selected_queue_ids=selected_queue_ids,
-                     selected_media_types=chat_media_query_types,
-                     selected_agent_ids=interaction_agent_ids,
-                     require_agent_user_exists=True,
-                     exclude_without_workgroup=exclude_without_workgroup,
-                 )
-                 skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
-                 st.session_state.skills_map = skill_lookup
-                 language_lookup = api.get_languages()
-                 if language_lookup:
-                     st.session_state.languages_map = language_lookup
-                 else:
-                     language_lookup = st.session_state.get("languages_map", {})
+        from src.lang import INTERACTION_COLUMNS
 
-                 for page in _iter_conversation_pages(
-                     api,
-                     start_date,
-                     end_date,
-                     max_records=max_records,
-                     chunk_days=3,
-                     conversation_filters=details_conversation_filters,
-                     segment_filters=details_segment_filters,
-                     allow_unfiltered_fallback=False,
-                 ):
-                     df_chunk = process_conversation_details(
-                         {"conversations": page},
-                         st.session_state.users_info,
-                         st.session_state.queues_map,
-                         st.session_state.wrapup_map,
-                         include_attributes=True,
-                         utc_offset=u_offset,
-                         skill_map=skill_lookup,
-                         language_map=language_lookup
-                     )
-                     if not df_chunk.empty:
-                         dfs.append(df_chunk)
-                         total_rows += len(df_chunk)
-                 df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-                 if max_records and total_rows >= max_records:
-                     st.warning(f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz.")
-                 
-                 if not df.empty:
-                     df = _apply_interaction_dataframe_filters(
-                         df,
-                         selected_queue_names=sel_names,
-                         selected_agent_names=interaction_agent_names,
-                         selected_agent_ids=interaction_agent_ids,
-                         selected_media_types=chat_media_query_types,
-                     )
-                     media_tokens = (
-                         df["MediaType"].apply(_normalize_detail_media_token)
-                         if "MediaType" in df.columns
-                         else pd.Series(dtype="object")
-                     )
-                     df_chat = df[media_tokens.isin({"chat", "message"})].copy() if not df.empty else pd.DataFrame()
+        st.info(get_text(lang, "chat_detail_info"))
+        _normalize_multiselect_state(
+            "rep_chat_cols",
+            INTERACTION_COLUMNS,
+            default_values=list(INTERACTION_COLUMNS),
+        )
+        selected_chat_cols_keys = st.multiselect(
+            get_text(lang, "select_columns"),
+            INTERACTION_COLUMNS,
+            key="rep_chat_cols",
+            format_func=lambda x: get_text(lang, x),
+        )
 
-                     if not df_chat.empty:
-                         st.info(get_text(lang, "fetching_details_info").format(len(df_chat)))
-                         
-                         # Create a progress bar
-                         progress_bar = st.progress(0)
-                         enrich_limit = int(st.session_state.get("rep_enrich_limit", 500))
-                         if enrich_limit and len(df_chat) > enrich_limit:
-                             st.warning(f"Zenginleştirme limiti uygulandı: ilk {enrich_limit} kayıt.")
-                             df_chat = df_chat.head(enrich_limit).copy()
-                         total_chats = len(df_chat)
-                         
-                         # Prepare a list to collect updated attributes
-                         enrichment_data = []
+        _normalize_multiselect_state(
+            "rep_chat_attrs",
+            chat_attribute_preset_keys,
+            default_values=[],
+        )
+        selected_chat_attr_keys = st.multiselect(
+            "Participant Data sütunları (opsiyonel)",
+            chat_attribute_preset_keys,
+            key="rep_chat_attrs",
+            help="Sadece seçtiğiniz attribute alanları zenginleştirilir.",
+        )
+        st.text_input(
+            "Ek attribute anahtarları (virgül ile)",
+            value=str(st.session_state.get("rep_chat_attrs_custom", "") or ""),
+            key="rep_chat_attrs_custom",
+            help="Örn: visitorId, orderId",
+        )
+        custom_chat_attr_keys = _parse_custom_attribute_keys(st.session_state.get("rep_chat_attrs_custom"))
+        requested_chat_attr_keys = list(dict.fromkeys(list(selected_chat_attr_keys) + custom_chat_attr_keys))
+        if requested_chat_attr_keys:
+            st.caption(f"Seçili attribute alanları: {', '.join(requested_chat_attr_keys[:20])}")
 
-                         # Use the helper to fetch
-                         api_instance = GenesysAPI(st.session_state.api_client)
+        if st.button(get_text(lang, "fetch_chat_data"), type="primary", width='stretch'):
+            with st.spinner(get_text(lang, "fetching_data")):
+                start_date = datetime.combine(sd, st_) - timedelta(hours=utc_offset_hours)
+                end_date = datetime.combine(ed, et) - timedelta(hours=utc_offset_hours)
 
-                         for index, (idx, row) in enumerate(df_chat.iterrows()):
-                             conv_id = row['Id']
-                             # Update progress
-                             progress_bar.progress((index + 1) / total_chats)
-                             
-                             try:
-                                 # ENRICHMENT: Call Standard Conversation API
-                                 # This is necessary because Analytics API often omits 'attributes' (Participant Data)
-                                 full_conv = api_instance._get(f"/api/v2/conversations/{conv_id}")
-                                 
-                                 attrs = {}
-                                 if full_conv and 'participants' in full_conv:
-                                     # Look for customer participant who usually holds the attributes
-                                     # Prioritize customer, then check others
-                                     found_attrs = False
-                                     for p in full_conv['participants']:
-                                         if p.get('purpose') == 'customer' and 'attributes' in p and p['attributes']:
-                                             attrs = p['attributes']
-                                             found_attrs = True
-                                             break
-                                     
-                                     if not found_attrs:
-                                          for p in full_conv['participants']:
-                                              if 'attributes' in p and p['attributes']:
-                                                  attrs = p['attributes']
-                                                  break
-                                 
-                                 # Append dict to list
-                                 enrichment_data.append(attrs)
-                                 
-                             except Exception as e:
-                                 # If individual fetch fails
-                                 enrichment_data.append({})
-                         
-                         progress_bar.empty()
-                         
-                         # Merge attributes into the DataFrame
-                         # usage of 'at' for direct assignment
-                         for i, attrs in enumerate(enrichment_data):
-                             original_index = df_chat.index[i]
-                             for k, v in attrs.items():
-                                 # Determine content to set. If it's a date or number, pandas might complain if column is object type,
-                                 # but usually it handles it. 
-                                 # We cast to string if needed to be safe? No, let pandas handle types.
-                                 df_chat.at[original_index, k] = v
-                     
-                     if df_chat.empty and not df.empty:
-                         _clear_report_result("chat_detail")
-                         st.warning("Seçilen tarih aralığında hiç 'Chat/Mesaj' kaydı bulunamadı. (Sesli çağrılar hariç tutuldu)")
-                     elif not df_chat.empty:
-                         df_chat = _apply_report_row_limit(df_chat, label="Chat detay raporu")
-                         df_chat_view = render_table_with_export_view(df_chat, "chat_detail")
-                         _store_report_result("chat_detail", df_chat, "chat_detail")
-                         render_downloads(df_chat_view, "chat_detail", key_base="chat_detail")
-                         report_rendered_this_run = True
-                     else:
-                         _clear_report_result("chat_detail")
-                         st.warning(get_text(lang, "no_data"))
-                 else:
-                     _clear_report_result("chat_detail")
-                     st.warning(get_text(lang, "no_data"))
-                 try:
-                     import gc as _gc
-                     _gc.collect()
-                 except Exception:
-                     pass
+                api = GenesysAPI(st.session_state.api_client)
+                max_records = int(st.session_state.get("rep_max_records", 5000))
+                dfs = []
+                total_rows = 0
+                u_offset = utc_offset_hours
+                selected_queue_ids = [qid for qid in (sel_ids or []) if qid]
+                chat_media_query_types = [
+                    _normalize_detail_media_token(mt)
+                    for mt in (sel_media_types or [])
+                    if _normalize_detail_media_token(mt) in {"chat", "message"}
+                ]
+                if not chat_media_query_types:
+                    chat_media_query_types = ["chat", "message"]
+                details_conversation_filters, details_segment_filters = _build_detail_query_filters(
+                    selected_queue_ids=selected_queue_ids,
+                    selected_media_types=chat_media_query_types,
+                    selected_agent_ids=interaction_agent_ids,
+                    require_agent_user_exists=True,
+                    exclude_without_workgroup=exclude_without_workgroup,
+                )
+                skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
+                st.session_state.skills_map = skill_lookup
+                language_lookup = api.get_languages()
+                if language_lookup:
+                    st.session_state.languages_map = language_lookup
+                else:
+                    language_lookup = st.session_state.get("languages_map", {})
+
+                include_requested_attributes = bool(requested_chat_attr_keys)
+                for page in _iter_conversation_pages(
+                    api,
+                    start_date,
+                    end_date,
+                    max_records=max_records,
+                    chunk_days=3,
+                    conversation_filters=details_conversation_filters,
+                    segment_filters=details_segment_filters,
+                    allow_unfiltered_fallback=False,
+                ):
+                    df_chunk = process_conversation_details(
+                        {"conversations": page},
+                        st.session_state.users_info,
+                        st.session_state.queues_map,
+                        st.session_state.wrapup_map,
+                        include_attributes=include_requested_attributes,
+                        utc_offset=u_offset,
+                        skill_map=skill_lookup,
+                        language_map=language_lookup,
+                    )
+                    if not df_chunk.empty:
+                        dfs.append(df_chunk)
+                        total_rows += len(df_chunk)
+                df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+                if max_records and total_rows >= max_records:
+                    st.warning(
+                        f"Maksimum kayıt limiti ({max_records}) uygulandı. Daha geniş aralıklar için limiti artırabilirsiniz."
+                    )
+
+                if not df.empty:
+                    df = _apply_interaction_dataframe_filters(
+                        df,
+                        selected_queue_names=sel_names,
+                        selected_agent_names=interaction_agent_names,
+                        selected_agent_ids=interaction_agent_ids,
+                        selected_media_types=chat_media_query_types,
+                    )
+                    media_tokens = (
+                        df["MediaType"].apply(_normalize_detail_media_token)
+                        if "MediaType" in df.columns
+                        else pd.Series(dtype="object")
+                    )
+                    df_chat = df[media_tokens.isin({"chat", "message"})].copy() if not df.empty else pd.DataFrame()
+
+                    if not df_chat.empty:
+                        for attr_key in requested_chat_attr_keys:
+                            if attr_key not in df_chat.columns:
+                                df_chat[attr_key] = ""
+
+                        if requested_chat_attr_keys:
+                            enrich_limit = int(st.session_state.get("rep_enrich_limit", 500) or 0)
+                            if enrich_limit == 0:
+                                st.info("Ek conversation API zenginleştirmesi kapalı (limit=0).")
+                            else:
+                                enrich_scope_df = df_chat
+                                if enrich_limit > 0 and len(df_chat) > enrich_limit:
+                                    st.warning(
+                                        f"Zenginleştirme limiti nedeniyle ilk {enrich_limit} chat kaydı detaylandırıldı."
+                                    )
+                                    enrich_scope_df = df_chat.head(enrich_limit)
+
+                                conversation_targets = {}
+                                for idx, row in enrich_scope_df.iterrows():
+                                    conv_id = str(row.get("Id") or "").strip()
+                                    if not conv_id:
+                                        continue
+                                    needs_fetch = any(
+                                        _is_empty_attribute_value(row.get(attr_key))
+                                        for attr_key in requested_chat_attr_keys
+                                    )
+                                    if needs_fetch:
+                                        if conv_id not in conversation_targets:
+                                            conversation_targets[conv_id] = []
+                                        conversation_targets[conv_id].append(idx)
+
+                                chat_attr_cache = st.session_state.get("_chat_attr_cache")
+                                if not isinstance(chat_attr_cache, dict):
+                                    chat_attr_cache = {}
+                                st.session_state["_chat_attr_cache"] = chat_attr_cache
+
+                                for conv_id, row_indexes in conversation_targets.items():
+                                    cached_attrs = chat_attr_cache.get(conv_id)
+                                    if not isinstance(cached_attrs, dict):
+                                        continue
+                                    for attr_key in requested_chat_attr_keys:
+                                        if attr_key not in cached_attrs:
+                                            continue
+                                        for row_index in row_indexes:
+                                            df_chat.at[row_index, attr_key] = cached_attrs.get(attr_key)
+
+                                remaining_conv_ids = []
+                                for conv_id, row_indexes in conversation_targets.items():
+                                    still_missing = False
+                                    for row_index in row_indexes:
+                                        if any(
+                                            _is_empty_attribute_value(df_chat.at[row_index, attr_key])
+                                            for attr_key in requested_chat_attr_keys
+                                        ):
+                                            still_missing = True
+                                            break
+                                    if still_missing:
+                                        remaining_conv_ids.append(conv_id)
+
+                                if remaining_conv_ids:
+                                    st.info(get_text(lang, "fetching_details_info").format(len(remaining_conv_ids)))
+                                    progress_bar = st.progress(0)
+                                    failed_calls = 0
+                                    rate_limit_errors = 0
+                                    api_instance = GenesysAPI(st.session_state.api_client)
+                                    for fetch_index, conv_id in enumerate(remaining_conv_ids):
+                                        progress_bar.progress((fetch_index + 1) / len(remaining_conv_ids))
+                                        attrs = {}
+                                        try:
+                                            full_conv = api_instance._get(f"/api/v2/conversations/{conv_id}")
+                                            attrs = _extract_conversation_attributes_for_chat(full_conv)
+                                        except Exception as fetch_err:
+                                            failed_calls += 1
+                                            if "429" in str(fetch_err):
+                                                rate_limit_errors += 1
+                                        chat_attr_cache[conv_id] = attrs
+                                        for row_index in conversation_targets.get(conv_id, []):
+                                            for attr_key in requested_chat_attr_keys:
+                                                if attr_key not in attrs:
+                                                    continue
+                                                df_chat.at[row_index, attr_key] = attrs.get(attr_key)
+                                        if (fetch_index + 1) % 25 == 0:
+                                            import time as _time
+                                            _time.sleep(0.15)
+                                    progress_bar.empty()
+
+                                    max_cache_items = 10000
+                                    if len(chat_attr_cache) > max_cache_items:
+                                        overflow = len(chat_attr_cache) - max_cache_items
+                                        for old_key in list(chat_attr_cache.keys())[:overflow]:
+                                            chat_attr_cache.pop(old_key, None)
+                                    st.session_state["_chat_attr_cache"] = chat_attr_cache
+
+                                    if failed_calls:
+                                        if rate_limit_errors:
+                                            st.warning(
+                                                f"{failed_calls} detay çağrısı tamamlanamadı (429: {rate_limit_errors}). "
+                                                "Kısmi attribute verisi gösteriliyor olabilir."
+                                            )
+                                        else:
+                                            st.warning(
+                                                f"{failed_calls} detay çağrısı tamamlanamadı. "
+                                                "Kısmi attribute verisi gösteriliyor olabilir."
+                                            )
+
+                        selected_base_cols = [
+                            col_name
+                            for col_name, label_key in interaction_col_map_internal.items()
+                            if label_key in selected_chat_cols_keys and col_name in df_chat.columns
+                        ]
+                        selected_attr_cols = [
+                            attr_key for attr_key in requested_chat_attr_keys if attr_key in df_chat.columns
+                        ]
+                        final_cols = selected_base_cols + [
+                            col_name for col_name in selected_attr_cols if col_name not in selected_base_cols
+                        ]
+                        if final_cols:
+                            df_chat = df_chat[final_cols].copy()
+
+                        rename_final = {
+                            col_name: get_text(lang, interaction_col_map_internal[col_name])
+                            for col_name in selected_base_cols
+                        }
+                        df_chat = _apply_selected_duration_view(df_chat)
+                        final_df = df_chat.rename(columns=rename_final)
+                        final_df = _apply_report_row_limit(final_df, label="Chat detay raporu")
+                        final_df_view = render_table_with_export_view(final_df, "chat_detail")
+                        _store_report_result("chat_detail", final_df, "chat_detail")
+                        render_downloads(final_df_view, "chat_detail", key_base="chat_detail")
+                        report_rendered_this_run = True
+                    elif not df.empty:
+                        _clear_report_result("chat_detail")
+                        st.warning(
+                            "Seçilen tarih aralığında hiç 'Chat/Mesaj' kaydı bulunamadı. (Sesli çağrılar hariç tutuldu)"
+                        )
+                    else:
+                        _clear_report_result("chat_detail")
+                        st.warning(get_text(lang, "no_data"))
+                else:
+                    _clear_report_result("chat_detail")
+                    st.warning(get_text(lang, "no_data"))
+                try:
+                    import gc as _gc
+                    _gc.collect()
+                except Exception:
+                    pass
 
     # --- MISSED INTERACTIONS REPORT ---
     if r_type == "missed_interactions":
@@ -874,9 +1123,17 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         
         # Dynamic Column Selection (Reuse interaction cols)
         from src.lang import INTERACTION_COLUMNS
-        default_cols = [c for c in INTERACTION_COLUMNS if c not in ["col_attributes", "col_media"]]
-         # Let user select
-        selected_cols_keys = st.multiselect(get_text(lang, "select_columns"), INTERACTION_COLUMNS, default=INTERACTION_COLUMNS, format_func=lambda x: get_text(lang, x))
+        _normalize_multiselect_state(
+            "rep_missed_cols",
+            INTERACTION_COLUMNS,
+            default_values=list(INTERACTION_COLUMNS),
+        )
+        selected_cols_keys = st.multiselect(
+            get_text(lang, "select_columns"),
+            INTERACTION_COLUMNS,
+            key="rep_missed_cols",
+            format_func=lambda x: get_text(lang, x),
+        )
 
         if st.button(get_text(lang, "fetch_missed_report"), type="primary", width='stretch'):
              with st.spinner(get_text(lang, "fetching_data")):
@@ -998,35 +1255,16 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      )
 
                      if not df_missed.empty:
-                         # Rename columns
-                         col_map_internal = {
-                             "Id": "col_interaction_id",
-                             "Direction": "col_direction",
-                             "Ani": "col_ani",
-                             "Dnis": "col_dnis",
-                             "Wrapup": "col_wrapup",
-                             "MediaType": "col_media",
-                             "Duration": "col_duration",
-                             "DisconnectType": "col_disconnect",
-                             "InternalParticipants": "col_internal_participants",
-                             "InternalDisconnectReason": "col_internal_disconnect",
-                             "ExternalParticipants": "col_external_participants",
-                             "ExternalDisconnectReason": "col_external_disconnect",
-                             "Alert": "col_alert",
-                             "HoldCount": "col_hold_count",
-                             "ConnectionStatus": "col_connection",
-                             "Start": "start_time",
-                             "End": "end_time",
-                             "Agent": "col_agent",
-                             "Username": "col_username",
-                             "Queue": "col_workgroup",
-                             "Skill": "col_skill",
-                             "Language": "col_language"
-                         }
-                         
-                         final_cols = [k for k, v in col_map_internal.items() if v in selected_cols_keys]
+                         final_cols = [
+                             col_name
+                             for col_name, label_key in interaction_col_map_internal.items()
+                             if label_key in selected_cols_keys and col_name in df_missed.columns
+                         ]
                          df_filtered = df_missed[final_cols]
-                         rename_final = {k: get_text(lang, col_map_internal[k]) for k in final_cols}
+                         rename_final = {
+                             col_name: get_text(lang, interaction_col_map_internal[col_name])
+                             for col_name in final_cols
+                         }
                          
                          final_df = df_filtered.rename(columns=rename_final)
                          final_df = _apply_report_row_limit(final_df, label="Kaçan etkileşim raporu")
@@ -1054,10 +1292,17 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         
         # Dynamic Column Selection
         from src.lang import INTERACTION_COLUMNS
-        default_cols = [c for c in INTERACTION_COLUMNS if c not in ["col_media", "col_wrapup"]] # Default subset
-        
-        # Allow user to customize columns if needed
-        selected_cols_keys = st.multiselect(get_text(lang, "select_columns"), INTERACTION_COLUMNS, default=INTERACTION_COLUMNS, format_func=lambda x: get_text(lang, x))
+        _normalize_multiselect_state(
+            "rep_interaction_cols",
+            INTERACTION_COLUMNS,
+            default_values=list(INTERACTION_COLUMNS),
+        )
+        selected_cols_keys = st.multiselect(
+            get_text(lang, "select_columns"),
+            INTERACTION_COLUMNS,
+            key="rep_interaction_cols",
+            format_func=lambda x: get_text(lang, x),
+        )
         
         if st.button(get_text(lang, "fetch_interactions"), type="primary", width='stretch'):
              with st.spinner(get_text(lang, "fetching_data")):
@@ -1117,38 +1362,19 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                          selected_agent_ids=interaction_agent_ids,
                          selected_media_types=sel_media_types,
                      )
-                     # Rename columns first to internal keys then to display names
-                     col_map_internal = {
-                         "Id": "col_interaction_id",
-                         "Direction": "col_direction",
-                         "Ani": "col_ani",
-                         "Dnis": "col_dnis",
-                         "Wrapup": "col_wrapup",
-                         "MediaType": "col_media",
-                         "Duration": "col_duration",
-                         "DisconnectType": "col_disconnect",
-                         "InternalParticipants": "col_internal_participants",
-                         "InternalDisconnectReason": "col_internal_disconnect",
-                         "ExternalParticipants": "col_external_participants",
-                         "ExternalDisconnectReason": "col_external_disconnect",
-                         "Alert": "col_alert",
-                         "HoldCount": "col_hold_count",
-                         "ConnectionStatus": "col_connection",
-                         "Start": "start_time",
-                         "End": "end_time",
-                         "Agent": "col_agent",
-                         "Username": "col_username",
-                         "Queue": "col_workgroup",
-                         "Skill": "col_skill",
-                         "Language": "col_language"
-                     }
-                     
                      # Filter columns based on selection
-                     final_cols = [k for k, v in col_map_internal.items() if v in selected_cols_keys]
+                     final_cols = [
+                         col_name
+                         for col_name, label_key in interaction_col_map_internal.items()
+                         if label_key in selected_cols_keys and col_name in df.columns
+                     ]
                      df_filtered = df[final_cols]
                      
                      # Rename to Display Names
-                     rename_final = {k: get_text(lang, col_map_internal[k]) for k in final_cols}
+                     rename_final = {
+                         col_name: get_text(lang, interaction_col_map_internal[col_name])
+                         for col_name in final_cols
+                     }
                      
                      df_filtered = _apply_selected_duration_view(df_filtered)
                      final_df = df_filtered.rename(columns=rename_final)
