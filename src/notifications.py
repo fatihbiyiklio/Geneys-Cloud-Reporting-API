@@ -934,7 +934,7 @@ class AgentNotificationManager:
 
 class GlobalConversationNotificationManager:
     """Notifications for org-wide conversations (calls/chats/messages/etc)."""
-    ACTIVE_CALL_TTL_SECONDS = 900  # Keep active conversations longer to avoid transient drops.
+    ACTIVE_CALL_TTL_SECONDS = 3600  # Keep active conversations longer to avoid transient drops.
     CLEANUP_INTERVAL_SECONDS = 30  # Reduced from 45
     MAX_ACTIVE_CONVERSATIONS = 300 # Reduced from 500
 
@@ -961,6 +961,13 @@ class GlobalConversationNotificationManager:
         self._next_retry_ts = 0
         self._backoff_seconds = 0
         self._last_cleanup_ts = 0
+        self._diag = {
+            "events_total": 0,
+            "events_upsert": 0,
+            "events_removed_end": 0,
+            "events_removed_inactive": 0,
+            "events_sparse_kept": 0,
+        }
 
     def update_client(self, api_client, queues_map):
         self.api = GenesysAPI(api_client) if api_client else None
@@ -1052,6 +1059,10 @@ class GlobalConversationNotificationManager:
                 self.active_conversations.pop(k, None)
             return list(self.active_conversations.values())
 
+    def get_diag(self):
+        with self._lock:
+            return dict(self._diag)
+
     def seed_conversations(self, conversations):
         """Upsert conversations from API. Updates existing entries, adds new ones."""
         now = time.time()
@@ -1062,13 +1073,44 @@ class GlobalConversationNotificationManager:
                     continue
                 existing = self.active_conversations.get(conv_id)
                 if existing:
-                    # Keep WS data if fresher, otherwise update from API
-                    ws_ts = existing.get("last_update", 0)
-                    # If WS updated this conv within last 10s, prefer WS data
-                    if (now - ws_ts) < 10:
-                        continue
-                conv["last_update"] = now
-                self.active_conversations[conv_id] = conv
+                    merged = dict(existing)
+                    # Reconcile all known fields on every seed cycle so existing rows refresh too.
+                    for key in (
+                        "conversation_id",
+                        "queue_id",
+                        "queue_name",
+                        "wg",
+                        "wait_seconds",
+                        "phone",
+                        "direction",
+                        "direction_label",
+                        "state",
+                        "agent_id",
+                        "agent_name",
+                        "media_type",
+                        "ivr_attrs",
+                        "ivr_selection",
+                    ):
+                        value = conv.get(key)
+                        if value is None or value == "":
+                            continue
+                        if key == "media_type":
+                            old_mt = str(merged.get("media_type") or "").lower()
+                            new_mt = str(value or "").lower()
+                            # Do not downgrade callback classification.
+                            if old_mt == "callback" and new_mt != "callback":
+                                continue
+                        if key == "queue_name":
+                            old_q = merged.get("queue_name")
+                            if _is_generic_queue_name(value) and not _is_generic_queue_name(old_q):
+                                continue
+                        merged[key] = value
+                    merged["last_update"] = now
+                    self.active_conversations[conv_id] = merged
+                else:
+                    item = dict(conv)
+                    item["last_update"] = now
+                    self.active_conversations[conv_id] = item
 
     def _prune_active_conversations(self):
         now = time.time()
@@ -1210,8 +1252,13 @@ class GlobalConversationNotificationManager:
         conv_id = event.get("id") or event.get("conversationId")
         if not conv_id:
             return
+        with self._lock:
+            self._diag["events_total"] = int(self._diag.get("events_total", 0) or 0) + 1
         self.last_event_ts = time.time()
         participants = event.get("participants", []) or []
+        session_count = 0
+        for p in participants:
+            session_count += len(p.get("sessions", []) or [])
 
         # Extract queue ID from topic (v2.routing.queues.{queueId}.conversations)
         topic_queue_id = None
@@ -1232,9 +1279,37 @@ class GlobalConversationNotificationManager:
             # Callback requests can be waiting without an active session state yet.
             active = True
 
-        if event.get("conversationEnd") or not active:
+        if event.get("conversationEnd"):
             with self._lock:
                 self.active_conversations.pop(conv_id, None)
+                self._diag["events_removed_end"] = int(self._diag.get("events_removed_end", 0) or 0) + 1
+            return
+        if not active:
+            # Genesys can emit partial non-terminal events (no active sessions) before
+            # a terminal conversationEnd event. Never drop existing live rows on this.
+            with self._lock:
+                existing = self.active_conversations.get(conv_id)
+                if existing:
+                    preserved = dict(existing)
+                    direction = event.get("originatingDirection") or event.get("direction")
+                    if direction and not preserved.get("direction"):
+                        preserved["direction"] = direction
+                    if not preserved.get("direction_label"):
+                        dir_label = _direction_label(direction) if direction else _infer_direction_from_event(event)
+                        if dir_label:
+                            preserved["direction_label"] = dir_label
+                    incoming_media = _extract_media_type(event)
+                    if incoming_media:
+                        if str(incoming_media).lower() == "callback":
+                            preserved["media_type"] = "callback"
+                        elif not preserved.get("media_type"):
+                            preserved["media_type"] = incoming_media
+                    preserved["last_update"] = time.time()
+                    self.active_conversations[conv_id] = preserved
+                    self._diag["events_sparse_kept"] = int(self._diag.get("events_sparse_kept", 0) or 0) + 1
+                else:
+                    # Unknown non-active event: ignore until we receive active or end payload.
+                    self._diag["events_removed_inactive"] = int(self._diag.get("events_removed_inactive", 0) or 0) + 1
             return
 
         queue_name = None
@@ -1400,6 +1475,7 @@ class GlobalConversationNotificationManager:
                 "ivr_selection": ivr_display,
                 "last_update": time.time(),
             }
+            self._diag["events_upsert"] = int(self._diag.get("events_upsert", 0) or 0) + 1
 
 
 def _parse_wait_seconds(val):

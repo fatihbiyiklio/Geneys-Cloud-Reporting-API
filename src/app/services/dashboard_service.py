@@ -6,6 +6,48 @@ from src.app.context import bind_context
 def render_dashboard_service(context: Dict[str, Any]) -> None:
     """Render live dashboard page using injected app context."""
     bind_context(globals(), context)
+    if "dashboard_mode" not in st.session_state:
+        st.session_state.dashboard_mode = "Live"
+    if "dashboard_auto_refresh" not in st.session_state:
+        st.session_state.dashboard_auto_refresh = True
+
+    in_fragment_refresh = bool(st.session_state.get("_dashboard_fragment_mode", False))
+    if in_fragment_refresh and (
+        st.session_state.get("dashboard_mode") != "Live"
+        or not st.session_state.get("dashboard_auto_refresh", True)
+    ):
+        st.session_state["_dashboard_fragment_mode"] = False
+        try:
+            st.rerun(scope="app")
+        except TypeError:
+            st.rerun()
+    if (
+        not in_fragment_refresh
+        and st.session_state.get("dashboard_mode") == "Live"
+        and st.session_state.get("dashboard_auto_refresh", True)
+    ):
+        refresh_seconds = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
+
+        @st.fragment(run_every=refresh_seconds)
+        def _dashboard_live_fragment():
+            st.session_state["_dashboard_fragment_mode"] = True
+            try:
+                render_dashboard_service(context)
+            finally:
+                st.session_state["_dashboard_fragment_mode"] = False
+
+        _dashboard_live_fragment()
+        return
+
+    def _dashboard_rerun() -> None:
+        try:
+            if in_fragment_refresh:
+                st.rerun(scope="fragment")
+            else:
+                st.rerun()
+        except TypeError:
+            st.rerun()
+
     dashboard_profile_total_t0 = pytime.perf_counter()
     _dashboard_profile_tick()
     # (Config already loaded at top level)
@@ -36,13 +78,13 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
             p_c1, p_c2, p_c3 = st.columns(3)
             if p_c1.button("Profili Başlat", key="dashboard_profile_start_btn", width='stretch'):
                 _dashboard_profile_start(duration_s=profile_duration)
-                st.rerun()
+                _dashboard_rerun()
             if p_c2.button("Profili Durdur", key="dashboard_profile_stop_btn", width='stretch'):
                 _dashboard_profile_stop()
-                st.rerun()
+                _dashboard_rerun()
             if p_c3.button("Profili Temizle", key="dashboard_profile_clear_btn", width='stretch'):
                 _dashboard_profile_clear(duration_s=profile_duration)
-                st.rerun()
+                _dashboard_rerun()
             if profile_state.get("enabled"):
                 elapsed_s = max(0, int(pytime.time() - float(profile_state.get("started_ts", 0) or 0)))
                 remaining_s = max(0, int(profile_state.get("duration_s", 180)) - elapsed_s)
@@ -59,13 +101,13 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
         save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
         refresh_data_manager_queues()
         st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
-        st.rerun()
+        _dashboard_rerun()
     
     with c_c2:
         sc1, sc2 = st.columns([2, 3])
         lo = sc1.radio(get_text(lang, "layout"), [1, 2, 3, 4], format_func=lambda x: f"Grid: {x}", index=min(st.session_state.dashboard_layout-1, 3), horizontal=True, label_visibility="collapsed")
         if lo != st.session_state.dashboard_layout:
-            st.session_state.dashboard_layout = lo; save_dashboard_config(org, lo, st.session_state.dashboard_cards); st.rerun()
+            st.session_state.dashboard_layout = lo; save_dashboard_config(org, lo, st.session_state.dashboard_cards); _dashboard_rerun()
         m_opts = ["Live", "Yesterday", "Date"]
         if 'dashboard_mode' not in st.session_state: st.session_state.dashboard_mode = "Live"
         st.session_state.dashboard_mode = sc2.radio(get_text(lang, "mode"), m_opts, format_func=lambda x: get_text(lang, f"mode_{x.lower()}"), index=m_opts.index(st.session_state.dashboard_mode), horizontal=True, label_visibility="collapsed")
@@ -108,7 +150,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
             # DataManager is managed centrally by refresh_data_manager_queues()
             # which is called on login, hot-reload, and config changes.
             ref_int = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
-            if st.session_state.get("dashboard_auto_refresh", True):
+            if st.session_state.get("dashboard_auto_refresh", True) and not in_fragment_refresh:
                 _safe_autorefresh(interval=ref_int * 1000, key="data_refresh")
         if not st.session_state.get("queues_map"):
             st.caption("Queue listesi yuklenemedi.")
@@ -116,7 +158,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                 recover_org_maps_if_needed(org, force=True)
                 refresh_data_manager_queues()
                 st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
-                st.rerun()
+                _dashboard_rerun()
     _dashboard_profile_record("dashboard.controls", pytime.perf_counter() - controls_t0)
 
     # Available metric options
@@ -762,7 +804,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
         save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
         refresh_data_manager_queues()
         st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
-        st.rerun()
+        _dashboard_rerun()
 
     # --- SIDE PANEL LOGIC ---
     if st.session_state.get('show_agent_panel', False) and agent_c:
@@ -1200,25 +1242,27 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                 st.session_state.call_panel_type_filters = list(call_filter_options)
             else:
                 st.session_state.call_panel_type_filters = [f for f in raw_type_filters if f in call_filter_options]
-
-            with st.form("call_panel_filters_form", clear_on_submit=False, border=False):
-                queue_search_term = st.text_input(
-                    "🔍 Kuyruk Ara",
-                    label_visibility="collapsed",
-                    placeholder="Kuyruk Ara...",
-                    key="call_panel_queue_search",
-                )
-                selected_group = st.selectbox("📌 Grup Filtresi", group_options, key="call_panel_group")
-                hide_mevcut = st.checkbox("Mevcut içeren kuyrukları gizle", key="call_panel_hide_mevcut")
-                selected_call_filters = st.multiselect(
-                    "🎛️ Yön / Kanal / Durum Filtresi",
-                    options=call_filter_options,
-                    key="call_panel_type_filters",
-                    format_func=lambda x: call_filter_labels.get(x, str(x).title()),
-                )
-                st.form_submit_button("Filtreyi Uygula", use_container_width=True)
+            # Filters are view-only: data keeps refreshing continuously, only visible list is filtered.
+            queue_search_term = st.text_input(
+                "🔍 Kuyruk Ara",
+                label_visibility="collapsed",
+                placeholder="Kuyruk Ara...",
+                key="call_panel_queue_search",
+            )
+            selected_group = st.selectbox("📌 Grup Filtresi", group_options, key="call_panel_group")
+            hide_mevcut = st.checkbox("Mevcut içeren kuyrukları gizle", key="call_panel_hide_mevcut")
+            selected_call_filters = st.multiselect(
+                "🎛️ Yön / Kanal / Durum Filtresi",
+                options=call_filter_options,
+                key="call_panel_type_filters",
+                format_func=lambda x: call_filter_labels.get(x, str(x).title()),
+            )
 
             queue_search_term = str(queue_search_term or "").strip().lower()
+            if selected_group not in group_options:
+                selected_group = "Hepsi (All)"
+            hide_mevcut = bool(hide_mevcut)
+            selected_call_filters = [f for f in (selected_call_filters or []) if f in call_filter_options]
             selected_filter_set = {str(x).lower() for x in (selected_call_filters or []) if x}
             selected_direction_filters = selected_filter_set.intersection(full_direction_filter_set)
             selected_state_filters = selected_filter_set.intersection(full_state_filter_set)
@@ -1260,6 +1304,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                 # ========================================
                 global_notif = ensure_global_conversation_manager()
                 global_notif.update_client(st.session_state.api_client, st.session_state.queues_map)
+                active_ttl_s = max(900, int(getattr(global_notif, "ACTIVE_CALL_TTL_SECONDS", 3600) or 3600))
 
                 all_queue_ids = list(st.session_state.queues_map.values()) if st.session_state.get("queues_map") else []
                 global_topics = [f"v2.routing.queues.{qid}.conversations" for qid in all_queue_ids if qid]
@@ -1267,16 +1312,21 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
 
                 last_msg = getattr(global_notif, "last_message_ts", 0)
                 last_evt = getattr(global_notif, "last_event_ts", 0)
-                snapshot_interval_s = max(90, int(refresh_s) * 8)
-                notif_stale = (not global_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > snapshot_interval_s)
+                seed_interval_s = max(180, int(refresh_s) * 12)
+                stale_after = seed_interval_s
+                notif_stale = (not global_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > stale_after)
+                reconcile_interval_s = max(10, int(refresh_s))
+                last_reconcile_ts = float(st.session_state.get("_call_panel_reconcile_ts", 0) or 0)
 
-                # Basic model: WS is primary, periodic API snapshot fully replaces active map.
-                last_snapshot_ts = float(st.session_state.get("_call_panel_snapshot_ts", 0) or 0)
-                should_snapshot = notif_stale or ((now_ts - last_snapshot_ts) >= snapshot_interval_s)
-                if should_snapshot:
+                # Agent panel ile ayni model:
+                # WS birincil kaynak, API sadece WS bos/stale oldugunda seed eder.
+                existing_live = global_notif.get_active_conversations(max_age_seconds=active_ttl_s)
+                needs_seed = (not existing_live) or notif_stale
+                should_reconcile = needs_seed or ((now_ts - last_reconcile_ts) >= reconcile_interval_s)
+                reserve_interval = seed_interval_s if needs_seed else reconcile_interval_s
+                if should_reconcile and _reserve_call_seed(org, now_ts, min_interval=reserve_interval):
                     snapshot_api_t0 = pytime.perf_counter()
                     try:
-                        snapshot_started_ts = pytime.time()
                         api = GenesysAPI(st.session_state.api_client)
                         end_dt = datetime.now(timezone.utc)
                         start_dt = end_dt - timedelta(hours=4)
@@ -1311,35 +1361,15 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             c["last_update"] = now_update
                             if not c.get("media_type"):
                                 c["media_type"] = _extract_media_type(c)
-                        st.session_state["_call_panel_snapshot_ts"] = now_update
-                        new_map = {c.get("conversation_id"): c for c in snapshot_calls if c.get("conversation_id")}
-                        with global_notif._lock:
-                            existing_map = dict(global_notif.active_conversations or {})
-                            merged_map = {}
-
-                            # 1) Start from snapshot, but never overwrite fresher WS data.
-                            for cid, snap_item in new_map.items():
-                                ex = existing_map.get(cid) or {}
-                                ex_ts = ex.get("last_update", 0) or 0
-                                if ex and ex_ts > snapshot_started_ts:
-                                    merged_map[cid] = ex
-                                else:
-                                    merged_map[cid] = _merge_call(ex, snap_item) if ex else snap_item
-
-                            # 2) Keep very fresh WS-only items that may lag in analytics snapshot.
-                            for cid, ex in existing_map.items():
-                                if cid in merged_map:
-                                    continue
-                                ex_ts = ex.get("last_update", 0) or 0
-                                if ex_ts and (snapshot_started_ts - ex_ts) <= 120:
-                                    merged_map[cid] = ex
-
-                            global_notif.active_conversations = merged_map
+                        global_notif.seed_conversations(snapshot_calls)
+                        _update_call_seed(org, snapshot_calls, now_update, max_items=300)
+                        st.session_state["_call_panel_reconcile_ts"] = now_update
                     except Exception:
-                        pass
+                        # Retry immediately on next rerun if snapshot fails.
+                        _update_call_seed(org, [], 0, max_items=300)
                     _dashboard_profile_record("call_panel.snapshot_api", pytime.perf_counter() - snapshot_api_t0)
 
-                active_conversations = global_notif.get_active_conversations(max_age_seconds=600)
+                active_conversations = global_notif.get_active_conversations(max_age_seconds=active_ttl_s)
                 for c in active_conversations:
                     if "state" not in c:
                         c["state"] = "waiting"
@@ -1359,11 +1389,17 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         combined.pop(cid, None)
                         continue
                     lu = item.get("last_update", 0) or 0
-                    if lu and (now_ts - lu) > 600:
+                    if lu and (now_ts - lu) > active_ttl_s:
                         combined.pop(cid, None)
                         continue
 
                 waiting_calls = list(combined.values())
+                raw_ws_total = 0
+                try:
+                    with global_notif._lock:
+                        raw_ws_total = len(global_notif.active_conversations or {})
+                except Exception:
+                    raw_ws_total = len(active_conversations)
 
                 filter_sort_t0 = pytime.perf_counter()
                 if group_queues_lower:
@@ -1392,7 +1428,50 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         )
                     ]
 
+                # Keep existing rows visually fresh between WS/API updates.
+                for item in waiting_calls:
+                    wait_val = item.get("wait_seconds")
+                    if wait_val is None:
+                        continue
+                    try:
+                        base_wait = float(wait_val)
+                    except Exception:
+                        continue
+                    last_upd = float(item.get("last_update", 0) or 0)
+                    if last_upd > 0:
+                        base_wait = max(0.0, base_wait + max(0.0, now_ts - last_upd))
+                    item["wait_seconds"] = int(base_wait)
+
                 waiting_calls.sort(key=lambda x: x.get("wait_seconds") if x.get("wait_seconds") is not None else -1, reverse=True)
+
+                # Throttled diagnostics to compare WS raw map vs panel-visible list.
+                last_cmp_log_ts = float(st.session_state.get("_call_panel_compare_log_ts", 0) or 0)
+                if (now_ts - last_cmp_log_ts) >= 20:
+                    cmp_payload = {
+                        "raw_ws_total": raw_ws_total,
+                        "after_ttl_total": len(active_conversations),
+                        "after_cleanup_total": len(combined),
+                        "visible_total": len(waiting_calls),
+                        "notif_connected": bool(getattr(global_notif, "connected", False)),
+                        "last_msg_age_s": round(now_ts - float(last_msg or 0), 1) if last_msg else None,
+                        "last_evt_age_s": round(now_ts - float(last_evt or 0), 1) if last_evt else None,
+                        "filters": {
+                            "group": selected_group,
+                            "hide_mevcut": bool(hide_mevcut),
+                            "queue_search": queue_search_term,
+                            "selected": sorted(selected_filter_set),
+                            "is_all": bool(is_filter_all),
+                        },
+                    }
+                    try:
+                        cmp_payload["ws_diag"] = global_notif.get_diag()
+                    except Exception:
+                        pass
+                    try:
+                        logger.info("[call-panel-compare] %s", json.dumps(cmp_payload, ensure_ascii=False))
+                    except Exception:
+                        pass
+                    st.session_state["_call_panel_compare_log_ts"] = now_ts
 
                 _dashboard_profile_record("call_panel.filter_sort", pytime.perf_counter() - filter_sort_t0)
 
@@ -1443,7 +1522,12 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         elif _normalize_call_media_token(media_type) == "message":
                             media_type = "Message"
                         meta_parts = []
-                        is_interacting = bool(agent_name) or bool(agent_id) or state_value == "interacting" or (state_label == get_text(lang, "interacting"))
+                        if state_value == "waiting":
+                            is_interacting = False
+                        elif state_value == "interacting":
+                            is_interacting = True
+                        else:
+                            is_interacting = bool(agent_name) or bool(agent_id) or (state_label == get_text(lang, "interacting"))
                         state_label = "Bağlandı" if is_interacting else "Bekleyen"
                         if agent_name and is_interacting:
                             meta_parts.append(f"Agent: {agent_name}")

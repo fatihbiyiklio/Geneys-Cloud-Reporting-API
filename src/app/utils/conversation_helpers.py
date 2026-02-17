@@ -232,20 +232,18 @@ def _normalize_call_state_token(item):
     state_raw = str(item.get("state") or "").strip().lower()
     if state_raw in {"interacting", "connected", "communicating", "active"}:
         return "connected"
+    if state_raw in {"waiting", "queued", "queue", "alerting", "offering", "dialing", "contacting"}:
+        return "waiting"
 
     state_label_raw = str(item.get("state_label") or "").strip().lower()
     if any(token in state_label_raw for token in ["bağlandı", "baglandi", "interacting", "connected"]):
         return "connected"
-
-    # Some WS/API payloads can keep "waiting" state briefly while agent fields are already set.
-    # Prefer agent evidence so filter behavior matches rendered "Bağlandı/Bekleyen" labels.
-    if item.get("agent_name") or item.get("agent_id"):
-        return "connected"
-
-    if state_raw in {"waiting", "queued", "queue", "alerting", "offering", "dialing", "contacting"}:
-        return "waiting"
     if any(token in state_label_raw for token in ["bekleyen", "waiting", "queued", "queue"]):
         return "waiting"
+
+    # Fallback when explicit state/label is unavailable.
+    if item.get("agent_name") or item.get("agent_id"):
+        return "connected"
     return "waiting"
 
 def _call_filter_tokens(item):
