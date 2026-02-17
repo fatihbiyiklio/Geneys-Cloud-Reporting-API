@@ -685,6 +685,7 @@ class GenesysAPI:
         order="asc",
         conversation_filters=None,
         segment_filters=None,
+        allow_unfiltered_fallback=True,
     ):
         """Yields conversation detail pages to reduce memory usage.
 
@@ -697,6 +698,7 @@ class GenesysAPI:
             order: "asc" or "desc"
             conversation_filters: optional list for details query conversationFilters
             segment_filters: optional list for details query segmentFilters
+            allow_unfiltered_fallback: when False, fallback never drops filters entirely
         """
         current_start = start_date
         while current_start < end_date:
@@ -730,7 +732,7 @@ class GenesysAPI:
                             q_segment_only = dict(base_query)
                             q_segment_only["segmentFilters"] = segment_filters
                             fallback_candidates.append(("segment_only", q_segment_only))
-                        if conversation_filters or segment_filters:
+                        if (conversation_filters or segment_filters) and allow_unfiltered_fallback:
                             fallback_candidates.append(("unfiltered", dict(base_query)))
 
                         for mode, fallback_query in fallback_candidates:
@@ -1880,7 +1882,25 @@ class GenesysAPI:
         def convert_metrics(input_mets, is_queue):
             new_mets = []
             for m in input_mets:
-                if m == "nAnswered": new_mets.append("tAnswered")
+                if m == "nInbound":
+                    new_mets.append("nOffered" if is_queue else "tAlert")
+                elif m == "oAnswerRate":
+                    if is_queue:
+                        new_mets.extend(["tAnswered", "nOffered"])
+                    else:
+                        new_mets.extend(["tAnswered", "tAlert"])
+                elif m == "nTotalInboundOutbound":
+                    if is_queue:
+                        new_mets.extend(["nOffered", "nOutbound"])
+                    else:
+                        new_mets.extend(["tAlert", "nOutbound"])
+                elif m == "tPhoneTalk":
+                    new_mets.append("tTalk")
+                elif m == "tASA":
+                    new_mets.append("tAnswered")
+                elif m == "tACHT":
+                    new_mets.append("tHandle")
+                elif m == "nAnswered": new_mets.append("tAnswered")
                 elif m == "nAbandon": new_mets.append("tAbandon")
                 elif m == "nOffered" and not is_queue: new_mets.append("tAlert") # For users, Offered=Alert
                 elif m == "nOffered" and is_queue: new_mets.append("nOffered")

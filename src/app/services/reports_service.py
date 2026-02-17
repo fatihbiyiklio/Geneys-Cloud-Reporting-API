@@ -174,6 +174,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
     et = c_d4.time_input(get_text(lang, "end_time"), time(23, 59))
     interaction_agent_names = []
     interaction_agent_ids = []
+    exclude_without_workgroup = bool(st.session_state.get("rep_exclude_no_workgroup", False))
     
     # --- ADVANCED FILTERS (Collapsible) ---
     with st.expander(f"⚙️ {get_text(lang, 'advanced_filters')}", expanded=False):
@@ -192,6 +193,15 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             key="rep_media",
             help=get_text(lang, "media_type_help")
         )
+        if r_type in ["interaction_search", "chat_detail", "missed_interactions"]:
+            exclude_without_workgroup = st.checkbox(
+                get_text(lang, "exclude_no_workgroup"),
+                value=exclude_without_workgroup,
+                key="rep_exclude_no_workgroup",
+                help=get_text(lang, "exclude_no_workgroup_help"),
+            )
+        else:
+            exclude_without_workgroup = False
 
         if r_type in ["interaction_search", "chat_detail", "missed_interactions"]:
             if not st.session_state.get("users_map"):
@@ -235,11 +245,11 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             ]
             st.session_state.rep_max_records = st.number_input(
                 "Maksimum kayıt (performans için)",
-                min_value=100,
-                max_value=20000,
+                min_value=0,
+                max_value=500000,
                 value=int(st.session_state.get("rep_max_records", 5000)),
-                step=100,
-                help="Yüksek aralıklar bellek kullanımını artırır. Varsayılan 5000 kayıt ile sınırlandırılır."
+                step=500,
+                help="0 = limitsiz. Yüksek aralıklar bellek kullanımını artırır."
             )
         if r_type == "chat_detail":
             st.session_state.rep_enrich_limit = st.number_input(
@@ -266,6 +276,8 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         always_visible_metrics = [
             "tLongestTalk", "tAverageTalk", "tChatTalk", "tBreak", "oEfficiency",
             "nChatAnswered", "nChatOffered",
+            "oAnswerRate", "nInbound", "nTotalInboundOutbound", "tPhoneTalk",
+            "tASA", "tACHT",
         ]
         for m in always_visible_metrics:
             if m not in selection_options and m in ALL_METRICS:
@@ -349,6 +361,8 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         selected_queue_ids=None,
         selected_media_types=None,
         selected_agent_ids=None,
+        require_agent_user_exists=False,
+        exclude_without_workgroup=False,
         base_conversation_filters=None,
         base_segment_clauses=None,
     ):
@@ -368,6 +382,20 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             ]
             details_segment_clauses.append({"type": "or", "predicates": queue_preds})
 
+        if exclude_without_workgroup:
+            details_segment_clauses.append(
+                {
+                    "type": "or",
+                    "predicates": [
+                        {
+                            "type": "dimension",
+                            "dimension": "queueId",
+                            "operator": "exists",
+                        }
+                    ],
+                }
+            )
+
         media_types = [
             str(mt).strip().lower()
             for mt in (selected_media_types or [])
@@ -384,6 +412,20 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 for mt in media_types
             ]
             details_segment_clauses.append({"type": "or", "predicates": media_preds})
+
+        if require_agent_user_exists:
+            details_segment_clauses.append(
+                {
+                    "type": "or",
+                    "predicates": [
+                        {
+                            "type": "dimension",
+                            "dimension": "userId",
+                            "operator": "exists",
+                        }
+                    ],
+                }
+            )
 
         agent_ids = [aid for aid in (selected_agent_ids or []) if aid]
         if agent_ids:
@@ -678,10 +720,19 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                  total_rows = 0
                  u_offset = utc_offset_hours
                  selected_queue_ids = [qid for qid in (sel_ids or []) if qid]
+                 chat_media_query_types = [
+                     _normalize_detail_media_token(mt)
+                     for mt in (sel_media_types or [])
+                     if _normalize_detail_media_token(mt) in {"chat", "message"}
+                 ]
+                 if not chat_media_query_types:
+                     chat_media_query_types = ["chat", "message"]
                  details_conversation_filters, details_segment_filters = _build_detail_query_filters(
                      selected_queue_ids=selected_queue_ids,
-                     selected_media_types=sel_media_types,
+                     selected_media_types=chat_media_query_types,
                      selected_agent_ids=interaction_agent_ids,
+                     require_agent_user_exists=True,
+                     exclude_without_workgroup=exclude_without_workgroup,
                  )
                  skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                  st.session_state.skills_map = skill_lookup
@@ -699,6 +750,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      chunk_days=3,
                      conversation_filters=details_conversation_filters,
                      segment_filters=details_segment_filters,
+                     allow_unfiltered_fallback=False,
                  ):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
@@ -723,7 +775,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                          selected_queue_names=sel_names,
                          selected_agent_names=interaction_agent_names,
                          selected_agent_ids=interaction_agent_ids,
-                         selected_media_types=sel_media_types,
+                         selected_media_types=chat_media_query_types,
                      )
                      media_tokens = (
                          df["MediaType"].apply(_normalize_detail_media_token)
@@ -876,6 +928,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      selected_queue_ids=selected_queue_ids,
                      selected_media_types=sel_media_types,
                      selected_agent_ids=interaction_agent_ids,
+                     exclude_without_workgroup=exclude_without_workgroup,
                      base_conversation_filters=details_conversation_filters,
                      base_segment_clauses=base_segment_clauses,
                  )
@@ -896,6 +949,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      chunk_days=3,
                      conversation_filters=details_conversation_filters,
                      segment_filters=details_segment_filters,
+                     allow_unfiltered_fallback=(not exclude_without_workgroup),
                  ):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
@@ -946,6 +1000,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      if not df_missed.empty:
                          # Rename columns
                          col_map_internal = {
+                             "Id": "col_interaction_id",
                              "Direction": "col_direction",
                              "Ani": "col_ani",
                              "Dnis": "col_dnis",
@@ -1018,6 +1073,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      selected_queue_ids=selected_queue_ids,
                      selected_media_types=sel_media_types,
                      selected_agent_ids=interaction_agent_ids,
+                     exclude_without_workgroup=exclude_without_workgroup,
                  )
                  skill_lookup = st.session_state.get("skills_map", {}) or api.get_routing_skills()
                  st.session_state.skills_map = skill_lookup
@@ -1035,6 +1091,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      chunk_days=3,
                      conversation_filters=details_conversation_filters,
                      segment_filters=details_segment_filters,
+                     allow_unfiltered_fallback=(not exclude_without_workgroup),
                  ):
                      df_chunk = process_conversation_details(
                          {"conversations": page},
@@ -1062,6 +1119,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      )
                      # Rename columns first to internal keys then to display names
                      col_map_internal = {
+                         "Id": "col_interaction_id",
                          "Direction": "col_direction",
                          "Ani": "col_ani",
                          "Dnis": "col_dnis",
@@ -1392,6 +1450,13 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                             return _sanitize_numeric_series(df[col_name], df.index)
                         return pd.Series(0, index=df.index, dtype="float64")
 
+                    def _inbound_series():
+                        inbound_direct = _metric_series_or_zero("nInbound")
+                        offered = _metric_series_or_zero("nOffered")
+                        alert = _metric_series_or_zero("nAlert")
+                        inbound = inbound_direct.where(inbound_direct > 0, offered.where(offered > 0, alert))
+                        return inbound.clip(lower=0)
+
                     if "tLongestTalk" in selected_metric_set:
                         if "tLongestTalk" in df.columns:
                             df["tLongestTalk"] = pd.to_numeric(df["tLongestTalk"], errors="coerce").fillna(0).round(2)
@@ -1429,6 +1494,37 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         ).round(2)
                     if "tChatTalk" in selected_metric_set:
                         df["tChatTalk"] = _metric_series_or_zero("tTalk").round(2)
+                    if "tPhoneTalk" in selected_metric_set:
+                        df["tPhoneTalk"] = _metric_series_or_zero("tTalk").round(2)
+                    if "tASA" in selected_metric_set:
+                        answer_sum = _metric_series_or_zero("tAnswered")
+                        answer_count = _metric_series_or_zero("nAnswered")
+                        answer_count = answer_count.where(answer_count > 0, _metric_series_or_zero("nTalk"))
+                        safe_answer_count = answer_count.where(answer_count > 0, answer_sum.gt(0).astype("float64"))
+                        df["tASA"] = answer_sum.divide(safe_answer_count.where(safe_answer_count > 0), fill_value=0).fillna(0).round(2)
+                    if "tACHT" in selected_metric_set:
+                        existing_aht = _metric_series_or_zero("AvgHandle")
+                        if existing_aht.gt(0).any():
+                            df["tACHT"] = existing_aht.round(2)
+                        else:
+                            handle_sum = _metric_series_or_zero("tHandle")
+                            handle_count = _metric_series_or_zero("nHandled")
+                            handle_count = handle_count.where(handle_count > 0, _metric_series_or_zero("nHandle"))
+                            handle_count = handle_count.where(handle_count > 0, _metric_series_or_zero("nAnswered"))
+                            safe_handle_count = handle_count.where(handle_count > 0, handle_sum.gt(0).astype("float64"))
+                            df["tACHT"] = handle_sum.divide(safe_handle_count.where(safe_handle_count > 0), fill_value=0).fillna(0).round(2)
+                    if "nInbound" in selected_metric_set:
+                        df["nInbound"] = _inbound_series().round(0)
+                    if "nTotalInboundOutbound" in selected_metric_set:
+                        inbound_total = _inbound_series()
+                        outbound_total = _metric_series_or_zero("nOutbound").clip(lower=0)
+                        df["nTotalInboundOutbound"] = (inbound_total + outbound_total).round(0)
+                    if "oAnswerRate" in selected_metric_set:
+                        inbound_total = _inbound_series()
+                        answered_total = _metric_series_or_zero("nAnswered").clip(lower=0)
+                        df["oAnswerRate"] = (
+                            answered_total.divide(inbound_total.where(inbound_total > 0), fill_value=0).fillna(0) * 100
+                        ).round(2)
 
                     if do_fill and gran_opt[sel_gran] != "P1D": df = fill_interval_gaps(df, datetime.combine(sd, st_), datetime.combine(ed, et), gran_opt[sel_gran])
 

@@ -215,6 +215,7 @@ def _iter_conversation_pages(
     page_size=100,
     conversation_filters=None,
     segment_filters=None,
+    allow_unfiltered_fallback=True,
 ):
     """Yield conversation pages with an upper bound on total records to avoid OOM."""
     total = 0
@@ -227,6 +228,7 @@ def _iter_conversation_pages(
         order="asc",
         conversation_filters=conversation_filters,
         segment_filters=segment_filters,
+        allow_unfiltered_fallback=allow_unfiltered_fallback,
     ):
         if not page:
             continue
