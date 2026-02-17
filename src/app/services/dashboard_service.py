@@ -73,7 +73,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
     if c_c3:
         if st.session_state.dashboard_mode == "Date": st.session_state.dashboard_date = st.date_input(get_text(lang, "mode_date"), datetime.today(), label_visibility="collapsed")
         elif st.session_state.dashboard_mode == "Live": 
-            c_auto, c_time, c_spacer, c_agent, c_call = st.columns([1, 1, 1, 1, 1])
+            c_auto, c_time, c_agent, c_call = st.columns([1, 1, 1, 1])
             auto_ref = c_auto.toggle(
                 get_text(lang, "auto_refresh"),
                 value=st.session_state.get("dashboard_auto_refresh", True),
@@ -259,11 +259,11 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                     # Determine date range based on mode
                     data_fetch_t0 = pytime.perf_counter()
                     if st.session_state.dashboard_mode == "Live":
-                        # Use cached live data
+                        # Use current live snapshot data
                         obs_map, daily_map, _ = st.session_state.data_manager.get_data(resolved_card_queues)
                         items_live = [obs_map.get(q) for q in resolved_card_queues if obs_map.get(q)]
                         items_daily = [daily_map.get(q) for q in resolved_card_queues if daily_map.get(q)]
-                        # No per-card direct API fallback in live mode to protect API budget.
+                        # No per-card direct API path in live mode; use current DataManager snapshot.
                     else:
                         # Fetch historical data via API
                         items_live = []  # No live data for historical
@@ -288,17 +288,13 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         if queue_ids:
                             try:
                                 interval = f"{start_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-                                cache_key = f"{interval}|{','.join(sorted(queue_ids))}"
-                                daily_data = _get_shared_daily_stats(org, cache_key, max_age_seconds=300)
-                                if daily_data is None:
-                                    api = GenesysAPI(st.session_state.api_client)
-                                    resp = api.get_queue_daily_stats(queue_ids, interval=interval)
-                                    daily_data = {}
-                                    if resp and resp.get('results'):
-                                        id_map = {v: k for k, v in st.session_state.queues_map.items()}
-                                        from src.processor import process_daily_stats
-                                        daily_data = process_daily_stats(resp, id_map) or {}
-                                    _set_shared_daily_stats(org, cache_key, daily_data, pytime.time(), max_items=60)
+                                api = GenesysAPI(st.session_state.api_client)
+                                resp = api.get_queue_daily_stats(queue_ids, interval=interval)
+                                daily_data = {}
+                                if resp and resp.get('results'):
+                                    id_map = {v: k for k, v in st.session_state.queues_map.items()}
+                                    from src.processor import process_daily_stats
+                                    daily_data = process_daily_stats(resp, id_map) or {}
                                 items_daily = [daily_data.get(q) for q in resolved_card_queues if daily_data.get(q)]
                             except Exception as e:
                                 st.warning(f"Veri çekilemedi: {e}")
@@ -354,6 +350,9 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                     obs_interacting = sum(get_media_sum(d, 'Interacting') for d in items_live) if items_live else 0
                     obs_onqueue_max = max((_obs_onqueue_total(d) for d in items_live), default=0) if items_live else 0
                     obs_idle_max = max((_safe_int(d.get("OnQueueIdle", 0)) for d in items_live), default=0) if items_live else 0
+                    obs_onqueue_interacting_max = max((_safe_int(d.get("OnQueueInteracting", 0)) for d in items_live), default=0) if items_live else 0
+                    # "Görüşmede" should be based on Interacting metric.
+                    obs_interacting_display = _safe_int(obs_interacting)
 
                     presence_defs = st.session_state.get("presence_map") or {}
 
@@ -369,11 +368,18 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                     def _routing_status_token(value):
                         return str(value or "").strip().upper().replace(" ", "_")
 
-                    def _routing_is_onqueue(value):
+                    def _routing_is_interacting(value):
                         token = _routing_status_token(value)
-                        if not token or token in {"OFF_QUEUE", "OFFLINE"}:
-                            return False
-                        return True
+                        return token in {"INTERACTING", "COMMUNICATING"}
+
+                    def _routing_is_idle(value):
+                        token = _routing_status_token(value)
+                        return token == "IDLE"
+
+                    def _routing_is_onqueue(value):
+                        # Match Genesys queue UI expectation:
+                        # On Queue = only users currently Idle or Interacting.
+                        return _routing_is_idle(value) or _routing_is_interacting(value)
 
                     def _routing_status_rank(value):
                         token = _routing_status_token(value)
@@ -474,6 +480,27 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         pres = d.get("Presences") or {}
                         for k in obs_pres_max.keys():
                             obs_pres_max[k] = max(obs_pres_max[k], _safe_int(pres.get(k, 0)))
+                    obs_onqueue_excluded = (
+                        obs_pres_max["Available"]
+                        + obs_pres_max["Busy"]
+                        + obs_pres_max["Away"]
+                        + obs_pres_max["Break"]
+                        + obs_pres_max["Meal"]
+                        + obs_pres_max["Meeting"]
+                        + obs_pres_max["Training"]
+                    )
+                    # Prefer direct on-queue user status counters when present.
+                    # They map better to Genesys queue "On Queue user(s)" list semantics.
+                    obs_onqueue_status = _safe_int(obs_idle_max) + _safe_int(obs_onqueue_interacting_max)
+                    obs_onqueue_presence_sub = max(0, _safe_int(obs_onqueue_max) - _safe_int(obs_onqueue_excluded))
+                    # Fallback order:
+                    # 1) direct status counters, 2) presence subtraction, 3) raw on-queue.
+                    if obs_onqueue_status > 0:
+                        obs_onqueue_filtered = obs_onqueue_status
+                    elif obs_onqueue_presence_sub > 0:
+                        obs_onqueue_filtered = obs_onqueue_presence_sub
+                    else:
+                        obs_onqueue_filtered = _safe_int(obs_onqueue_max)
 
                     cnt_interacting = 0
                     cnt_idle = 0
@@ -485,6 +512,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                     cnt_meal = 0
                     cnt_meeting = 0
                     cnt_training = 0
+                    routing_has_status_payload = False
 
                     if routing_has_payload:
                         has_routing_status = False
@@ -493,9 +521,9 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             routing_status = _routing_status_token(entity.get("routing_status"))
                             if routing_status:
                                 has_routing_status = True
-                            if routing_status in {"INTERACTING", "COMMUNICATING"}:
+                            if _routing_is_interacting(routing_status):
                                 cnt_interacting += 1
-                            if routing_status == "IDLE":
+                            if _routing_is_idle(routing_status):
                                 cnt_idle += 1
                             if _routing_is_onqueue(routing_status):
                                 cnt_on_queue += 1
@@ -517,19 +545,13 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             elif bucket == "Training":
                                 cnt_training += 1
 
-                        # Queue metriclerinde interacting her zaman on-queue kapsaminda olmalidir.
-                        cnt_on_queue = max(cnt_on_queue, cnt_interacting)
+                        routing_has_status_payload = has_routing_status
 
                         # Routing detaylari eksik gelirse observation degerlerine geri don.
                         if not has_routing_status:
-                            cnt_interacting = obs_interacting
-                            cnt_on_queue = max(cnt_interacting, obs_onqueue_max)
+                            cnt_interacting = obs_interacting_display
+                            cnt_on_queue = obs_onqueue_filtered
                             cnt_idle = obs_idle_max
-                        else:
-                            if cnt_on_queue == 0 and obs_onqueue_max > 0:
-                                cnt_on_queue = max(cnt_interacting, obs_onqueue_max)
-                            if cnt_idle == 0 and obs_idle_max > 0:
-                                cnt_idle = obs_idle_max
 
                         if not has_presence_details:
                             cnt_available = obs_pres_max["Available"]
@@ -541,8 +563,8 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             cnt_training = obs_pres_max["Training"]
                     else:
                         # Fallback to queue observations when routing detail payload is unavailable.
-                        cnt_interacting = obs_interacting
-                        cnt_on_queue = max(cnt_interacting, obs_onqueue_max)
+                        cnt_interacting = obs_interacting_display
+                        cnt_on_queue = obs_onqueue_filtered
                         cnt_idle = obs_idle_max
                         cnt_available = obs_pres_max["Available"]
                         cnt_busy = obs_pres_max["Busy"]
@@ -552,18 +574,86 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         cnt_meeting = obs_pres_max["Meeting"]
                         cnt_training = obs_pres_max["Training"]
 
+                    # Use routing snapshot only when its coverage is plausible against observation.
+                    routing_user_count = len(routing_users_dedup or {})
+                    routing_live_total = max(
+                        _safe_int(cnt_on_queue),
+                        _safe_int(cnt_idle) + _safe_int(cnt_interacting),
+                    )
+                    obs_baseline = max(
+                        _safe_int(obs_onqueue_filtered),
+                        _safe_int(obs_interacting_display),
+                        _safe_int(obs_idle_max),
+                    )
+                    routing_min_live_total = 0
+                    if routing_has_status_payload:
+                        routing_has_live_onqueue_state = (cnt_on_queue > 0) or (cnt_idle > 0) or (cnt_interacting > 0)
+                        if obs_baseline > 0:
+                            base_expected = max(
+                                int(obs_onqueue_filtered * 0.8),
+                                int(obs_interacting_display * 0.8),
+                                int(obs_idle_max * 0.8),
+                            )
+                            routing_min_expected = max(1, base_expected)
+                            if obs_baseline > 1:
+                                routing_min_expected = max(2, routing_min_expected)
+                            routing_min_live_total = max(1, int(obs_baseline * 0.6))
+                            routing_quality_ok = (
+                                routing_has_live_onqueue_state
+                                and (routing_user_count >= routing_min_expected)
+                                and (routing_live_total >= routing_min_live_total)
+                            )
+                            # Hard guard: if routing snapshot does not cover observation baseline,
+                            # never use routing-driven live metrics (prevents sudden drops).
+                            if routing_quality_ok:
+                                if routing_user_count < obs_baseline:
+                                    routing_quality_ok = False
+                                elif routing_live_total < obs_baseline:
+                                    routing_quality_ok = False
+                        else:
+                            routing_min_expected = 1
+                            routing_quality_ok = routing_has_live_onqueue_state or (routing_user_count > 0)
+                    else:
+                        routing_min_expected = 1
+                        routing_quality_ok = False
+                    use_routing_agent_metrics = bool(routing_quality_ok)
+
+                    display_waiting = obs_waiting
+                    if use_routing_agent_metrics:
+                        display_interacting = cnt_interacting
+                        display_on_queue = cnt_on_queue
+                        display_idle = cnt_idle
+                        display_available = cnt_available
+                        display_busy = cnt_busy
+                        display_away = cnt_away
+                        display_break = cnt_break
+                        display_meal = cnt_meal
+                        display_meeting = cnt_meeting
+                        display_training = cnt_training
+                    else:
+                        display_interacting = obs_interacting_display
+                        display_on_queue = obs_onqueue_filtered
+                        display_idle = obs_idle_max
+                        display_available = obs_pres_max["Available"]
+                        display_busy = obs_pres_max["Busy"]
+                        display_away = obs_pres_max["Away"]
+                        display_break = obs_pres_max["Break"]
+                        display_meal = obs_pres_max["Meal"]
+                        display_meeting = obs_pres_max["Meeting"]
+                        display_training = obs_pres_max["Training"]
+
                     live_values = {
-                        "Waiting": obs_waiting,
-                        "Interacting": cnt_interacting,
-                        "Idle Agent": cnt_idle,
-                        "On Queue": cnt_on_queue,
-                        "Available": cnt_available,
-                        "Busy": cnt_busy,
-                        "Away": cnt_away,
-                        "Break": cnt_break,
-                        "Meal": cnt_meal,
-                        "Meeting": cnt_meeting,
-                        "Training": cnt_training,
+                        "Waiting": display_waiting,
+                        "Interacting": display_interacting,
+                        "Idle Agent": display_idle,
+                        "On Queue": display_on_queue,
+                        "Available": display_available,
+                        "Busy": display_busy,
+                        "Away": display_away,
+                        "Break": display_break,
+                        "Meal": display_meal,
+                        "Meeting": display_meeting,
+                        "Training": display_training,
                     }
                     
                     # Daily metrics mapping
@@ -576,46 +666,6 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         "Avg Handle Time": f"{avg_handle/60:.1f}m" if avg_handle else "0",
                         "Avg Wait Time": f"{avg_wait:.0f}s" if avg_wait else "0",
                     }
-                    # Short-lived fallback cache to avoid empty flashes between refresh cycles.
-                    now_ts = pytime.time()
-                    card_cache = st.session_state.get("_dashboard_card_last_by_target", {})
-                    if not isinstance(card_cache, dict):
-                        card_cache = {}
-                    refresh_s_local = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
-                    fallback_ttl = 20
-                    mode = st.session_state.get("dashboard_mode", "Live")
-                    if mode == "Date":
-                        mode_sig = f"Date:{st.session_state.get('dashboard_date', datetime.today()).isoformat()}"
-                    else:
-                        mode_sig = str(mode)
-                    media_sig = ",".join(sorted(str(m).strip().lower() for m in (selected_media or []) if m))
-                    queue_sig = ",".join(sorted(str(q).strip().lower() for q in resolved_card_queues))
-                    card_cache_key = f"v2|mode:{mode_sig}|card:{card.get('id')}|q:{queue_sig}|media:{media_sig}"
-                    has_source_data = bool(items_daily) if mode != "Live" else bool(items_live or items_daily or routing_has_payload)
-                    if has_source_data:
-                        card_cache[card_cache_key] = {
-                            "ts": now_ts,
-                            "live_values": dict(live_values),
-                            "daily_values": dict(daily_values),
-                            "off": off,
-                            "ans": ans,
-                            "abn": abn,
-                            "sl": sl,
-                        }
-                        if len(card_cache) > 200:
-                            oldest = sorted(card_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(card_cache) - 200]
-                            for k, _ in oldest:
-                                card_cache.pop(k, None)
-                        st.session_state["_dashboard_card_last_by_target"] = card_cache
-                    else:
-                        cached = card_cache.get(card_cache_key) or {}
-                        if cached and (now_ts - float(cached.get("ts", 0) or 0)) <= fallback_ttl:
-                            live_values = dict(cached.get("live_values") or live_values)
-                            daily_values = dict(cached.get("daily_values") or daily_values)
-                            off = float(cached.get("off", off) or 0)
-                            ans = float(cached.get("ans", ans) or 0)
-                            abn = float(cached.get("abn", abn) or 0)
-                            sl = float(cached.get("sl", sl) or 0)
                     _dashboard_profile_record("cards.compute", pytime.perf_counter() - calc_t0)
                     
                     render_t0 = pytime.perf_counter()
@@ -700,6 +750,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                                         elif vis == "Abandon Rate":
                                             ab_val = (abn / off * 100) if off > 0 else 0
                                             st.plotly_chart(create_gauge_chart(ab_val, "Abandon Rate", base_h), width='stretch', config={'displayModeBar': False, 'responsive': True}, key=f"g_ab_{card['id']}_{panel_key_suffix}_{start}_{idx}")
+
                     _dashboard_profile_record("cards.render", pytime.perf_counter() - render_t0)
         finally:
             _dashboard_profile_record("cards.card_total", pytime.perf_counter() - card_total_t0)
@@ -776,16 +827,12 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
             # Group Filter (Genesys Groups) + submit-based filters (no rerun on each keypress)
             now_ts = pytime.time()
             groups_api_t0 = pytime.perf_counter()
-            groups_cache = st.session_state.get("dashboard_groups_cache", [])
-            groups_ts = st.session_state.get("dashboard_groups_ts", 0)
-            if (not groups_cache) or ((now_ts - groups_ts) > 600):
-                try:
-                    api = GenesysAPI(st.session_state.api_client)
-                    groups_cache = api.get_groups()
-                    st.session_state.dashboard_groups_cache = groups_cache
-                    st.session_state.dashboard_groups_ts = now_ts
-                except Exception:
-                    pass
+            groups_cache = []
+            try:
+                api = GenesysAPI(st.session_state.api_client)
+                groups_cache = api.get_groups() or []
+            except Exception:
+                groups_cache = []
             _dashboard_profile_record("agent_panel.groups_api", pytime.perf_counter() - groups_api_t0)
             group_options = ["Hepsi (All)"] + [g.get('name', '') for g in groups_cache if g.get('name')]
             if "agent_panel_search" not in st.session_state:
@@ -827,29 +874,22 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             pass
                         _dashboard_profile_record("agent_panel.users_info_api", pytime.perf_counter() - users_info_api_t0)
                 else:
-                    # Recover from last-known users, lazy org refresh, then users_map inversion.
-                    cached_users_info = st.session_state.get('_users_info_last') or {}
-                    if cached_users_info:
-                        users_info_map = dict(cached_users_info)
-                    else:
-                        last_try = float(st.session_state.get("_users_info_recover_ts", 0) or 0)
-                        if (now_ts - last_try) > 20:
-                            st.session_state._users_info_recover_ts = now_ts
-                            try:
-                                api = GenesysAPI(st.session_state.api_client)
-                                refreshed = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
-                                users_info_map = refreshed.get("users_info", {}) or {}
-                                st.session_state.users_info = users_info_map
-                                if users_info_map:
-                                    st.session_state._users_info_last = dict(users_info_map)
-                            except Exception:
-                                pass
+                    # Direct org refresh path; no last-known fallback cache.
+                    last_try = float(st.session_state.get("_users_info_recover_ts", 0) or 0)
+                    if (now_ts - last_try) > 20:
+                        st.session_state._users_info_recover_ts = now_ts
+                        try:
+                            api = GenesysAPI(st.session_state.api_client)
+                            refreshed = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
+                            users_info_map = refreshed.get("users_info", {}) or {}
+                            st.session_state.users_info = users_info_map
+                        except Exception:
+                            pass
                     if not users_info_map:
                         users_map = st.session_state.get("users_map") or {}
                         if users_map:
                             users_info_map = {uid: {"name": name, "username": "", "email": ""} for name, uid in users_map.items()}
                             st.session_state.users_info = users_info_map
-                            st.session_state._users_info_last = dict(users_info_map)
                 if not users_info_map:
                     st.info("Kullanıcı bilgileri yükleniyor...")
 
@@ -867,51 +907,34 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                     group_member_ids = set()
                     if selected_group_obj and selected_group_obj.get("id"):
                         group_id = selected_group_obj.get("id")
-                        members_cache = st.session_state.get("dashboard_group_members_cache", {})
-                        if members_cache:
-                            stale_ids = [gid for gid, ent in members_cache.items() if (now_ts - ent.get("ts", 0)) > 1800]
-                            for gid in stale_ids:
-                                members_cache.pop(gid, None)
-                            if len(members_cache) > 40:
-                                oldest = sorted(members_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(members_cache) - 40]
-                                for gid, _ in oldest:
-                                    members_cache.pop(gid, None)
-                            st.session_state.dashboard_group_members_cache = members_cache
-                        entry = members_cache.get(group_id, {})
-                        if (not entry) or ((now_ts - entry.get("ts", 0)) > 600):
-                            group_members_api_t0 = pytime.perf_counter()
-                            try:
-                                api = GenesysAPI(st.session_state.api_client)
-                                members = api.get_group_members(group_id)
-                                members_cache[group_id] = {"ts": now_ts, "members": members}
-                                st.session_state.dashboard_group_members_cache = members_cache
-                                entry = members_cache.get(group_id, {})
-                            except Exception:
-                                pass
-                            _dashboard_profile_record("agent_panel.group_members_api", pytime.perf_counter() - group_members_api_t0)
-                        for m in (entry.get("members") or []):
+                        members = []
+                        group_members_api_t0 = pytime.perf_counter()
+                        try:
+                            api = GenesysAPI(st.session_state.api_client)
+                            members = api.get_group_members(group_id) or []
+                        except Exception:
+                            members = []
+                        _dashboard_profile_record("agent_panel.group_members_api", pytime.perf_counter() - group_members_api_t0)
+                        for m in members:
                             if m.get("id"):
                                 group_member_ids.add(m.get("id"))
                     all_user_ids = sorted(group_member_ids)
                 else:
                     all_user_ids = sorted(users_info_map.keys())
 
-                # Seed from API if notifications cache is empty/stale
+                # Seed from API if WS state is empty/stale (no shared fallback cache)
                 refresh_s = _resolve_refresh_interval_seconds(org, minimum=10, default=10)
-                shared_ts, shared_presence, shared_routing = _get_shared_agent_seed(org)
                 last_msg = getattr(agent_notif, "last_message_ts", 0)
                 last_evt = getattr(agent_notif, "last_event_ts", 0)
                 seed_interval_s = max(180, int(refresh_s) * 12)
                 stale_after = seed_interval_s
                 notif_stale = (not agent_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > stale_after)
-                periodic_seed_due = (now_ts - float(shared_ts or 0)) >= seed_interval_s
                 if all_user_ids:
                     seeded_from_api = False
                     reserved_seed = False
                     needs_seed = (
                         (not getattr(agent_notif, "user_presence", {}) and not getattr(agent_notif, "user_routing", {}))
                         or notif_stale
-                        or periodic_seed_due
                     )
                     if needs_seed and _reserve_agent_seed(org, now_ts, min_interval=seed_interval_s):
                         reserved_seed = True
@@ -923,19 +946,13 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             rout = snap.get("routing") or {}
                             if pres or rout:
                                 agent_notif.seed_users(pres, rout)
-                                _merge_agent_seed(org, pres, rout, now_ts)
                                 seeded_from_api = True
                         except Exception:
                             if reserved_seed:
-                                _rollback_agent_seed(org, now_ts, fallback_ts=shared_ts)
+                                _rollback_agent_seed(org, now_ts, fallback_ts=0)
                         _dashboard_profile_record("agent_panel.seed_api", pytime.perf_counter() - seed_api_t0)
                     if reserved_seed and not seeded_from_api:
-                        _rollback_agent_seed(org, now_ts, fallback_ts=shared_ts)
-                    if (not seeded_from_api) and (shared_presence or shared_routing):
-                        pres = {uid: shared_presence.get(uid) for uid in all_user_ids if uid in shared_presence}
-                        rout = {uid: shared_routing.get(uid) for uid in all_user_ids if uid in shared_routing}
-                        if pres or rout:
-                            agent_notif.seed_users_missing(pres, rout)
+                        _rollback_agent_seed(org, now_ts, fallback_ts=0)
 
                 # Keep WS subscriptions on the full target set so offline->active transitions are captured.
                 max_users = (agent_notif.MAX_TOPICS_PER_CHANNEL * agent_notif.MAX_CHANNELS) // 3
@@ -1025,23 +1042,6 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
 
                 all_members.sort(key=get_sort_score)
 
-                # Keep previous agent list visible while waiting for fresh data.
-                agent_cache_key = f"{selected_group}|{search_term}"
-                agent_cache = st.session_state.get("_agent_panel_last_by_filter", {})
-                if not isinstance(agent_cache, dict):
-                    agent_cache = {}
-                fallback_ttl = 20
-                if all_members:
-                    agent_cache[agent_cache_key] = {"ts": now_ts, "data": list(all_members)}
-                    if len(agent_cache) > 20:
-                        oldest = sorted(agent_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(agent_cache) - 20]
-                        for k, _ in oldest:
-                            agent_cache.pop(k, None)
-                    st.session_state["_agent_panel_last_by_filter"] = agent_cache
-                else:
-                    cached = agent_cache.get(agent_cache_key) or {}
-                    if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
-                        all_members = list(cached.get("data") or [])
                 _dashboard_profile_record("agent_panel.filter_sort", pytime.perf_counter() - filter_sort_t0)
 
                 render_t0 = pytime.perf_counter()
@@ -1270,32 +1270,34 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                 snapshot_interval_s = max(90, int(refresh_s) * 8)
                 notif_stale = (not global_notif.connected) or (last_msg == 0) or ((now_ts - last_evt) > snapshot_interval_s)
 
-                # Basic model: WS is primary, periodic API snapshot fully replaces cache.
-                # Snapshot throttling is org-wide (shared), not per session.
-                shared_snapshot_ts, shared_snapshot_calls = _get_shared_call_seed(org)
-                if shared_snapshot_calls:
-                    with global_notif._lock:
-                        if not global_notif.active_conversations:
-                            seed_map = {}
-                            for c in shared_snapshot_calls:
-                                cid = c.get("conversation_id")
-                                if not cid:
-                                    continue
-                                item = dict(c)
-                                item.setdefault("last_update", shared_snapshot_ts or now_ts)
-                                seed_map[cid] = item
-                            if seed_map:
-                                global_notif.active_conversations = seed_map
-
-                should_snapshot = notif_stale or (now_ts - shared_snapshot_ts >= snapshot_interval_s)
-                if should_snapshot and _reserve_call_seed(org, now_ts, min_interval=snapshot_interval_s):
+                # Basic model: WS is primary, periodic API snapshot fully replaces active map.
+                last_snapshot_ts = float(st.session_state.get("_call_panel_snapshot_ts", 0) or 0)
+                should_snapshot = notif_stale or ((now_ts - last_snapshot_ts) >= snapshot_interval_s)
+                if should_snapshot:
                     snapshot_api_t0 = pytime.perf_counter()
                     try:
                         snapshot_started_ts = pytime.time()
                         api = GenesysAPI(st.session_state.api_client)
                         end_dt = datetime.now(timezone.utc)
-                        start_dt = end_dt - timedelta(minutes=15)
-                        convs = api.get_conversation_details_recent(start_dt, end_dt, page_size=50, max_pages=1, order="desc")
+                        start_dt = end_dt - timedelta(hours=4)
+
+                        # Pull up to ~300 records while covering both newest and oldest active tails.
+                        convs_desc = api.get_conversation_details_recent(
+                            start_dt, end_dt, page_size=100, max_pages=2, order="desc"
+                        )
+                        convs_asc = api.get_conversation_details_recent(
+                            start_dt, end_dt, page_size=100, max_pages=1, order="asc"
+                        )
+                        convs_by_id = {}
+                        for conv in (convs_desc or []) + (convs_asc or []):
+                            if not isinstance(conv, dict):
+                                continue
+                            cid = conv.get("conversationId") or conv.get("id")
+                            if not cid:
+                                continue
+                            convs_by_id[str(cid)] = conv
+                        convs = list(convs_by_id.values())
+
                         snapshot_calls = _build_active_calls(
                             [c for c in (convs or []) if not c.get("conversationEnd")],
                             lang,
@@ -1309,8 +1311,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             c["last_update"] = now_update
                             if not c.get("media_type"):
                                 c["media_type"] = _extract_media_type(c)
-                        _update_call_seed(org, snapshot_calls, now_update, max_items=300)
-                        _update_call_meta(org, snapshot_calls, now_update, max_items=300)
+                        st.session_state["_call_panel_snapshot_ts"] = now_update
                         new_map = {c.get("conversation_id"): c for c in snapshot_calls if c.get("conversation_id")}
                         with global_notif._lock:
                             existing_map = dict(global_notif.active_conversations or {})
@@ -1330,7 +1331,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                                 if cid in merged_map:
                                     continue
                                 ex_ts = ex.get("last_update", 0) or 0
-                                if ex_ts and (snapshot_started_ts - ex_ts) <= 30:
+                                if ex_ts and (snapshot_started_ts - ex_ts) <= 120:
                                     merged_map[cid] = ex
 
                             global_notif.active_conversations = merged_map
@@ -1338,7 +1339,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         pass
                     _dashboard_profile_record("call_panel.snapshot_api", pytime.perf_counter() - snapshot_api_t0)
 
-                active_conversations = global_notif.get_active_conversations(max_age_seconds=300)
+                active_conversations = global_notif.get_active_conversations(max_age_seconds=600)
                 for c in active_conversations:
                     if "state" not in c:
                         c["state"] = "waiting"
@@ -1351,54 +1352,6 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                     if cid:
                         combined[cid] = dict(c)
 
-                # Enrich from shared meta cache first (org-wide).
-                shared_meta = _get_shared_call_meta(org, max_age_seconds=600)
-                if shared_meta:
-                    for cid, item in list(combined.items()):
-                        meta = shared_meta.get(cid)
-                        if meta:
-                            combined[cid] = _merge_call(item, meta)
-
-                # Small enrichment pass for missing queue/phone/direction fields.
-                missing_ids = []
-                for cid, item in combined.items():
-                    has_queue = bool(item.get("queue_name")) and not _is_generic_queue_name(item.get("queue_name"))
-                    has_wg = bool(item.get("wg"))
-                    has_phone = bool(item.get("phone"))
-                    has_direction = bool(item.get("direction_label")) or bool(item.get("direction"))
-                    if not (has_queue and has_wg and has_phone and has_direction):
-                        missing_ids.append(cid)
-
-                meta_poll_interval_s = max(60, int(refresh_s) * 6)
-                meta_target_ids = _reserve_call_meta_targets(
-                    org,
-                    missing_ids,
-                    now_ts,
-                    min_interval=meta_poll_interval_s,
-                    cooldown_seconds=max(120, int(refresh_s) * 12),
-                    max_items=1,
-                )
-                if meta_target_ids:
-                    meta_api_t0 = pytime.perf_counter()
-                    try:
-                        api = GenesysAPI(st.session_state.api_client)
-                        users_info = st.session_state.get("users_info") or {}
-                        for cid in meta_target_ids:
-                            meta = _fetch_conversation_meta(api, cid, queue_id_to_name, users_info=users_info)
-                            if meta:
-                                if meta.get("ended"):
-                                    combined.pop(cid, None)
-                                    try:
-                                        with global_notif._lock:
-                                            global_notif.active_conversations.pop(cid, None)
-                                    except Exception:
-                                        pass
-                                    continue
-                                combined[cid] = _merge_call(combined.get(cid), meta)
-                    except Exception:
-                        pass
-                    _dashboard_profile_record("call_panel.meta_api", pytime.perf_counter() - meta_api_t0)
-
                 # Final cleanup.
                 for cid in list(combined.keys()):
                     item = combined.get(cid) or {}
@@ -1406,15 +1359,11 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         combined.pop(cid, None)
                         continue
                     lu = item.get("last_update", 0) or 0
-                    if lu and (now_ts - lu) > 300:
+                    if lu and (now_ts - lu) > 600:
                         combined.pop(cid, None)
                         continue
 
                 waiting_calls = list(combined.values())
-                try:
-                    _update_call_meta(org, waiting_calls, now_ts, max_items=300)
-                except Exception:
-                    pass
 
                 filter_sort_t0 = pytime.perf_counter()
                 if group_queues_lower:
@@ -1445,31 +1394,6 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
 
                 waiting_calls.sort(key=lambda x: x.get("wait_seconds") if x.get("wait_seconds") is not None else -1, reverse=True)
 
-                # Short-lived fallback cache to avoid empty flashes between refresh cycles.
-                if is_filter_all:
-                    filter_sig = "all"
-                elif selected_filter_set:
-                    filter_sig = ",".join(sorted(selected_filter_set))
-                else:
-                    filter_sig = "none"
-                search_sig = queue_search_term.replace("|", " ").strip() if queue_search_term else ""
-                call_cache_key = f"v3|{selected_group}|{int(bool(hide_mevcut))}|{filter_sig}|q:{search_sig}"
-                call_cache = st.session_state.get("_call_panel_last_by_filter", {})
-                if not isinstance(call_cache, dict):
-                    call_cache = {}
-                fallback_ttl = 20
-                if waiting_calls:
-                    call_cache[call_cache_key] = {"ts": now_ts, "data": list(waiting_calls)}
-                    if len(call_cache) > 20:
-                        oldest = sorted(call_cache.items(), key=lambda kv: kv[1].get("ts", 0))[:len(call_cache) - 20]
-                        for k, _ in oldest:
-                            call_cache.pop(k, None)
-                    st.session_state["_call_panel_last_by_filter"] = call_cache
-                else:
-                    if is_filter_all or selected_filter_set:
-                        cached = call_cache.get(call_cache_key) or {}
-                        if cached and (now_ts - cached.get("ts", 0)) <= fallback_ttl:
-                            waiting_calls = list(cached.get("data") or [])
                 _dashboard_profile_record("call_panel.filter_sort", pytime.perf_counter() - filter_sort_t0)
 
                 count_label = "Aktif"

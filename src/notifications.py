@@ -934,7 +934,7 @@ class AgentNotificationManager:
 
 class GlobalConversationNotificationManager:
     """Notifications for org-wide conversations (calls/chats/messages/etc)."""
-    ACTIVE_CALL_TTL_SECONDS = 180  # Reduced from 300
+    ACTIVE_CALL_TTL_SECONDS = 900  # Keep active conversations longer to avoid transient drops.
     CLEANUP_INTERVAL_SECONDS = 30  # Reduced from 45
     MAX_ACTIVE_CONVERSATIONS = 300 # Reduced from 500
 

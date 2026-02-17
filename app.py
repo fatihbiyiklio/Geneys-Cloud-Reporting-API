@@ -200,6 +200,7 @@ LOGIN_WINDOW_SECONDS = int(os.environ.get("GENESYS_LOGIN_WINDOW_SECONDS", "900")
 LOGIN_LOCK_SECONDS = int(os.environ.get("GENESYS_LOGIN_LOCK_SECONDS", "900"))
 LOGIN_MAX_FAILURES = int(os.environ.get("GENESYS_LOGIN_MAX_FAILURES", "5"))
 LOGIN_ATTEMPT_MAX_ENTRIES = int(os.environ.get("GENESYS_LOGIN_ATTEMPT_MAX_ENTRIES", "5000"))
+DATA_MANAGER_IMPL_VERSION = 2
 
 def _rm_debug(msg, *args):
     if DEBUG_REMEMBER_ME:
@@ -2393,9 +2394,20 @@ def get_shared_data_manager(org_code, max_orgs=20):
                     except Exception:
                         pass
         dm = store["data"].get(org_code)
+        dm_version = int(getattr(dm, "_impl_version", 0) or 0) if dm is not None else 0
+        if dm is not None and dm_version != int(DATA_MANAGER_IMPL_VERSION):
+            try:
+                dm.force_stop()
+            except Exception:
+                pass
+            store["data"].pop(org_code, None)
+            dm = None
         if dm is None:
             dm = DataManager()
+            setattr(dm, "_impl_version", int(DATA_MANAGER_IMPL_VERSION))
             store["data"][org_code] = dm
+        elif not hasattr(dm, "_impl_version"):
+            setattr(dm, "_impl_version", int(DATA_MANAGER_IMPL_VERSION))
     # Apply persisted enabled/disabled state every time
     dm.enabled = is_dm_enabled(org_code)
     return dm

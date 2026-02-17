@@ -237,8 +237,7 @@ class DataManager:
             last_member_refresh = self.last_member_refresh
             member_cache_snapshot = self.queue_members_cache.copy()
 
-        # 1. Observations (Live Metrics)
-        # Keep previous cache if refresh fails/returns empty.
+        # 1. Observations (Live Metrics) - direct overwrite, no fallback retention
         if q_ids:
             try:
                 obs_response = self.api.get_queue_observations(q_ids)
@@ -249,65 +248,69 @@ class DataManager:
                     q_name = item.get("Queue")
                     if q_name:
                         new_obs[q_name] = item
-                if new_obs:
-                    with self._lock:
-                        merged_obs = {q: v for q, v in self.obs_data_cache.items() if q in monitored_queue_names}
-                        merged_obs.update(new_obs)
-                        self.obs_data_cache = merged_obs
+                with self._lock:
+                    merged_obs = {q: v for q, v in self.obs_data_cache.items() if q not in monitored_queue_names}
+                    merged_obs.update(new_obs)
+                    self.obs_data_cache = merged_obs
             except Exception as e:
                 self._log_error(f"Observation refresh error: {e}")
+                with self._lock:
+                    self.obs_data_cache = {
+                        q: v for q, v in self.obs_data_cache.items() if q not in monitored_queue_names
+                    }
         else:
             with self._lock:
                 self.obs_data_cache = {}
 
-        # 1.5 Routing activity (queue-scoped user routing/presence details for deduped agent metrics)
+        # 1.5 Routing activity - direct overwrite, no grace/fallback retention
         if q_ids:
             try:
                 routing_response = self.api.get_routing_activity(q_ids)
-                routing_results = None
-                if isinstance(routing_response, dict):
-                    routing_results = routing_response.get("results")
+                routing_results = routing_response.get("results") if isinstance(routing_response, dict) else []
+                rebuilt = {}
+                for result in (routing_results or []):
+                    group = result.get("group") or {}
+                    q_id = group.get("queueId") or group.get("queue_id")
+                    q_name = id_map.get(q_id)
+                    if not q_name:
+                        continue
 
-                # Update cache only if request succeeded (results may be empty list).
-                # If request fails (None), keep previous cache to avoid false zero states.
-                if routing_results is not None:
-                    rebuilt = {q_name: {} for q_name in monitored_queue_names}
-                    for result in routing_results:
-                        group = result.get("group") or {}
-                        q_id = group.get("queueId") or group.get("queue_id")
-                        q_name = id_map.get(q_id)
-                        if not q_name:
+                    entities = result.get("entities") or []
+                    q_users = {}
+                    for ent in entities:
+                        uid = str(ent.get("userId") or ent.get("user_id") or "").strip()
+                        if not uid:
                             continue
 
-                        entities = result.get("entities") or []
-                        q_users = rebuilt.setdefault(q_name, {})
-                        for ent in entities:
-                            uid = str(ent.get("userId") or ent.get("user_id") or "").strip()
-                            if not uid:
-                                continue
+                        normalized = {
+                            "user_id": uid,
+                            "queue_id": q_id,
+                            "routing_status": ent.get("routingStatus") or ent.get("routing_status"),
+                            "system_presence": ent.get("systemPresence") or ent.get("system_presence"),
+                            "organization_presence_id": ent.get("organizationPresenceId") or ent.get("organization_presence_id"),
+                            "activity_date": ent.get("activityDate") or ent.get("activity_date"),
+                        }
 
-                            normalized = {
-                                "user_id": uid,
-                                "queue_id": q_id,
-                                "routing_status": ent.get("routingStatus") or ent.get("routing_status"),
-                                "system_presence": ent.get("systemPresence") or ent.get("system_presence"),
-                                "organization_presence_id": ent.get("organizationPresenceId") or ent.get("organization_presence_id"),
-                                "activity_date": ent.get("activityDate") or ent.get("activity_date"),
-                            }
+                        prev = q_users.get(uid) or {}
+                        prev_ts = self._parse_iso_ts(prev.get("activity_date"))
+                        curr_ts = self._parse_iso_ts(normalized.get("activity_date"))
+                        if prev and (curr_ts < prev_ts):
+                            continue
+                        q_users[uid] = normalized
+                    rebuilt[q_name] = q_users
 
-                            prev = q_users.get(uid) or {}
-                            prev_ts = self._parse_iso_ts(prev.get("activity_date"))
-                            curr_ts = self._parse_iso_ts(normalized.get("activity_date"))
-                            if prev and (curr_ts < prev_ts):
-                                continue
-                            q_users[uid] = normalized
-
-                    with self._lock:
-                        merged = {q: v for q, v in self.routing_activity_cache.items() if q not in monitored_queue_names}
-                        merged.update(rebuilt)
-                        self.routing_activity_cache = merged
+                with self._lock:
+                    merged = {q: v for q, v in self.routing_activity_cache.items() if q not in monitored_queue_names}
+                    for q_name in monitored_queue_names:
+                        merged[q_name] = dict(rebuilt.get(q_name) or {})
+                    self.routing_activity_cache = merged
             except Exception as e:
                 self._log_error(f"Routing activity refresh error: {e}")
+                with self._lock:
+                    merged = {q: v for q, v in self.routing_activity_cache.items() if q not in monitored_queue_names}
+                    for q_name in monitored_queue_names:
+                        merged[q_name] = {}
+                    self.routing_activity_cache = merged
         else:
             with self._lock:
                 self.routing_activity_cache = {}
@@ -329,21 +332,17 @@ class DataManager:
                 new_daily = process_daily_stats(daily_response, id_map) if daily_response else {}
                 new_daily = new_daily or {}
                 with self._lock:
-                    previous_interval_key = self.last_daily_interval_key
-                    if new_daily:
-                        # Fresh data: replace monitored queue values atomically.
-                        preserved = {q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names}
-                        preserved.update(new_daily)
-                        self.daily_data_cache = preserved
-                    elif previous_interval_key != daily_interval_key:
-                        # Day rollover: clear monitored queues to avoid carrying previous day totals.
-                        preserved = {q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names}
-                        self.daily_data_cache = preserved
-                    # Same-day empty response is treated as transient; keep existing monitored values.
+                    preserved = {q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names}
+                    preserved.update(new_daily)
+                    self.daily_data_cache = preserved
                     self.last_daily_interval_key = daily_interval_key
                     self.last_daily_refresh = current_time
             except Exception as e:
                 self._log_error(f"Daily stats refresh error: {e}")
+                with self._lock:
+                    self.daily_data_cache = {
+                        q: v for q, v in self.daily_data_cache.items() if q not in monitored_queue_names
+                    }
         elif not q_ids:
             with self._lock:
                 self.daily_data_cache = {}
@@ -375,25 +374,12 @@ class DataManager:
 
         with self._lock:
             queue_members_snapshot = {q_id: list(self.queue_members_cache.get(q_id, [])) for q_id in agent_q_ids}
-            previous_agent_cache = {k: list(v or []) for k, v in self.agent_details_cache.items()}
 
         # User Status Scan
         unique_user_ids = set()
         for q_id in agent_q_ids:
             for m in queue_members_snapshot.get(q_id, []):
                 unique_user_ids.add(m['id'])
-
-        prev_status = {}
-        for members in previous_agent_cache.values():
-            for member in members:
-                uid = member.get("id")
-                if not uid:
-                    continue
-                user_obj = member.get("user", {})
-                prev_status[uid] = {
-                    "presence": user_obj.get("presence", {}),
-                    "routingStatus": member.get("routingStatus", {}),
-                }
 
         status_map = {}
         if agent_q_ids and unique_user_ids:
@@ -419,9 +405,6 @@ class DataManager:
             except Exception as e:
                 self._log_error(f"User Scan Error: {str(e)}")
                 self._log_error(f"Error updating users: {e}")
-                for u_id in unique_user_ids:
-                    if u_id in prev_status:
-                        status_map[u_id] = prev_status[u_id]
 
         # Detail Cache reconstruction
         temp_cache = {}
@@ -431,7 +414,7 @@ class DataManager:
             items = []
             for m in mems:
                 u_id = m['id']
-                st = status_map.get(u_id) or prev_status.get(u_id, {})
+                st = status_map.get(u_id) or {}
                 items.append({
                     'id': u_id,
                     'user': {'id': u_id, 'name': m['name'], 'presence': st.get('presence', {})},

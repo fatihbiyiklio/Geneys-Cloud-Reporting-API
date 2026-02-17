@@ -359,7 +359,9 @@ def process_observations(resp, id_map, presence_map=None):
                     "OnQueueIdle": 0, 
                     "OnQueueInteracting": 0, 
                     "ActiveUsers": 0,
-                    "Presences": {"Available": 0, "Busy": 0, "Away": 0, "Offline": 0, "On Queue": 0, "Meal": 0, "Break": 0, "Meeting": 0, "Training": 0}
+                    "Presences": {"Available": 0, "Busy": 0, "Away": 0, "Offline": 0, "On Queue": 0, "Meal": 0, "Break": 0, "Meeting": 0, "Training": 0},
+                    "_onqueue_by_qual": {},
+                    "_presence_by_qual": {}
                 } 
                 for k, v in id_map.items()}
 
@@ -394,10 +396,11 @@ def process_observations(resp, id_map, presence_map=None):
                 elif m == "oMemberUsers": row["Members"] = max(row["Members"], val)
                 elif m == "oActiveUsers": row["ActiveUsers"] = max(row["ActiveUsers"], val)
                 elif m == "oOnQueueUsers":
-                    # OnQueue metrics usually don't have mediaType in the same way, but let's check
-                    if qualifier.upper() == "IDLE": row["OnQueueIdle"] += val
-                    elif qualifier.upper() == "INTERACTING": row["OnQueueInteracting"] += val
-                    else: row["OnQueue"] = max(row["OnQueue"], val)
+                    # Dedupe qualifier values across media buckets by keeping max per qualifier.
+                    q_key = str(qualifier or "TOTAL").strip().upper() or "TOTAL"
+                    prev_v = row["_onqueue_by_qual"].get(q_key, 0)
+                    if val > prev_v:
+                        row["_onqueue_by_qual"][q_key] = val
                 elif m == "oUserPresences":
                     # Map UUID to System Presence if map provided
                     if presence_map and qualifier in presence_map:
@@ -405,20 +408,51 @@ def process_observations(resp, id_map, presence_map=None):
                         mapped_qualifier = p_info['systemPresence'] if isinstance(p_info, dict) else p_info
                     else:
                         mapped_qualifier = qualifier
-                        
+
                     q_lower = mapped_qualifier.lower()
-                    if "available" in q_lower: row["Presences"]["Available"] += val
-                    elif "break" in q_lower: row["Presences"]["Break"] += val
-                    elif "meal" in q_lower: row["Presences"]["Meal"] += val
-                    elif "meeting" in q_lower: row["Presences"]["Meeting"] += val
-                    elif "training" in q_lower: row["Presences"]["Training"] += val
-                    elif "busy" in q_lower or "do not disturb" in q_lower: row["Presences"]["Busy"] += val
-                    elif "away" in q_lower: row["Presences"]["Away"] += val
-                    elif "offline" in q_lower: row["Presences"]["Offline"] += val
-                    elif "on queue" in q_lower or "onqueue" in q_lower: row["Presences"]["On Queue"] += val
+                    bucket = None
+                    if "available" in q_lower: bucket = "Available"
+                    elif "break" in q_lower: bucket = "Break"
+                    elif "meal" in q_lower: bucket = "Meal"
+                    elif "meeting" in q_lower: bucket = "Meeting"
+                    elif "training" in q_lower: bucket = "Training"
+                    elif "busy" in q_lower or "do not disturb" in q_lower: bucket = "Busy"
+                    elif "away" in q_lower: bucket = "Away"
+                    elif "offline" in q_lower: bucket = "Offline"
+                    elif "on queue" in q_lower or "onqueue" in q_lower: bucket = "On Queue"
+                    if bucket:
+                        qual_key = str(qualifier or mapped_qualifier or bucket).strip()
+                        prev_info = row["_presence_by_qual"].get(qual_key) or {"bucket": bucket, "value": 0}
+                        prev_v = prev_info.get("value", 0) if isinstance(prev_info, dict) else 0
+                        if val > prev_v:
+                            row["_presence_by_qual"][qual_key] = {"bucket": bucket, "value": val}
             
             if sl_values:
                 row["ServiceLevel"] = round((sum(sl_values) / len(sl_values)), 1)
+
+    # Finalize deduped qualifier maps into output counters.
+    for row in data_map.values():
+        onq_map = row.pop("_onqueue_by_qual", {}) if isinstance(row, dict) else {}
+        if isinstance(onq_map, dict):
+            row["OnQueueIdle"] = int(onq_map.get("IDLE", row.get("OnQueueIdle", 0)) or 0)
+            row["OnQueueInteracting"] = int(onq_map.get("INTERACTING", row.get("OnQueueInteracting", 0)) or 0)
+            other_vals = [int(v or 0) for k, v in onq_map.items() if k not in {"IDLE", "INTERACTING"}]
+            if other_vals:
+                row["OnQueue"] = max([int(row.get("OnQueue", 0) or 0)] + other_vals)
+            elif int(row.get("OnQueue", 0) or 0) <= 0:
+                row["OnQueue"] = row["OnQueueIdle"] + row["OnQueueInteracting"]
+
+        pres_map = row.pop("_presence_by_qual", {}) if isinstance(row, dict) else {}
+        if isinstance(pres_map, dict):
+            for k in list((row.get("Presences") or {}).keys()):
+                row["Presences"][k] = 0
+            for info in pres_map.values():
+                if not isinstance(info, dict):
+                    continue
+                b = str(info.get("bucket") or "").strip()
+                v = int(info.get("value", 0) or 0)
+                if b and b in row["Presences"]:
+                    row["Presences"][b] += v
 
     return list(data_map.values())
 
