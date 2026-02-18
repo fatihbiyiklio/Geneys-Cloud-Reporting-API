@@ -189,6 +189,7 @@ jobs:
       - name: Build with PyInstaller
         run: |
           pyinstaller --clean --noconfirm --onefile --noconsole --name "GenesysReporting" `
+            --runtime-tmpdir "." `
             --collect-all streamlit `
             --collect-all streamlit_autorefresh `
             --collect-all streamlit_cookies_manager `

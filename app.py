@@ -21,6 +21,7 @@ import tempfile
 import psutil
 import re
 import html
+import builtins
 
 # Suppress st.cache deprecation warning from streamlit_cookies_manager
 warnings.filterwarnings("ignore", message=r".*st\.cache.*deprecated.*")
@@ -55,7 +56,17 @@ except Exception:
     pass
 
 from streamlit.runtime import Runtime
-from cryptography.fernet import Fernet
+
+def _load_fernet_class():
+    """Reuse Fernet across Streamlit reruns to avoid reinitializing PyO3 modules."""
+    cached = getattr(builtins, "_GENESYS_FERNET_CLASS", None)
+    if cached is not None:
+        return cached
+    from cryptography.fernet import Fernet as _Fernet
+    setattr(builtins, "_GENESYS_FERNET_CLASS", _Fernet)
+    return _Fernet
+
+Fernet = _load_fernet_class()
 from src.data_manager import DataManager
 from src.notifications import NotificationManager, AgentNotificationManager, GlobalConversationNotificationManager
 from src.auth_manager import AuthManager

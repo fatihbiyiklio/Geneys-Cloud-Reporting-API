@@ -7,18 +7,28 @@ import subprocess
 import socket
 import streamlit.web.cli as stcli
 
+def _runtime_home_dir():
+    """Stable writable app directory for lock/log/state files."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_HOME_DIR = _runtime_home_dir()
+
+
 def resolve_path(path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
     try:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
+        base_path = APP_HOME_DIR
 
     return os.path.join(base_path, path)
 
-PID_FILE = ".app.pid"
-LOCK_FILE = ".app.lock"
+PID_FILE = os.path.join(APP_HOME_DIR, ".app.pid")
+LOCK_FILE = os.path.join(APP_HOME_DIR, ".app.lock")
 CHILD_FLAG = "--streamlit-child"
 
 _lock_handle = None
@@ -63,6 +73,15 @@ def _normalize_service_bin_path(value):
     return " ".join((value or "").replace('"', "").split()).lower()
 
 
+def _build_windows_service_bin_path():
+    if getattr(sys, "frozen", False):
+        exe_path = os.path.abspath(sys.executable)
+        exe_dir = os.path.dirname(exe_path)
+        # Force service launch cwd to exe dir so PyInstaller onefile unpacks there.
+        return f'cmd.exe /d /c "cd /d ""{exe_dir}"" && ""{exe_path}"""'
+    return f"\"{sys.executable}\" \"{os.path.abspath(__file__)}\""
+
+
 def _emit_startup_message(log_func, message):
     try:
         print(message)
@@ -70,6 +89,13 @@ def _emit_startup_message(log_func, message):
         pass
     try:
         log_func(message)
+    except Exception:
+        pass
+
+
+def _ensure_app_home_cwd():
+    try:
+        os.chdir(APP_HOME_DIR)
     except Exception:
         pass
 
@@ -91,10 +117,7 @@ def ensure_windows_service_registration(log_func):
     if start_mode not in ("auto", "demand", "disabled", "delayed-auto"):
         start_mode = "auto"
 
-    if getattr(sys, "frozen", False):
-        bin_path = f"\"{sys.executable}\""
-    else:
-        bin_path = f"\"{sys.executable}\" \"{os.path.abspath(__file__)}\""
+    bin_path = _build_windows_service_bin_path()
 
     is_admin = _is_windows_admin()
     exists, query_out = _run_sc_command("query", service_name)
@@ -278,12 +301,14 @@ def check_single_instance():
 if __name__ == "__main__":
     import psutil
 
+    _ensure_app_home_cwd()
+
     # Child process mode: do not acquire single-instance lock.
     if len(sys.argv) > 1 and sys.argv[1] == CHILD_FLAG:
         sys.exit(run_streamlit_child())
 
     # Log file for debugging startup issues (especially on Windows)
-    log_path = os.path.join(os.getcwd(), "app_startup.log")
+    log_path = os.path.join(APP_HOME_DIR, "app_startup.log")
     def log(msg):
         try:
             with open(log_path, "a", encoding="utf-8") as f:
