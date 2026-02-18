@@ -2,16 +2,29 @@ import json
 import os
 import threading
 import time
+import builtins
 import requests
 import sys
 import re
-from cryptography.fernet import Fernet
 
 _cache_lock = threading.Lock()
 _mem_cache = {}
 _MAX_MEM_CACHE_ENTRIES = 50
 ORG_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
 SECRET_KEY_FILENAME = ".secret.key"
+
+
+def _load_fernet_class():
+    """Reuse Fernet across Streamlit reruns to avoid PyO3 re-init errors."""
+    cached = getattr(builtins, "_GENESYS_FERNET_CLASS", None)
+    if cached is not None:
+        return cached
+    from cryptography.fernet import Fernet as _Fernet
+    setattr(builtins, "_GENESYS_FERNET_CLASS", _Fernet)
+    return _Fernet
+
+
+Fernet = _load_fernet_class()
 
 def _cache_key(client_id, region):
     return f"{client_id}:{region}"

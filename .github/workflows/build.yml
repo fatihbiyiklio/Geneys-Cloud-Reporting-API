@@ -5,6 +5,9 @@ on:
     branches: ["main", "master"]
   workflow_dispatch:
 
+env:
+  PYTHON_VERSION: '3.11'
+
 permissions:
   contents: write
   packages: write
@@ -110,7 +113,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
       - name: Install dependencies
@@ -150,6 +153,7 @@ jobs:
           ref=${GITHUB_REF}
           tag=${{ needs.create-tag-release.outputs.tag_name }}
           run_id=${GITHUB_RUN_ID}
+          python_version=${{ env.PYTHON_VERSION }}
           built_at_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           EOF
 
@@ -173,7 +177,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
       - name: Install dependencies
@@ -217,6 +221,7 @@ jobs:
           ref=${{ github.ref }}
           tag=$tag
           run_id=${{ github.run_id }}
+          python_version=${{ env.PYTHON_VERSION }}
           built_at_utc=$(Get-Date -AsUTC -Format o)
           "@ | Out-File -FilePath "dist/build-info-windows.txt" -Encoding utf8
 
@@ -271,4 +276,5 @@ jobs:
       - name: Publish build summary
         run: |
           echo "Tag: ${{ needs.create-tag-release.outputs.tag_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Python: ${{ env.PYTHON_VERSION }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Release assets uploaded successfully." >> "$GITHUB_STEP_SUMMARY"

@@ -44,10 +44,11 @@ IMAGE_REPOSITORY=ghcr.io/<owner>/genesys-cloud-reporting IMAGE_TAG=latest docker
 GitHub Actions her `main/master` push'unda otomatik tag + release üretir.
 - Önce benzersiz bir `v*` tag oluşturulur ve release açılır.
 - Aynı akışta Linux binary (`GenesysReporting-linux`) ve Windows EXE (`GenesysReporting.exe`) build edilir.
+- Linux/Windows binary build'leri GitHub Actions üzerinde Python 3.11 ile alınır.
 - Windows EXE build'inde `--runtime-tmpdir "."` kullanılır; EXE kendi klasöründen çalıştırıldığında açılım klasörü de bu dizin olur.
 - Dosyalar otomatik olarak bu tag release'ine eklenir.
 - Release/Artifact içinde izleme için `build-info-linux.txt` ve `build-info-windows.txt` bulunur.
-- Güncellik doğrulaması için `build-info-*.txt` dosyalarındaki `sha` alanını kontrol edin.
+- Güncellik doğrulaması için `build-info-*.txt` dosyalarındaki `sha` ve `python_version` alanlarını kontrol edin.
 
 ### Windows + IIS Reverse Proxy
 Bu proje Streamlit tabanli oldugu icin IIS'te dogrudan host edilmez, reverse proxy olarak yayinlanir.
