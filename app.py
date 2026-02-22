@@ -1009,21 +1009,26 @@ def delete_app_session():
         _rm_debug("delete session failed: %s", e)
         pass
 
-def _flush_pending_remember_me_delete():
+def _flush_pending_remember_me_delete(block_ui=True, max_retries=20):
     if not st.session_state.get("_remember_me_pending_delete"):
         return True
     retries = int(st.session_state.get("_remember_me_pending_delete_retries", 0))
-    cookie_status, existing = _read_app_session_cookie(with_status=True)
+    cookie_status, _ = _read_app_session_cookie(with_status=True)
     if cookie_status == "manager_missing":
         retries += 1
         st.session_state["_remember_me_pending_delete_retries"] = retries
         _rm_debug("pending remember-me delete waiting for cookie manager retry=%s", retries)
-        if retries <= 20:
+        if block_ui and retries <= max_retries:
             _safe_autorefresh(interval=700, key=f"remember_delete_retry_{retries}")
             st.info("Oturum çıkışı doğrulanıyor, lütfen bekleyin...")
             st.stop()
-        _rm_debug("pending remember-me delete exceeded retries=%s while waiting manager", retries)
-        return False
+        if retries > max_retries:
+            _rm_debug("pending remember-me delete exceeded retries=%s while waiting manager", retries)
+            if not block_ui:
+                st.session_state["_remember_me_pending_delete"] = False
+                st.session_state["_remember_me_pending_delete_retries"] = 0
+            return False
+        return True
     if cookie_status == "not_found":
         st.session_state["_remember_me_pending_delete"] = False
         st.session_state["_remember_me_pending_delete_retries"] = 0
@@ -1044,14 +1049,19 @@ def _flush_pending_remember_me_delete():
         _rm_debug("pending remember-me delete failed: %s", e)
     retries += 1
     st.session_state["_remember_me_pending_delete_retries"] = retries
-    if retries <= 20:
+    if block_ui and retries <= max_retries:
         _safe_autorefresh(interval=700, key=f"remember_delete_retry_{retries}")
         st.info("Oturum çıkışı doğrulanıyor, lütfen bekleyin...")
         st.stop()
-    _rm_debug("pending remember-me delete exceeded retries=%s", retries)
-    return False
+    if retries > max_retries:
+        _rm_debug("pending remember-me delete exceeded retries=%s", retries)
+        if not block_ui:
+            st.session_state["_remember_me_pending_delete"] = False
+            st.session_state["_remember_me_pending_delete_retries"] = 0
+        return False
+    return True
 
-def _flush_pending_remember_me():
+def _flush_pending_remember_me(block_ui=True, max_retries=20):
     payload = st.session_state.get("_remember_me_pending_payload")
     if not payload:
         return True
@@ -1106,12 +1116,19 @@ def _flush_pending_remember_me():
     save_ok = save_app_session(payload)
     _rm_debug("pending remember-me flush attempt=%s save_ok=%s", retries, save_ok)
     # Give cookie component time to initialize and persist.
-    if retries <= 20:
+    if block_ui and retries <= max_retries:
         _safe_autorefresh(interval=700, key=f"remember_flush_retry_{retries}")
         st.info("Beni Hatırla kaydı doğrulanıyor, lütfen bekleyin...")
         st.stop()
-    _rm_debug("pending remember-me flush failed after retries=%s", retries)
-    return False
+    if retries > max_retries:
+        _rm_debug("pending remember-me flush failed after retries=%s", retries)
+        if not block_ui:
+            st.session_state.pop("_remember_me_pending_payload", None)
+            st.session_state.pop("_remember_me_pending_retries", None)
+            st.session_state.remember_me_enabled = False
+            return True
+        return False
+    return True
 
 def _ensure_cookie_component_ready(max_retries=8):
     retries = int(st.session_state.get("_cookie_boot_retries", 0))
@@ -2946,11 +2963,9 @@ def log_to_console(message, level='error'):
 init_session_state()
 _inject_reboot_path_bridge_script()
 _maybe_periodic_temp_cleanup()
-if not _flush_pending_remember_me_delete():
-    st.stop()
-if not _flush_pending_remember_me() and _cookie_manager_initializing():
-    st.info("Oturum bileşeni hazırlanıyor, lütfen bekleyin...")
-    st.stop()
+_cookie_flow_blocking = not bool(st.session_state.get("app_user"))
+_flush_pending_remember_me_delete(block_ui=_cookie_flow_blocking)
+_flush_pending_remember_me(block_ui=_cookie_flow_blocking)
 
 # Ensure shared DataManager is available after login
 if st.session_state.app_user and 'data_manager' not in st.session_state:
