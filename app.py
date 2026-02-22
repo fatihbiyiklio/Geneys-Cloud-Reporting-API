@@ -82,6 +82,7 @@ MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "512"))  # Soft 
 MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "60"))  # Reduced from 120
 MEMORY_HARD_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_HARD_LIMIT_MB", "768"))  # Hard limit - trigger restart
 RESTART_EXIT_CODE = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
+REBOOT_HISTORY_MAX_ENTRIES = int(os.environ.get("GENESYS_REBOOT_HISTORY_MAX_ENTRIES", "200"))
 TEMP_CLEANUP_INTERVAL_SEC = int(os.environ.get("GENESYS_TEMP_CLEANUP_INTERVAL_SEC", "900"))
 TEMP_FILE_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MAX_AGE_HOURS", "6"))
 TEMP_FILE_MANUAL_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MANUAL_MAX_AGE_HOURS", "0"))
@@ -1528,10 +1529,100 @@ def _shared_memory_store():
         "restart_in_progress": False,
     }
 
-def _silent_restart():
-    """Perform a silent restart of the Streamlit app when memory exceeds hard limit.
-    Uses process exit to trigger the restart loop in run_app.py."""
-    logger.warning(f"Memory exceeded {MEMORY_HARD_LIMIT_MB}MB, initiating silent restart...")
+@st.cache_resource(show_spinner=False)
+def _shared_reboot_event_store():
+    return {"lock": threading.Lock()}
+
+
+def _reboot_events_file_path():
+    try:
+        monitor_dir = os.path.join(ORG_BASE_DIR, "_monitor")
+        os.makedirs(monitor_dir, exist_ok=True)
+        return os.path.join(monitor_dir, "reboot_events.json")
+    except Exception:
+        return None
+
+
+def _read_reboot_events():
+    path = _reboot_events_file_path()
+    if not path or (not os.path.exists(path)):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, list):
+            return []
+        out = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            out.append({
+                "timestamp": str(item.get("timestamp") or "").strip(),
+                "source": str(item.get("source") or "-").strip() or "-",
+                "username": str(item.get("username") or "-").strip() or "-",
+                "org_code": str(item.get("org_code") or "-").strip() or "-",
+                "note": str(item.get("note") or "").strip(),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _write_reboot_events(events):
+    path = _reboot_events_file_path()
+    if not path:
+        return False
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(events or [], f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def _append_reboot_event(source, username=None, org_code=None, note=None):
+    event = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": str(source or "-").strip() or "-",
+        "username": str(username or "-").strip() or "-",
+        "org_code": str(org_code or "-").strip() or "-",
+        "note": str(note or "").strip(),
+    }
+    store = _shared_reboot_event_store()
+    with store["lock"]:
+        events = _read_reboot_events()
+        events.append(event)
+        max_entries = max(20, int(REBOOT_HISTORY_MAX_ENTRIES or 200))
+        if len(events) > max_entries:
+            events = events[-max_entries:]
+        _write_reboot_events(events)
+    return event
+
+
+def _get_reboot_events(limit=50):
+    store = _shared_reboot_event_store()
+    with store["lock"]:
+        events = _read_reboot_events()
+    if limit is None:
+        return list(reversed(events))
+    try:
+        lim = max(1, int(limit))
+    except Exception:
+        lim = 50
+    return list(reversed(events[-lim:]))
+
+
+def _silent_restart(reason=None):
+    """Perform a silent restart of the Streamlit app via wrapper exit code."""
+    reason_text = str(reason or "manual").strip() or "manual"
+    logger.warning("Silent restart initiated (reason=%s)", reason_text)
     
     # Full cleanup before restart
     _soft_memory_cleanup()
@@ -1546,6 +1637,187 @@ def _silent_restart():
     # Forcefully terminate process so wrapper can start a fresh Python process.
     # Use a dedicated non-zero code for intentional restart requests.
     os._exit(RESTART_EXIT_CODE)
+
+
+def _get_query_params_dict():
+    """Read query params in a Streamlit-version-compatible way."""
+    out = {}
+    try:
+        qp = st.query_params
+        for key in qp.keys():
+            try:
+                value = qp.get(key)
+            except Exception:
+                value = None
+            if isinstance(value, list):
+                out[key] = str(value[-1]) if value else ""
+            else:
+                out[key] = str(value or "")
+        return out
+    except Exception:
+        pass
+
+    try:
+        qp_old = st.experimental_get_query_params()
+        for key, values in (qp_old or {}).items():
+            if isinstance(values, list):
+                out[key] = str(values[-1]) if values else ""
+            else:
+                out[key] = str(values or "")
+    except Exception:
+        pass
+    return out
+
+
+def _set_query_params_dict(params):
+    """Write query params in a Streamlit-version-compatible way."""
+    clean = {}
+    for key, value in (params or {}).items():
+        k = str(key or "").strip()
+        if not k:
+            continue
+        v = str(value or "").strip()
+        if not v:
+            continue
+        clean[k] = v
+
+    try:
+        qp = st.query_params
+        try:
+            qp.clear()
+        except Exception:
+            pass
+        for key, value in clean.items():
+            qp[key] = value
+        return True
+    except Exception:
+        pass
+
+    try:
+        st.experimental_set_query_params(**clean)
+        return True
+    except Exception:
+        return False
+
+
+def _is_truthy_query_value(value):
+    token = str(value or "").strip().lower()
+    return token in {"1", "true", "yes", "on", "y", "ok"}
+
+
+def _clear_reboot_query_flags():
+    params = _get_query_params_dict()
+    if not params:
+        return False
+    keys_to_remove = {
+        "rebootme",
+        "reboot",
+        "reboot_from_path",
+        "reboot_token",
+        "token",
+    }
+    changed = False
+    remaining = {}
+    for key, value in params.items():
+        if key in keys_to_remove:
+            changed = True
+            continue
+        remaining[key] = value
+    if changed:
+        _set_query_params_dict(remaining)
+    return changed
+
+
+def _inject_reboot_path_bridge_script():
+    """Convert /rebootme path requests to ?rebootme=1 query format."""
+    try:
+        import streamlit.components.v1 as components
+        components.html(
+            """
+            <script>
+            (function() {
+                try {
+                    const path = String(window.location.pathname || "");
+                    const match = path.match(/^(.*)\\/rebootme\\/?$/i);
+                    if (!match) return;
+                    const base = (match[1] && match[1].length > 0) ? match[1] : "/";
+                    const url = new URL(window.location.href);
+                    url.pathname = base.endsWith("/") ? base : (base + "/");
+                    url.searchParams.set("rebootme", "1");
+                    url.searchParams.set("reboot_from_path", "1");
+                    if (window.location.href !== url.toString()) {
+                        window.location.replace(url.toString());
+                    }
+                } catch (e) {}
+            })();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+    except Exception:
+        pass
+
+
+def _maybe_handle_reboot_link_request():
+    """
+    Allow admin-triggered reboot via URL:
+    - /rebootme (bridged to query by JS)
+    - ?rebootme=1 or ?reboot=true
+    Optional hardening:
+    - if GENESYS_REBOOT_LINK_TOKEN is set, query must include token/reboot_token.
+    """
+    params = _get_query_params_dict()
+    if not params:
+        return False
+
+    reboot_requested = _is_truthy_query_value(params.get("rebootme")) or _is_truthy_query_value(params.get("reboot"))
+    if not reboot_requested:
+        return False
+
+    user = st.session_state.get("app_user") or {}
+    username = str(user.get("username") or "unknown")
+    role = str(user.get("role") or "")
+    org_code = str(user.get("org_code") or "default")
+    from_path = _is_truthy_query_value(params.get("reboot_from_path"))
+
+    required_token = str(os.environ.get("GENESYS_REBOOT_LINK_TOKEN") or "").strip()
+    incoming_token = str(params.get("reboot_token") or params.get("token") or "").strip()
+    token_ok = (not required_token) or (incoming_token == required_token)
+
+    if role != "Admin":
+        logger.warning("[REBOOT LINK] denied (role=%s user=%s org=%s)", role, username, org_code)
+        _clear_reboot_query_flags()
+        st.error("Reboot link yalnızca Admin kullanıcıları tarafından kullanılabilir.")
+        st.stop()
+
+    if not token_ok:
+        logger.warning("[REBOOT LINK] denied (invalid token) user=%s org=%s", username, org_code)
+        _clear_reboot_query_flags()
+        st.error("Reboot link token doğrulaması başarısız.")
+        st.stop()
+
+    logger.warning(
+        "[REBOOT LINK] requested by user=%s org=%s source=%s",
+        username,
+        org_code,
+        "path" if from_path else "query",
+    )
+    _append_reboot_event(
+        source="url-path" if from_path else "url-query",
+        username=username,
+        org_code=org_code,
+        note="Reboot link triggered from browser URL.",
+    )
+    _clear_reboot_query_flags()
+    st.success("Reboot link tetiklendi. Uygulama yeniden başlatılıyor...")
+    try:
+        pytime.sleep(0.6)
+    except Exception:
+        pass
+    _soft_memory_cleanup()
+    _silent_restart(reason="reboot-link")
+    return True
 
 def _soft_memory_cleanup():
     """Best-effort cleanup to reduce memory without visible user impact."""
@@ -1819,7 +2091,13 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                             store["restart_in_progress"] = True
                     if not restart_in_progress:
                         logger.warning(f"RSS memory {rss_mb:.1f}MB exceeds hard limit {MEMORY_HARD_LIMIT_MB}MB, triggering silent restart")
-                        _silent_restart()
+                        _append_reboot_event(
+                            source="auto-memory",
+                            username="system",
+                            org_code="system",
+                            note=f"RSS {rss_mb:.1f}MB >= hard limit {MEMORY_HARD_LIMIT_MB}MB",
+                        )
+                        _silent_restart(reason="memory-hard-limit")
                 
                 # Soft cleanup at lower threshold
                 if rss_mb >= MEMORY_LIMIT_MB and (pytime.time() - last_cleanup) > MEMORY_CLEANUP_COOLDOWN_SEC:
@@ -2666,6 +2944,7 @@ def log_to_console(message, level='error'):
     st.markdown(js_code, unsafe_allow_html=True)
 
 init_session_state()
+_inject_reboot_path_bridge_script()
 _maybe_periodic_temp_cleanup()
 if not _flush_pending_remember_me_delete():
     st.stop()
@@ -2870,6 +3149,9 @@ if st.session_state.get("app_user") and st.session_state.app_user.get("must_chan
                 else:
                     st.error(msg)
     st.stop()
+
+# --- URL-TRIGGERED REBOOT (ADMIN ONLY) ---
+_maybe_handle_reboot_link_request()
 
 # --- AUTO-LOGIN GENESYS ---
 if st.session_state.app_user:

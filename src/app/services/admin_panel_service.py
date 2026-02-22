@@ -8,7 +8,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
     bind_context(globals(), context)
     st.title(f"🛡️ {get_text(lang, 'admin_panel')}")
     
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama", "🧾 Kuyruk Üyelik Değişimleri"])
     
     with tab1:
         stats = monitor.get_stats()
@@ -91,12 +91,55 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
         _start_memory_monitor(sample_interval=10, max_samples=720)
         st.subheader("Uygulama Kontrol")
         st.warning("Bu işlem uygulamayı yeniden başlatır. Aktif kullanıcı oturumları kısa süreli kesilir.")
+        st.caption("URL tetikleme: `/rebootme` veya `/?rebootme=1` (yalnızca Admin oturumunda çalışır).")
+        st.caption("Opsiyonel güvenlik: `GENESYS_REBOOT_LINK_TOKEN` tanımlıysa URL'e `?token=...` eklenmelidir.")
         reboot_confirm = st.checkbox("Uygulamayı yeniden başlatmayı onaylıyorum", key="admin_reboot_confirm")
         if st.button("🔄 Uygulamayı Reboot Et", type="primary", key="admin_reboot_btn", disabled=not reboot_confirm):
-            admin_user = st.session_state.get('app_user', {}).get('username', 'unknown')
+            app_user = st.session_state.get('app_user', {}) or {}
+            admin_user = app_user.get('username', 'unknown')
+            admin_org = app_user.get('org_code', 'default')
             logger.warning(f"[ADMIN REBOOT] Restart requested by {admin_user}")
+            reboot_event_writer = globals().get("_append_reboot_event")
+            if callable(reboot_event_writer):
+                try:
+                    reboot_event_writer(
+                        source="admin-panel",
+                        username=admin_user,
+                        org_code=admin_org,
+                        note="Admin Panel reboot button.",
+                    )
+                except Exception:
+                    pass
+            st.success("Reboot isteği alındı. Uygulama yeniden başlatılıyor...")
             _soft_memory_cleanup()
-            _silent_restart()
+            _silent_restart(reason="admin-panel-button")
+
+        reboot_event_reader = globals().get("_get_reboot_events")
+        reboot_events = []
+        if callable(reboot_event_reader):
+            try:
+                reboot_events = reboot_event_reader(limit=50) or []
+            except Exception:
+                reboot_events = []
+        st.markdown("### 🗒️ Reboot Notları")
+        if reboot_events:
+            rows = []
+            for item in reboot_events:
+                if not isinstance(item, dict):
+                    continue
+                rows.append({
+                    "Tarih/Saat": item.get("timestamp") or "-",
+                    "Kaynak": item.get("source") or "-",
+                    "Kullanıcı": item.get("username") or "-",
+                    "Org": item.get("org_code") or "-",
+                    "Not": item.get("note") or "-",
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), width='stretch')
+            else:
+                st.info("Henüz reboot kaydı yok.")
+        else:
+            st.info("Henüz reboot kaydı yok.")
 
         st.divider()
         st.subheader("Sistem Durumu")
@@ -1217,8 +1260,9 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 if not isinstance(audit_cache_store, dict):
                                     audit_cache_store = {}
                                 st.session_state.admin_status_audit_cache = audit_cache_store
+
                                 audit_cache_key = (
-                                    f"{org}|{user_id_clean}|days:{int(audit_history_days)}|"
+                                    f"{org}|{user_id_clean}|mode:status|days:{int(audit_history_days)}|"
                                     f"pages:{int(audit_history_pages)}"
                                 )
                                 if audit_refresh_clicked and audit_cache_key in audit_cache_store:
@@ -1354,7 +1398,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                                 st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
                                             if audit_warning:
                                                 st.info(audit_warning)
-                            
+
                             # Groups
                             current_org = str(org or "").strip()
                             cached_groups_org = str(st.session_state.get("admin_groups_cache_org") or "").strip()
@@ -1687,6 +1731,439 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             st.warning(f"⚠️ Kullanıcı bulunamadı: `{user_id_clean}`")
                     except Exception as e:
                         st.error(f"❌ Hata: {e}")
+
+    with tab7:
+        st.subheader("🧾 Kuyruk Üyelik Değişimleri (Audit)")
+        st.caption(
+            "Bu sayfa kuyruk üyelik değişimlerini (ekleme, çıkarma, aktif/pasif) listeler. "
+            "Filtreler: değişen kullanıcı (etkilenen) ve değiştiren kullanıcı (actor)."
+        )
+        st.caption("Realtime audit endpoint 14 günle sınırlıdır; bu sayfa gerektiğinde async audit fallback kullanır.")
+
+        if not st.session_state.get("api_client"):
+            st.error("Bu özellik için Genesys Cloud bağlantısı gereklidir.")
+        else:
+            try:
+                offset_hours = _resolve_org_utc_offset_hours(org_code=org, default=3.0, force_reload=False)
+            except Exception:
+                offset_hours = 3.0
+            tz_local = timezone(timedelta(hours=float(offset_hours or 0)))
+            today_local = datetime.now(tz_local).date()
+            default_start_date = today_local - timedelta(days=3)
+
+            state_prefix = f"admin_queue_audit_tab7_{org}"
+            rows_key = f"{state_prefix}_rows"
+            meta_key = f"{state_prefix}_meta"
+
+            if not st.session_state.get("users_info") or not st.session_state.get("queues_map"):
+                try:
+                    recover_org_maps_if_needed(org, force=False)
+                except Exception:
+                    pass
+
+            cached_rows = st.session_state.get(rows_key) or []
+            user_options = [""]
+            user_labels = {"": "(Tümü)"}
+            users_info = st.session_state.get("users_info", {}) or {}
+            if isinstance(users_info, dict):
+                for uid, info in users_info.items():
+                    user_id_opt = str(uid or "").strip()
+                    if not user_id_opt:
+                        continue
+                    if user_id_opt not in user_options:
+                        user_options.append(user_id_opt)
+                    info_obj = info if isinstance(info, dict) else {}
+                    user_name_opt = str(info_obj.get("name") or info_obj.get("username") or user_id_opt).strip()
+                    user_labels[user_id_opt] = f"{user_name_opt} ({user_id_opt})"
+
+            if isinstance(cached_rows, list):
+                for row in cached_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    for id_key, name_key in (("Değiştiren ID", "Değiştiren"), ("Etkilenen ID", "Etkilenen")):
+                        uid_val = str(row.get(id_key) or "").strip()
+                        uname_val = str(row.get(name_key) or "").strip()
+                        if not uid_val or uid_val == "-":
+                            continue
+                        if uid_val not in user_options:
+                            user_options.append(uid_val)
+                        if uid_val not in user_labels:
+                            user_labels[uid_val] = f"{(uname_val or uid_val)} ({uid_val})"
+            user_options = [""] + sorted(
+                [opt for opt in user_options if opt],
+                key=lambda x: user_labels.get(x, x).lower(),
+            )
+
+            cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
+            with cfg_col1:
+                queue_start_date = st.date_input(
+                    "Başlangıç Tarihi",
+                    value=st.session_state.get(f"{state_prefix}_start_date", default_start_date),
+                    key=f"{state_prefix}_start_date",
+                )
+            with cfg_col2:
+                queue_end_date = st.date_input(
+                    "Bitiş Tarihi",
+                    value=st.session_state.get(f"{state_prefix}_end_date", today_local),
+                    key=f"{state_prefix}_end_date",
+                )
+            with cfg_col3:
+                queue_max_pages = int(
+                    st.number_input(
+                        "Maksimum Sayfa",
+                        min_value=1,
+                        max_value=50,
+                        value=int(st.session_state.get(f"{state_prefix}_max_pages", 8)),
+                        step=1,
+                        key=f"{state_prefix}_max_pages",
+                        help="Her sayfada en fazla 100 audit kaydı çekilir.",
+                    )
+                )
+
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                selected_target_user = st.selectbox(
+                    "Değişen Kullanıcı (Etkilenen) Filtresi",
+                    options=user_options,
+                    format_func=lambda x: user_labels.get(x, x),
+                    key=f"{state_prefix}_target_filter",
+                )
+            with filter_col2:
+                selected_actor_user = st.selectbox(
+                    "Değiştiren Kullanıcı (Actor) Filtresi",
+                    options=user_options,
+                    format_func=lambda x: user_labels.get(x, x),
+                    key=f"{state_prefix}_actor_filter",
+                )
+
+            default_operations = [
+                "Eklendi",
+                "Çıkarıldı",
+                "Aktif Yapıldı",
+                "Pasif Yapıldı",
+                "Durum Güncellendi",
+                "Güncellendi",
+            ]
+            operation_options = list(default_operations)
+            if isinstance(cached_rows, list):
+                dynamic_ops = sorted(
+                    {
+                        str(row.get("İşlem") or "").strip()
+                        for row in cached_rows
+                        if isinstance(row, dict) and str(row.get("İşlem") or "").strip()
+                    }
+                )
+                for op_name in dynamic_ops:
+                    if op_name not in operation_options:
+                        operation_options.append(op_name)
+            selected_operations = st.multiselect(
+                "İşlem Filtresi",
+                options=operation_options,
+                default=operation_options,
+                key=f"{state_prefix}_operation_filter",
+            )
+
+            queue_search_input = str(st.text_input(
+                "Kuyruk Ara (Ad veya ID)",
+                placeholder="Örn: Yeni_KibrisOtel",
+                key=f"{state_prefix}_queue_search",
+            ) or "").strip()
+            queue_search_token = queue_search_input.lower()
+
+            action_col1, action_col2 = st.columns(2)
+            with action_col1:
+                run_query_clicked = st.button(
+                    "🔎 Audit Sorgusunu Çalıştır",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"{state_prefix}_run_btn",
+                )
+            with action_col2:
+                clear_results_clicked = st.button(
+                    "🧹 Sonucu Temizle",
+                    use_container_width=True,
+                    key=f"{state_prefix}_clear_btn",
+                )
+
+            if clear_results_clicked:
+                st.session_state.pop(rows_key, None)
+                st.session_state.pop(meta_key, None)
+                st.rerun()
+
+            if run_query_clicked:
+                queue_date_invalid = False
+                if queue_end_date < queue_start_date:
+                    st.error("Bitiş tarihi başlangıç tarihinden önce olamaz.")
+                    queue_date_invalid = True
+
+                if queue_date_invalid:
+                    st.session_state[rows_key] = []
+                    st.session_state[meta_key] = {
+                        "executed": False,
+                        "range_text": f"{queue_start_date.isoformat()} - {queue_end_date.isoformat()}",
+                    }
+                else:
+                    try:
+                        if ((queue_end_date - queue_start_date).days + 1) > 14:
+                            st.info("14 günden uzun aralık seçildi. Realtime + async fallback ile sorgu çalıştırılıyor, işlem daha uzun sürebilir.")
+                        start_local_dt = datetime(
+                            queue_start_date.year,
+                            queue_start_date.month,
+                            queue_start_date.day,
+                            0,
+                            0,
+                            0,
+                            tzinfo=tz_local,
+                        )
+                        end_local_dt = datetime(
+                            queue_end_date.year,
+                            queue_end_date.month,
+                            queue_end_date.day,
+                            23,
+                            59,
+                            59,
+                            tzinfo=tz_local,
+                        )
+                        queue_api = GenesysAPI(st.session_state.api_client)
+                        queue_filter_ids = []
+                        if queue_search_token:
+                            queues_map_state = st.session_state.get("queues_map", {}) or {}
+                            if isinstance(queues_map_state, dict):
+                                for queue_name_raw, queue_id_raw in queues_map_state.items():
+                                    queue_name_s = str(queue_name_raw or "").strip().lower()
+                                    queue_id_s = str(queue_id_raw or "").strip()
+                                    if not queue_id_s:
+                                        continue
+                                    queue_id_l = queue_id_s.lower()
+                                    if (
+                                        (queue_search_token in queue_name_s)
+                                        or (queue_search_token == queue_id_l)
+                                        or (queue_search_token in queue_id_l)
+                                    ):
+                                        queue_filter_ids.append(queue_id_s)
+                            queue_filter_ids = sorted({str(qid).strip() for qid in queue_filter_ids if str(qid).strip()})
+
+                        with st.spinner("Kuyruk üyelik audit kayıtları getiriliyor..."):
+                            audit_payload = queue_api.get_queue_membership_audit_logs(
+                                start_date=start_local_dt,
+                                end_date=end_local_dt,
+                                page_size=100,
+                                max_pages=int(queue_max_pages),
+                                service_name="Routing",
+                                actor_user_id=selected_actor_user or None,
+                                affected_user_id=selected_target_user or None,
+                                queue_ids=queue_filter_ids or None,
+                                queue_text=queue_search_input or None,
+                            )
+                            entities = (audit_payload or {}).get("entities") or []
+                            query_error = (audit_payload or {}).get("_error")
+                            query_warning = str((audit_payload or {}).get("_warning") or "").strip()
+                            query_attempts = (audit_payload or {}).get("_attempts") or []
+                            raw_preview_rows = []
+                            for item in entities[:120]:
+                                if not isinstance(item, dict):
+                                    continue
+                                actor_obj = item.get("user") or {}
+                                actor_id = str(actor_obj.get("id") or "").strip()
+                                actor_name = _resolve_user_label(
+                                    user_id=actor_id,
+                                    users_info=st.session_state.get("users_info", {}),
+                                    fallback_name=actor_obj.get("name") or actor_obj.get("displayName"),
+                                )
+                                entity_obj = item.get("entity") or {}
+                                message_obj = item.get("message") or {}
+                                raw_preview_rows.append({
+                                    "Zaman": _format_iso_with_utc_offset(item.get("eventDate"), utc_offset_hours=offset_hours),
+                                    "Servis": item.get("serviceName") or "-",
+                                    "Aksiyon": item.get("action") or "-",
+                                    "EntityType": item.get("entityType") or "-",
+                                    "EntityId": entity_obj.get("id") if isinstance(entity_obj, dict) else "-",
+                                    "Değiştiren": actor_name,
+                                    "Değiştiren ID": actor_id or "-",
+                                    "Mesaj": (
+                                        message_obj.get("message")
+                                        or message_obj.get("messageWithParams")
+                                        or "-"
+                                    ) if isinstance(message_obj, dict) else "-",
+                                    "Audit ID": item.get("id") or "-",
+                                })
+
+                            queue_name_map = {}
+                            queue_map_state = st.session_state.get("queues_map", {}) or {}
+                            if isinstance(queue_map_state, dict):
+                                for queue_name, queue_id in queue_map_state.items():
+                                    queue_id_s = str(queue_id or "").strip()
+                                    queue_name_s = str(queue_name or queue_id_s).strip() or queue_id_s
+                                    if queue_id_s:
+                                        queue_name_map[queue_id_s] = queue_name_s
+                            if not queue_name_map:
+                                try:
+                                    queue_entities = queue_api.get_queues() or []
+                                    queue_name_map = {
+                                        str(item.get("id")): str(item.get("name") or item.get("id"))
+                                        for item in queue_entities
+                                        if isinstance(item, dict) and item.get("id")
+                                    }
+                                except Exception:
+                                    queue_name_map = {}
+
+                            rows = _build_status_audit_rows(
+                                audit_entities=entities,
+                                target_user_id=None,
+                                users_info=st.session_state.get("users_info", {}),
+                                presence_map=st.session_state.get("presence_map", {}),
+                                utc_offset_hours=offset_hours,
+                                audit_mode="queue_membership",
+                                queue_name_map=queue_name_map,
+                            )
+                            for row in rows:
+                                if not isinstance(row, dict):
+                                    continue
+                                target_id = str(row.get("Etkilenen ID") or "").strip()
+                                row["Etkilenen"] = _resolve_user_label(
+                                    user_id=target_id,
+                                    users_info=st.session_state.get("users_info", {}),
+                                    fallback_name=row.get("Etkilenen"),
+                                )
+                            rows = sorted(
+                                [row for row in rows if isinstance(row, dict)],
+                                key=lambda row: str(row.get("Zaman") or ""),
+                                reverse=True,
+                            )
+
+                        st.session_state[rows_key] = rows
+                        st.session_state[meta_key] = {
+                            "executed": True,
+                            "source": str((audit_payload or {}).get("source") or "-"),
+                            "service_name": str((audit_payload or {}).get("service_name") or "-"),
+                            "filter_variant": (audit_payload or {}).get("filter_variant") or [],
+                            "attempts": query_attempts,
+                            "warning": query_warning,
+                            "error": query_error,
+                            "range_text": f"{queue_start_date.isoformat()} - {queue_end_date.isoformat()}",
+                            "result_count": len(rows),
+                            "raw_entity_count": len(entities),
+                            "raw_preview_rows": raw_preview_rows,
+                            "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    except Exception as qe:
+                        st.session_state[rows_key] = []
+                        st.session_state[meta_key] = {
+                            "executed": True,
+                            "error": str(qe),
+                            "range_text": f"{queue_start_date.isoformat()} - {queue_end_date.isoformat()}",
+                            "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+
+            rows_all = st.session_state.get(rows_key) or []
+            meta = st.session_state.get(meta_key) or {}
+
+            if meta.get("error"):
+                st.warning(f"Audit sorgusunda hata oluştu.\n\nHata detayı: {meta.get('error')}")
+            if meta.get("warning"):
+                st.info(str(meta.get("warning")))
+            if meta.get("executed") and meta.get("ran_at"):
+                st.caption(f"Son sorgu zamanı: {meta.get('ran_at')}")
+            if meta.get("executed"):
+                st.caption(
+                    f"Ham audit kaydı: {int(meta.get('raw_entity_count') or 0)} | "
+                    f"Parse edilen satır: {int(meta.get('result_count') or 0)}"
+                )
+                attempts = meta.get("attempts") or []
+                if attempts:
+                    st.caption(f"Sorgu denemesi: {len(attempts)}")
+                    with st.expander("Sorgu Diagnostiği", expanded=False):
+                        st.dataframe(pd.DataFrame(attempts), width='stretch')
+
+            if not rows_all:
+                if meta.get("executed"):
+                    raw_count = int(meta.get("raw_entity_count") or 0)
+                    if raw_count > 0:
+                        st.warning(
+                            f"Sorgu çalıştırıldı, {raw_count} ham audit kaydı bulundu ancak kuyruk üyelik satırına parse edilemedi."
+                        )
+                        raw_preview_rows = meta.get("raw_preview_rows") or []
+                        if raw_preview_rows:
+                            st.dataframe(pd.DataFrame(raw_preview_rows), width='stretch')
+                    else:
+                        st.info(
+                            "Sorgu çalıştırıldı ancak kayıt bulunamadı. "
+                            "Tarih aralığını genişletip veya filtreleri azaltıp tekrar deneyin."
+                        )
+                else:
+                    st.info("Henüz sonuç yok. Tarih aralığını seçip sorguyu çalıştırın.")
+            else:
+                selected_target_user = str(selected_target_user or "").strip()
+                selected_actor_user = str(selected_actor_user or "").strip()
+                selected_operations = [
+                    str(op or "").strip()
+                    for op in (selected_operations or [])
+                    if str(op or "").strip()
+                ]
+
+                filtered_rows = []
+                for row in rows_all:
+                    if not isinstance(row, dict):
+                        continue
+                    if selected_target_user and str(row.get("Etkilenen ID") or "").strip() != selected_target_user:
+                        continue
+                    if selected_actor_user and str(row.get("Değiştiren ID") or "").strip() != selected_actor_user:
+                        continue
+                    if selected_operations and str(row.get("İşlem") or "").strip() not in selected_operations:
+                        continue
+                    if queue_search_token:
+                        queue_name = str(row.get("Kuyruk") or "").strip().lower()
+                        queue_id = str(row.get("Kuyruk ID") or "").strip().lower()
+                        queue_summary = str(row.get("Özet") or "").strip().lower()
+                        queue_message = str(row.get("Mesaj") or "").strip().lower()
+                        if (
+                            (queue_search_token not in queue_name)
+                            and (queue_search_token not in queue_id)
+                            and (queue_search_token not in queue_summary)
+                            and (queue_search_token not in queue_message)
+                        ):
+                            continue
+                    filtered_rows.append(row)
+
+                if not filtered_rows:
+                    st.info("Seçilen filtrelere uygun kuyruk üyelik kaydı bulunamadı.")
+                else:
+                    df_queue_history = pd.DataFrame(filtered_rows)
+                    preferred_cols = [
+                        "Zaman",
+                        "Özet",
+                        "İşlem",
+                        "Kuyruk",
+                        "Kuyruk ID",
+                        "Etkilenen",
+                        "Etkilenen ID",
+                        "Değiştiren",
+                        "Değiştiren ID",
+                        "Servis",
+                        "Aksiyon",
+                        "Alan",
+                        "Eski Değer",
+                        "Yeni Değer",
+                        "Mesaj",
+                        "Audit ID",
+                    ]
+                    visible_cols = [c for c in preferred_cols if c in df_queue_history.columns]
+                    visible_cols.extend([c for c in df_queue_history.columns if c not in visible_cols])
+                    df_queue_history = df_queue_history[visible_cols]
+
+                    st.success(f"{len(df_queue_history)} adet kuyruk üyelik kaydı listeleniyor.")
+                    st.caption(
+                        f"Kaynak: `{meta.get('source', '-')}` | Servis: `{meta.get('service_name', '-')}` "
+                        f"| Aralık: `{meta.get('range_text', '-')}`"
+                    )
+                    st.dataframe(df_queue_history, width='stretch')
+                    st.download_button(
+                        "📥 Kuyruk Üyelik Geçmişini CSV İndir",
+                        data=df_queue_history.to_csv(index=False).encode("utf-8"),
+                        file_name=f"queue_history_{org}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key=f"{state_prefix}_download_csv",
+                    )
 
     # Logout moved to Organization Settings
     
