@@ -2073,7 +2073,25 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 if attempts:
                     st.caption(f"Sorgu denemesi: {len(attempts)}")
                     with st.expander("Sorgu Diagnostiği", expanded=False):
-                        st.dataframe(pd.DataFrame(attempts), width='stretch')
+                        attempt_rows = []
+                        for item in attempts:
+                            if not isinstance(item, dict):
+                                continue
+                            row = dict(item)
+                            filters_val = row.get("filters")
+                            if isinstance(filters_val, list):
+                                filters_text = ", ".join(
+                                    f"{str(f.get('property') or '').strip()}={str(f.get('value') or '').strip()}"
+                                    for f in filters_val
+                                    if isinstance(f, dict)
+                                    and str(f.get("property") or "").strip()
+                                    and str(f.get("value") or "").strip()
+                                )
+                                row["filters"] = filters_text or "-"
+                            else:
+                                row["filters"] = str(filters_val or "-")
+                            attempt_rows.append(row)
+                        st.dataframe(pd.DataFrame(attempt_rows), width='stretch')
 
             if not rows_all:
                 if meta.get("executed"):

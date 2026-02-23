@@ -2265,6 +2265,15 @@ class GenesysAPI:
                 "error": str(error_val or "").strip(),
             })
 
+        def _is_action_requires_entitytype_error(error_value):
+            text = str(error_value or "").strip().lower()
+            if not text:
+                return False
+            return (
+                ("supplying an action" in text and "supply entitytype" in text)
+                or ("action" in text and "entitytype" in text and "illegalqueryexception" in text)
+            )
+
         interval = f"{_to_utc_iso(start_date)}/{_to_utc_iso(end_date)}"
         pages_to_scan = max(1, int(max_pages or 1))
         size = max(1, min(int(page_size or 100), 500))
@@ -2422,10 +2431,27 @@ class GenesysAPI:
             if len(action_candidates) >= 10:
                 break
 
+        service_entity_candidates = {}
+        for candidate in mapping_candidates:
+            svc_key = str(candidate.get("service") or "").strip().lower()
+            entity_name = str(candidate.get("entity") or "").strip()
+            if (not svc_key) or (not entity_name):
+                continue
+            bucket = service_entity_candidates.setdefault(svc_key, [])
+            if entity_name not in bucket:
+                bucket.append(entity_name)
+
         for scan_service_name in service_candidates:
             broad_variants = [None]
-            for action_name in action_candidates[:6]:
-                broad_variants.append([{"property": "Action", "value": action_name}])
+            scan_service_key = str(scan_service_name or "").strip().lower()
+            entity_candidates = service_entity_candidates.get(scan_service_key, [])
+            if scan_service_name and entity_candidates:
+                for action_name in action_candidates[:6]:
+                    for entity_name in entity_candidates[:3]:
+                        broad_variants.append([
+                            {"property": "EntityType", "value": entity_name},
+                            {"property": "Action", "value": action_name},
+                        ])
 
             for broad_filter in broad_variants:
                 request_filter_variants = []
@@ -2485,6 +2511,7 @@ class GenesysAPI:
                             ("unknown entitytype" in err_lower)
                             or ("servicename is expected when passing entitytype" in err_lower)
                             or ("unknown servicename" in err_lower)
+                            or _is_action_requires_entitytype_error(err_lower)
                         ):
                             continue
                         last_error = resp.get("_error")
@@ -2574,8 +2601,15 @@ class GenesysAPI:
         # Async pass 2: broad service scans.
         for scan_service_name in service_candidates:
             broad_variants = [None]
-            for action_name in action_candidates[:6]:
-                broad_variants.append([{"property": "Action", "value": action_name}])
+            scan_service_key = str(scan_service_name or "").strip().lower()
+            entity_candidates = service_entity_candidates.get(scan_service_key, [])
+            if scan_service_name and entity_candidates:
+                for action_name in action_candidates[:6]:
+                    for entity_name in entity_candidates[:3]:
+                        broad_variants.append([
+                            {"property": "EntityType", "value": entity_name},
+                            {"property": "Action", "value": action_name},
+                        ])
 
             for broad_filter in broad_variants:
                 request_filter_variants = []
@@ -2630,6 +2664,14 @@ class GenesysAPI:
                         return result
 
                     if resp.get("_error"):
+                        err_lower = str(resp.get("_error") or "").lower()
+                        if (
+                            ("unknown entitytype" in err_lower)
+                            or ("servicename is expected when passing entitytype" in err_lower)
+                            or ("unknown servicename" in err_lower)
+                            or _is_action_requires_entitytype_error(err_lower)
+                        ):
+                            continue
                         last_error = resp.get("_error")
 
         return {
