@@ -1,11 +1,127 @@
+import time
 from typing import Any, Dict
 
 from src.app.context import bind_context
 
 
+ADMIN_STATUS_AUDIT_CACHE_TTL_SECONDS = 1800
+ADMIN_STATUS_AUDIT_CACHE_MAX_ENTRIES = 20
+ADMIN_QUEUE_AUDIT_CACHE_TTL_SECONDS = 1800
+ADMIN_QUEUE_AUDIT_MAX_ATTEMPTS = 40
+ADMIN_QUEUE_AUDIT_MAX_PREVIEW_ROWS = 80
+ADMIN_QUEUE_AUDIT_MAX_ROWS = 5000
+
+
+def _trim_attempts_for_storage(attempts, max_items=ADMIN_QUEUE_AUDIT_MAX_ATTEMPTS, max_filters=8, max_error_len=280):
+    trimmed = []
+    if not isinstance(attempts, list):
+        return trimmed
+    for item in attempts[: max(1, int(max_items or 1))]:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        filters_val = row.get("filters")
+        if isinstance(filters_val, list):
+            compact_filters = []
+            for f in filters_val[: max(1, int(max_filters or 1))]:
+                if not isinstance(f, dict):
+                    continue
+                prop = str(f.get("property") or "").strip()
+                value = str(f.get("value") or "").strip()
+                if not prop or not value:
+                    continue
+                compact_filters.append({"property": prop, "value": value})
+            row["filters"] = compact_filters
+        err = str(row.get("error") or "").strip()
+        if len(err) > max_error_len:
+            row["error"] = err[: max_error_len - 3] + "..."
+        trimmed.append(row)
+    return trimmed
+
+
+def _prune_admin_runtime_caches(session_state, current_org):
+    """Trim admin panel session caches to avoid long-running session bloat."""
+    now_ts = time.time()
+
+    # 1) Status audit cache: TTL + max entry bound.
+    status_cache = session_state.get("admin_status_audit_cache")
+    if isinstance(status_cache, dict):
+        cleaned = {}
+        indexed = []
+        for key, payload in status_cache.items():
+            if not isinstance(payload, dict):
+                continue
+            cached_at = float(payload.get("_cached_at_ts", 0) or 0)
+            if cached_at <= 0:
+                cached_at = now_ts
+                payload = dict(payload)
+                payload["_cached_at_ts"] = cached_at
+            if (now_ts - cached_at) > ADMIN_STATUS_AUDIT_CACHE_TTL_SECONDS:
+                continue
+            payload = dict(payload)
+            payload["_attempts"] = _trim_attempts_for_storage(payload.get("_attempts"))
+            cleaned[key] = payload
+            indexed.append((key, cached_at))
+
+        if len(cleaned) > ADMIN_STATUS_AUDIT_CACHE_MAX_ENTRIES:
+            keep_keys = {
+                key
+                for key, _ in sorted(indexed, key=lambda kv: kv[1], reverse=True)[:ADMIN_STATUS_AUDIT_CACHE_MAX_ENTRIES]
+            }
+            cleaned = {k: v for k, v in cleaned.items() if k in keep_keys}
+        session_state["admin_status_audit_cache"] = cleaned
+
+    # 2) Queue audit tab cache (per org): bound row/attempt/preview sizes + TTL for stale org keys.
+    queue_meta_keys = [
+        key
+        for key in list(session_state.keys())
+        if key.startswith("admin_queue_audit_tab7_") and key.endswith("_meta")
+    ]
+    for meta_key in queue_meta_keys:
+        meta = session_state.get(meta_key) or {}
+        if not isinstance(meta, dict):
+            continue
+
+        cached_at = float(meta.get("_cached_at_ts", 0) or 0)
+        if cached_at <= 0:
+            cached_at = now_ts
+            meta = dict(meta)
+            meta["_cached_at_ts"] = cached_at
+
+        is_current_org_key = meta_key.startswith(f"admin_queue_audit_tab7_{str(current_org or '').strip()}_")
+        if (not is_current_org_key) and ((now_ts - cached_at) > ADMIN_QUEUE_AUDIT_CACHE_TTL_SECONDS):
+            session_state.pop(meta_key, None)
+            rows_key = meta_key[:-5] + "_rows"
+            session_state.pop(rows_key, None)
+            continue
+
+        attempts = _trim_attempts_for_storage(meta.get("attempts"))
+        raw_preview_rows = meta.get("raw_preview_rows")
+        if isinstance(raw_preview_rows, list):
+            raw_preview_rows = raw_preview_rows[:ADMIN_QUEUE_AUDIT_MAX_PREVIEW_ROWS]
+        else:
+            raw_preview_rows = []
+        meta["attempts"] = attempts
+        meta["raw_preview_rows"] = raw_preview_rows
+        session_state[meta_key] = meta
+
+        rows_key = meta_key[:-5] + "_rows"
+        rows = session_state.get(rows_key)
+        if isinstance(rows, list) and len(rows) > ADMIN_QUEUE_AUDIT_MAX_ROWS:
+            session_state[rows_key] = rows[:ADMIN_QUEUE_AUDIT_MAX_ROWS]
+            meta["warning"] = str(meta.get("warning") or "").strip() or (
+                f"Sonuçlar bellek koruması için ilk {ADMIN_QUEUE_AUDIT_MAX_ROWS} satır ile sınırlandı."
+            )
+            meta["_rows_truncated"] = True
+            meta["_rows_original_count"] = len(rows)
+            session_state[meta_key] = meta
+
+
 def render_admin_panel_service(context: Dict[str, Any]) -> None:
     """Render admin panel page using injected app context."""
     bind_context(globals(), context)
+    current_org = str((st.session_state.get("app_user") or {}).get("org_code") or globals().get("org") or "default").strip() or "default"
+    _prune_admin_runtime_caches(st.session_state, current_org)
     st.title(f"🛡️ {get_text(lang, 'admin_panel')}")
     
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama", "🧾 Kuyruk Üyelik Değişimleri"])
@@ -1302,7 +1418,10 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                                 audit_payload = fallback_payload
                                             elif (fallback_payload or {}).get("_error") and not (audit_payload or {}).get("_error"):
                                                 audit_payload = fallback_payload
-                                    audit_cache_store[audit_cache_key] = audit_payload or {}
+                                    cache_payload = dict(audit_payload or {})
+                                    cache_payload["_cached_at_ts"] = time.time()
+                                    cache_payload["_attempts"] = _trim_attempts_for_storage(cache_payload.get("_attempts"))
+                                    audit_cache_store[audit_cache_key] = cache_payload
                                     st.session_state.admin_status_audit_cache = audit_cache_store
 
                                 audit_payload = audit_cache_store.get(audit_cache_key) or {}
@@ -1901,6 +2020,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                     st.session_state[meta_key] = {
                         "executed": False,
                         "range_text": f"{queue_start_date.isoformat()} - {queue_end_date.isoformat()}",
+                        "_cached_at_ts": time.time(),
                     }
                 else:
                     try:
@@ -1958,9 +2078,9 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             entities = (audit_payload or {}).get("entities") or []
                             query_error = (audit_payload or {}).get("_error")
                             query_warning = str((audit_payload or {}).get("_warning") or "").strip()
-                            query_attempts = (audit_payload or {}).get("_attempts") or []
+                            query_attempts = _trim_attempts_for_storage((audit_payload or {}).get("_attempts"))
                             raw_preview_rows = []
-                            for item in entities[:120]:
+                            for item in entities[:ADMIN_QUEUE_AUDIT_MAX_PREVIEW_ROWS]:
                                 if not isinstance(item, dict):
                                     continue
                                 actor_obj = item.get("user") or {}
@@ -2030,6 +2150,11 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 key=lambda row: str(row.get("Zaman") or ""),
                                 reverse=True,
                             )
+                            if len(rows) > ADMIN_QUEUE_AUDIT_MAX_ROWS:
+                                rows = rows[:ADMIN_QUEUE_AUDIT_MAX_ROWS]
+                                query_warning = (query_warning + " " if query_warning else "") + (
+                                    f"Sonuçlar bellek koruması için ilk {ADMIN_QUEUE_AUDIT_MAX_ROWS} satır ile sınırlandı."
+                                )
 
                         st.session_state[rows_key] = rows
                         st.session_state[meta_key] = {
@@ -2045,6 +2170,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "raw_entity_count": len(entities),
                             "raw_preview_rows": raw_preview_rows,
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
+                            "_cached_at_ts": time.time(),
                         }
                     except Exception as qe:
                         st.session_state[rows_key] = []
@@ -2053,6 +2179,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "error": str(qe),
                             "range_text": f"{queue_start_date.isoformat()} - {queue_end_date.isoformat()}",
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
+                            "_cached_at_ts": time.time(),
                         }
 
             rows_all = st.session_state.get(rows_key) or []

@@ -88,6 +88,36 @@ TEMP_FILE_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MAX_AGE_HOURS"
 TEMP_FILE_MANUAL_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MANUAL_MAX_AGE_HOURS", "0"))
 TEMP_KEEP_RECENT_SECONDS = int(os.environ.get("GENESYS_TEMP_KEEP_RECENT_SECONDS", "120"))
 
+
+def _resolve_periodic_reboot_interval_seconds():
+    raw_seconds = str(os.environ.get("GENESYS_PERIODIC_REBOOT_INTERVAL_SECONDS", "") or "").strip()
+    if raw_seconds:
+        try:
+            return max(0, int(float(raw_seconds)))
+        except Exception:
+            pass
+    raw_hours = str(os.environ.get("GENESYS_PERIODIC_REBOOT_HOURS", "12") or "").strip()
+    try:
+        hours = float(raw_hours)
+    except Exception:
+        hours = 12.0
+    if hours <= 0:
+        return 0
+    return max(0, int(hours * 3600))
+
+
+def _resolve_periodic_reboot_check_seconds():
+    raw = str(os.environ.get("GENESYS_PERIODIC_REBOOT_CHECK_SECONDS", "15") or "").strip()
+    try:
+        value = int(float(raw))
+    except Exception:
+        value = 15
+    return max(5, min(60, value))
+
+
+PERIODIC_REBOOT_INTERVAL_SECONDS = _resolve_periodic_reboot_interval_seconds()
+PERIODIC_REBOOT_CHECK_SECONDS = _resolve_periodic_reboot_check_seconds()
+
 def _setup_logging():
     logger = logging.getLogger("genesys_app")
     if logger.handlers:
@@ -1547,6 +1577,18 @@ def _shared_memory_store():
     }
 
 @st.cache_resource(show_spinner=False)
+def _shared_periodic_reboot_store():
+    return {
+        "lock": threading.Lock(),
+        "thread": None,
+        "stop_event": threading.Event(),
+        "interval_seconds": 0,
+        "started_at_ts": 0.0,
+        "next_reboot_ts": 0.0,
+        "restart_in_progress": False,
+    }
+
+@st.cache_resource(show_spinner=False)
 def _shared_reboot_event_store():
     return {"lock": threading.Lock()}
 
@@ -2188,6 +2230,80 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
         store["thread"] = t
         t.start()
     return store
+
+
+def _start_periodic_reboot_scheduler():
+    """Start a single background scheduler that triggers silent reboot periodically."""
+    interval_s = max(0, int(PERIODIC_REBOOT_INTERVAL_SECONDS or 0))
+    if interval_s <= 0:
+        return None
+
+    store = _shared_periodic_reboot_store()
+    with store["lock"]:
+        existing = store.get("thread")
+        if existing and existing.is_alive():
+            # Keep runtime-configurable interval in sync if env changed.
+            old_interval = int(store.get("interval_seconds") or 0)
+            if old_interval != interval_s:
+                store["interval_seconds"] = interval_s
+                store["next_reboot_ts"] = pytime.time() + interval_s
+            return store
+
+        store["stop_event"].clear()
+        now_ts = pytime.time()
+        store["interval_seconds"] = interval_s
+        store["started_at_ts"] = now_ts
+        store["next_reboot_ts"] = now_ts + interval_s
+        store["restart_in_progress"] = False
+
+        def run():
+            check_s = max(5, int(PERIODIC_REBOOT_CHECK_SECONDS or 15))
+            while not store["stop_event"].is_set():
+                now_inner = pytime.time()
+                with store["lock"]:
+                    next_ts = float(store.get("next_reboot_ts", 0) or 0)
+                    current_interval = max(1, int(store.get("interval_seconds") or interval_s))
+                    in_progress = bool(store.get("restart_in_progress"))
+
+                if (not in_progress) and next_ts and now_inner >= next_ts:
+                    acquired = False
+                    with store["lock"]:
+                        if not store.get("restart_in_progress"):
+                            store["restart_in_progress"] = True
+                            acquired = True
+
+                    if acquired:
+                        interval_hours = current_interval / 3600.0
+                        logger.warning(
+                            "Periodic reboot interval reached (%.2fh / %ss). Triggering restart.",
+                            interval_hours,
+                            current_interval,
+                        )
+                        try:
+                            _append_reboot_event(
+                                source="auto-periodic",
+                                username="system",
+                                org_code="system",
+                                note=f"Periodic reboot triggered after {interval_hours:.2f}h interval.",
+                            )
+                        except Exception:
+                            pass
+                        _silent_restart(reason="auto-periodic")
+                        # Safety fallback if process did not exit for any reason.
+                        with store["lock"]:
+                            store["next_reboot_ts"] = pytime.time() + current_interval
+                            store["restart_in_progress"] = False
+
+                for _ in range(max(1, check_s * 5)):
+                    if store["stop_event"].is_set():
+                        break
+                    pytime.sleep(0.2)
+
+        thread = threading.Thread(target=run, daemon=True, name="periodic-reboot-scheduler")
+        store["thread"] = thread
+        thread.start()
+    return store
+
 
 def _ensure_seed_org(store, org_code, max_orgs=20):
     # Enforce max orgs to prevent memory bloat from abandoned orgs
@@ -3020,6 +3136,7 @@ def log_to_console(message, level='error'):
 
 init_session_state()
 _inject_reboot_path_bridge_script()
+_start_periodic_reboot_scheduler()
 _maybe_periodic_temp_cleanup()
 _cookie_flow_blocking = not bool(st.session_state.get("app_user"))
 _flush_pending_remember_me_delete(block_ui=_cookie_flow_blocking)
