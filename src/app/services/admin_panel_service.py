@@ -2009,7 +2009,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
 
                             rows = _build_status_audit_rows(
                                 audit_entities=entities,
-                                target_user_id=None,
+                                target_user_id=selected_target_user or None,
                                 users_info=st.session_state.get("users_info", {}),
                                 presence_map=st.session_state.get("presence_map", {}),
                                 utc_offset_hours=offset_hours,
@@ -2095,6 +2095,8 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             else:
                 selected_target_user = str(selected_target_user or "").strip()
                 selected_actor_user = str(selected_actor_user or "").strip()
+                selected_target_user_lower = selected_target_user.lower()
+                selected_actor_user_lower = selected_actor_user.lower()
                 selected_operations = [
                     str(op or "").strip()
                     for op in (selected_operations or [])
@@ -2105,9 +2107,9 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 for row in rows_all:
                     if not isinstance(row, dict):
                         continue
-                    if selected_target_user and str(row.get("Etkilenen ID") or "").strip() != selected_target_user:
+                    if selected_target_user and str(row.get("Etkilenen ID") or "").strip().lower() != selected_target_user_lower:
                         continue
-                    if selected_actor_user and str(row.get("Değiştiren ID") or "").strip() != selected_actor_user:
+                    if selected_actor_user and str(row.get("Değiştiren ID") or "").strip().lower() != selected_actor_user_lower:
                         continue
                     if selected_operations and str(row.get("İşlem") or "").strip() not in selected_operations:
                         continue

@@ -482,6 +482,8 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
             return "Durum Güncellendi"
         return "Güncellendi"
 
+    global_seen_keys = set()
+
     for audit in audit_entities:
         if not isinstance(audit, dict):
             continue
@@ -522,9 +524,11 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                 queue_uuid_set.add(qid_ref.lower())
 
         target_candidates_ordered = []
+        target_candidate_scores = {}
+        target_candidate_order = {}
         target_candidates_seen = set()
 
-        def _add_target_candidate(value):
+        def _add_target_candidate(value, score=1):
             uid = str(value or "").strip()
             if not _looks_like_uuid(uid):
                 return
@@ -533,13 +537,21 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                 return
             if uid_lower in queue_uuid_set:
                 return
+            try:
+                score_value = int(score)
+            except Exception:
+                score_value = 1
+            if score_value < 1:
+                score_value = 1
+            target_candidate_scores[uid_lower] = int(target_candidate_scores.get(uid_lower, 0) or 0) + score_value
             if uid_lower in target_candidates_seen:
                 return
             target_candidates_seen.add(uid_lower)
+            target_candidate_order[uid_lower] = len(target_candidates_ordered)
             target_candidates_ordered.append(uid)
 
         for uid in sorted(context_target_ids):
-            _add_target_candidate(uid)
+            _add_target_candidate(uid, score=4)
 
         if _looks_like_uuid(entity_id):
             if (
@@ -548,7 +560,7 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                 or ("agent" in entity_type)
                 or ("member" in entity_type)
             ):
-                _add_target_candidate(entity_id)
+                _add_target_candidate(entity_id, score=5)
 
         for ch in property_changes:
             if not isinstance(ch, dict):
@@ -563,24 +575,24 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
             ):
                 continue
             for uid in _extract_uuids(prop_name):
-                _add_target_candidate(uid)
+                _add_target_candidate(uid, score=6)
             for uid in _extract_uuids(ch.get("newValues")):
-                _add_target_candidate(uid)
+                _add_target_candidate(uid, score=6)
             for uid in _extract_uuids(ch.get("oldValues")):
-                _add_target_candidate(uid)
+                _add_target_candidate(uid, score=6)
 
         for ec in entity_changes:
             if not isinstance(ec, dict):
                 continue
             ec_type = str(ec.get("entityType") or "").strip().lower()
             if ("user" in ec_type) or ("agent" in ec_type) or ("member" in ec_type):
-                _add_target_candidate(ec.get("entityId"))
+                _add_target_candidate(ec.get("entityId"), score=5)
                 for uid in _extract_uuids(ec.get("entityName")):
-                    _add_target_candidate(uid)
+                    _add_target_candidate(uid, score=4)
                 for uid in _extract_uuids(ec.get("newValues")):
-                    _add_target_candidate(uid)
+                    _add_target_candidate(uid, score=5)
                 for uid in _extract_uuids(ec.get("oldValues")):
-                    _add_target_candidate(uid)
+                    _add_target_candidate(uid, score=5)
 
         if not target_candidates_ordered:
             combined_for_target = {
@@ -591,7 +603,7 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                 "entityChanges": entity_changes,
             }
             for uid in _extract_uuids(combined_for_target):
-                _add_target_candidate(uid)
+                _add_target_candidate(uid, score=1)
 
         target_candidates = set(target_candidates_ordered)
 
@@ -613,7 +625,18 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
             users_info=users_info,
             fallback_name=actor.get("name") or actor.get("displayName"),
         )
-        affected_user_id = target_uid or (target_candidates_ordered[0] if target_candidates_ordered else "-")
+        if target_uid:
+            affected_user_id = target_uid
+        elif target_candidates_ordered:
+            affected_user_id = max(
+                target_candidates_ordered,
+                key=lambda uid: (
+                    int(target_candidate_scores.get(str(uid).strip().lower(), 0) or 0),
+                    -int(target_candidate_order.get(str(uid).strip().lower(), 10_000) or 10_000),
+                ),
+            )
+        else:
+            affected_user_id = "-"
 
         event_date_local = _format_iso_with_utc_offset(audit.get("eventDate"), utc_offset_hours=utc_offset_hours)
         action = str(audit.get("action") or "").strip()
@@ -626,6 +649,41 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
             or message_obj.get("messageWithParams")
             or ""
         ).strip()
+        service_name_lower = str(service_name or "-").strip().lower()
+        action_lower = str(action or "-").strip().lower()
+        message_lower = str(message_text or "-").strip().lower()
+        event_local_s = str(event_date_local or "-").strip()
+        actor_key = str(actor_id or "-").strip().lower()
+        affected_key = str(affected_user_id or "-").strip().lower()
+        queue_key = str(queue_id or "-").strip().lower()
+        audit_key = str(audit_id or "-").strip().lower()
+        per_audit_seen = set()
+
+        def _append_unique_row(row_obj):
+            if not isinstance(row_obj, dict):
+                return
+            operation_key = str(row_obj.get("İşlem") or "-").strip().lower()
+            summary_key = str(row_obj.get("Özet") or "-").strip().lower()
+            dedupe_key = (
+                event_local_s,
+                service_name_lower,
+                action_lower,
+                audit_key,
+                queue_key,
+                actor_key,
+                affected_key,
+                operation_key,
+                summary_key,
+                message_lower,
+            )
+            if dedupe_key in per_audit_seen:
+                return
+            if dedupe_key in global_seen_keys:
+                return
+            per_audit_seen.add(dedupe_key)
+            global_seen_keys.add(dedupe_key)
+            rows.append(row_obj)
+
         context_blob_lower = _to_blob_lower(context)
         message_blob_lower = _to_blob_lower(message_obj)
         matched = False
@@ -686,7 +744,7 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                     old_text = "Aktif"
                 new_text = "Pasif"
 
-            rows.append({
+            _append_unique_row({
                 "Zaman": event_date_local,
                 "Servis": service_name or "-",
                 "Aksiyon": action or "-",
@@ -766,7 +824,7 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                 old_text = "Aktif"
                 new_text = "Pasif"
 
-            rows.append({
+            _append_unique_row({
                 "Zaman": event_date_local,
                 "Servis": service_name or "-",
                 "Aksiyon": action or "-",
