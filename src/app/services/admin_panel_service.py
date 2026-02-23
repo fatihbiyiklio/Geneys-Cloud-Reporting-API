@@ -91,8 +91,8 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
         _start_memory_monitor(sample_interval=10, max_samples=720)
         st.subheader("Uygulama Kontrol")
         st.warning("Bu işlem uygulamayı yeniden başlatır. Aktif kullanıcı oturumları kısa süreli kesilir.")
-        st.caption("URL tetikleme: `/rebootme` veya `/?rebootme=1` (yalnızca Admin oturumunda çalışır).")
-        st.caption("Opsiyonel güvenlik: `GENESYS_REBOOT_LINK_TOKEN` tanımlıysa URL'e `?token=...` eklenmelidir.")
+        st.caption("URL tetikleme: `/rebootme` veya `/?rebootme=1` (aktif oturum gerektirmez).")
+        st.caption("Not: URL tetiklemesi doğrudan reboot başlatır.")
         reboot_confirm = st.checkbox("Uygulamayı yeniden başlatmayı onaylıyorum", key="admin_reboot_confirm")
         if st.button("🔄 Uygulamayı Reboot Et", type="primary", key="admin_reboot_btn", disabled=not reboot_confirm):
             app_user = st.session_state.get('app_user', {}) or {}

@@ -1636,6 +1636,40 @@ def _get_reboot_events(limit=50):
     return list(reversed(events[-lim:]))
 
 
+def _parse_reboot_event_timestamp(raw_value):
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def _is_recent_reboot_link_event(username, org_code, max_age_seconds=30):
+    now = datetime.now()
+    target_user = str(username or "unknown")
+    target_org = str(org_code or "default")
+    for event in reversed(_read_reboot_events()):
+        source = str(event.get("source") or "").strip().lower()
+        if source not in {"url-path", "url-query"}:
+            continue
+        if str(event.get("username") or "unknown") != target_user:
+            continue
+        if str(event.get("org_code") or "default") != target_org:
+            continue
+        ts = _parse_reboot_event_timestamp(event.get("timestamp"))
+        if ts is None:
+            continue
+        age_seconds = (now - ts).total_seconds()
+        return 0 <= age_seconds <= max_age_seconds
+    return False
+
+
 def _silent_restart(reason=None):
     """Perform a silent restart of the Streamlit app via wrapper exit code."""
     reason_text = str(reason or "manual").strip() or "manual"
@@ -1722,17 +1756,53 @@ def _is_truthy_query_value(value):
     return token in {"1", "true", "yes", "on", "y", "ok"}
 
 
+def _inject_query_param_cleanup_script(keys_to_remove):
+    keys = [str(k).strip() for k in (keys_to_remove or []) if str(k).strip()]
+    if not keys:
+        return
+    try:
+        import streamlit.components.v1 as components
+        keys_json = json.dumps(keys, ensure_ascii=False)
+        components.html(
+            f"""
+            <script>
+            (function() {{
+                try {{
+                    const keys = {keys_json};
+                    const url = new URL(window.location.href);
+                    let changed = false;
+                    keys.forEach(function(k) {{
+                        if (url.searchParams.has(k)) {{
+                            url.searchParams.delete(k);
+                            changed = true;
+                        }}
+                    }});
+                    if (!changed) return;
+                    const nextQuery = url.searchParams.toString();
+                    const nextUrl = url.pathname + (nextQuery ? ("?" + nextQuery) : "") + url.hash;
+                    window.history.replaceState({{}}, "", nextUrl);
+                }} catch (e) {{}}
+            }})();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+    except Exception:
+        pass
+
+
 def _clear_reboot_query_flags():
     params = _get_query_params_dict()
     if not params:
         return False
-    keys_to_remove = {
+    keys_to_remove = (
         "rebootme",
         "reboot",
         "reboot_from_path",
         "reboot_token",
         "token",
-    }
+    )
     changed = False
     remaining = {}
     for key, value in params.items():
@@ -1742,6 +1812,7 @@ def _clear_reboot_query_flags():
         remaining[key] = value
     if changed:
         _set_query_params_dict(remaining)
+        _inject_query_param_cleanup_script(keys_to_remove)
     return changed
 
 
@@ -1778,11 +1849,9 @@ def _inject_reboot_path_bridge_script():
 
 def _maybe_handle_reboot_link_request():
     """
-    Allow admin-triggered reboot via URL:
+    Allow reboot via URL:
     - /rebootme (bridged to query by JS)
     - ?rebootme=1 or ?reboot=true
-    Optional hardening:
-    - if GENESYS_REBOOT_LINK_TOKEN is set, query must include token/reboot_token.
     """
     params = _get_query_params_dict()
     if not params:
@@ -1794,25 +1863,14 @@ def _maybe_handle_reboot_link_request():
 
     user = st.session_state.get("app_user") or {}
     username = str(user.get("username") or "unknown")
-    role = str(user.get("role") or "")
     org_code = str(user.get("org_code") or "default")
     from_path = _is_truthy_query_value(params.get("reboot_from_path"))
 
-    required_token = str(os.environ.get("GENESYS_REBOOT_LINK_TOKEN") or "").strip()
-    incoming_token = str(params.get("reboot_token") or params.get("token") or "").strip()
-    token_ok = (not required_token) or (incoming_token == required_token)
-
-    if role != "Admin":
-        logger.warning("[REBOOT LINK] denied (role=%s user=%s org=%s)", role, username, org_code)
+    if _is_recent_reboot_link_event(username, org_code, max_age_seconds=30):
+        logger.warning("[REBOOT LINK] duplicate suppressed user=%s org=%s", username, org_code)
         _clear_reboot_query_flags()
-        st.error("Reboot link yalnızca Admin kullanıcıları tarafından kullanılabilir.")
-        st.stop()
-
-    if not token_ok:
-        logger.warning("[REBOOT LINK] denied (invalid token) user=%s org=%s", username, org_code)
-        _clear_reboot_query_flags()
-        st.error("Reboot link token doğrulaması başarısız.")
-        st.stop()
+        st.info("Reboot link zaten işlendi; URL parametresi temizlendi.")
+        return False
 
     logger.warning(
         "[REBOOT LINK] requested by user=%s org=%s source=%s",

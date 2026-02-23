@@ -152,6 +152,28 @@ jobs:
             --add-data "src:src" \
             run_app.py
 
+      - name: Smoke test Linux binary
+        run: |
+          set -euo pipefail
+          chmod +x dist/GenesysReporting-linux
+          ./dist/GenesysReporting-linux > smoke-linux.log 2>&1 &
+          APP_PID=$!
+          cleanup() {
+            kill "$APP_PID" >/dev/null 2>&1 || true
+            wait "$APP_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          for i in $(seq 1 90); do
+            if curl --silent --fail "http://127.0.0.1:8501/_stcore/health" >/dev/null; then
+              echo "Linux binary smoke test passed."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Linux binary smoke test failed. Last logs:"
+          tail -n 200 smoke-linux.log || true
+          exit 1
+
       - name: Stamp Linux artifact metadata
         run: |
           cat > dist/build-info-linux.txt <<EOF
@@ -222,6 +244,50 @@ jobs:
             --add-data ".streamlit;.streamlit" `
             --add-data "src;src" `
             run_app.py
+
+      - name: Smoke test Windows EXE
+        shell: pwsh
+        env:
+          GENESYS_WINDOWS_SERVICE_AUTO_INSTALL: "0"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stdoutPath = Join-Path $PWD "smoke-windows.out.log"
+          $stderrPath = Join-Path $PWD "smoke-windows.err.log"
+          if (Test-Path $stdoutPath) { Remove-Item $stdoutPath -Force }
+          if (Test-Path $stderrPath) { Remove-Item $stderrPath -Force }
+
+          $proc = Start-Process -FilePath "dist/GenesysReporting.exe" `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+
+          try {
+            $healthy = $false
+            for ($i = 0; $i -lt 90; $i++) {
+              try {
+                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8501/_stcore/health" -UseBasicParsing -TimeoutSec 2
+                if ($resp.StatusCode -eq 200) {
+                  $healthy = $true
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 1
+            }
+
+            if (-not $healthy) {
+              Write-Host "Windows EXE smoke test failed. Last logs:"
+              if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Tail 200 }
+              if (Test-Path $stderrPath) { Get-Content $stderrPath -Tail 200 }
+              throw "Windows EXE health endpoint not reachable."
+            }
+
+            Write-Host "Windows EXE smoke test passed."
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
 
       - name: Stamp EXE with build metadata
         shell: pwsh

@@ -17,6 +17,48 @@ def _runtime_home_dir():
 APP_HOME_DIR = _runtime_home_dir()
 
 
+def _default_state_dir():
+    """Resolve a stable state directory shared across app restarts."""
+    env_dir = os.environ.get("GENESYS_STATE_DIR", "").strip()
+    if env_dir:
+        return os.path.abspath(env_dir)
+
+    if getattr(sys, "frozen", False):
+        appdata = os.environ.get("APPDATA", "").strip()
+        if appdata:
+            return os.path.join(appdata, "GenesysCloudReporting", "orgs")
+        home_dir = os.path.expanduser("~")
+        if home_dir:
+            return os.path.join(home_dir, ".genesys_cloud_reporting", "orgs")
+
+    return os.path.join(APP_HOME_DIR, "orgs")
+
+
+def _ensure_state_dir_env(log_func=None):
+    """Guarantee GENESYS_STATE_DIR is always set to a writable stable path."""
+    state_dir = _default_state_dir()
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+    except Exception as exc:
+        fallback_dir = os.path.join(APP_HOME_DIR, "orgs")
+        try:
+            os.makedirs(fallback_dir, exist_ok=True)
+            state_dir = fallback_dir
+        except Exception:
+            if log_func:
+                _emit_startup_message(log_func, f"State dir initialization failed: {exc}")
+            return None
+        if log_func:
+            _emit_startup_message(
+                log_func,
+                f"State dir fallback applied after init failure ({exc}): {state_dir}",
+            )
+    os.environ["GENESYS_STATE_DIR"] = os.path.abspath(state_dir)
+    if log_func:
+        _emit_startup_message(log_func, f"Using state dir: {os.environ['GENESYS_STATE_DIR']}")
+    return os.environ["GENESYS_STATE_DIR"]
+
+
 def resolve_path(path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
     try:
@@ -302,6 +344,7 @@ if __name__ == "__main__":
     import psutil
 
     _ensure_app_home_cwd()
+    _ensure_state_dir_env()
 
     # Child process mode: do not acquire single-instance lock.
     if len(sys.argv) > 1 and sys.argv[1] == CHILD_FLAG:
@@ -316,6 +359,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+    _ensure_state_dir_env(log)
     ensure_windows_service_registration(log)
     acquire_single_instance_lock()
     app_path = resolve_path("app.py")
