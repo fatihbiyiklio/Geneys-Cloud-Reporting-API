@@ -625,9 +625,7 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
             users_info=users_info,
             fallback_name=actor.get("name") or actor.get("displayName"),
         )
-        if target_uid:
-            affected_user_id = target_uid
-        elif target_candidates_ordered:
+        if target_candidates_ordered:
             affected_user_id = max(
                 target_candidates_ordered,
                 key=lambda uid: (
@@ -635,6 +633,9 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                     -int(target_candidate_order.get(str(uid).strip().lower(), 10_000) or 10_000),
                 ),
             )
+        elif target_uid:
+            # Keep user-selected target only when payload has no extractable target id.
+            affected_user_id = target_uid
         else:
             affected_user_id = "-"
 

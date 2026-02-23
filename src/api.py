@@ -1973,6 +1973,18 @@ class GenesysAPI:
                     merged.append({"property": prop, "value": value})
             return merged
 
+        def _is_invalid_filter_combo(filters):
+            props = {str((item or {}).get("property") or "").strip().lower() for item in (filters or []) if isinstance(item, dict)}
+            has_entity_id = "entityid" in props
+            has_entity_type = "entitytype" in props
+            has_action = "action" in props
+            # Genesys audits query rejects EntityId/Action without EntityType in many orgs.
+            if has_entity_id and (not has_entity_type):
+                return True
+            if has_action and (not has_entity_type):
+                return True
+            return False
+
         def _collect_realtime(interval_value, scan_service_name=None, filters=None, scan_pages=1, scan_size=100):
             entities = []
             seen_ids = set()
@@ -2290,10 +2302,9 @@ class GenesysAPI:
         if actor_uid:
             api_fixed_filters.append({"property": "UserId", "value": actor_uid})
 
-        entity_id_filter_values = _unique_non_empty(
-            ([affected_uid] if affected_uid else []) + (queue_ids_clean or []),
-            limit=8,
-        )
+        # Do not map affected user directly to EntityId filter; queue-membership audits
+        # frequently use queue/entity identifiers there, which causes false negatives.
+        entity_id_filter_values = _unique_non_empty(queue_ids_clean or [], limit=8)
         entity_id_filter_variants = (
             [[{"property": "EntityId", "value": eid}] for eid in entity_id_filter_values]
             if entity_id_filter_values
@@ -2353,6 +2364,8 @@ class GenesysAPI:
             for base_filters in filter_variants:
                 for entity_filters in entity_id_filter_variants:
                     merged_filters = _merge_filters(base_filters, api_fixed_filters, entity_filters)
+                    if _is_invalid_filter_combo(merged_filters):
+                        continue
                     merged_key = tuple((f.get("property"), f.get("value")) for f in merged_filters)
                     if merged_key in seen_filter_variants:
                         continue
@@ -2458,6 +2471,8 @@ class GenesysAPI:
                 seen_filter_variants = set()
                 for entity_filters in entity_id_filter_variants:
                     merged_filters = _merge_filters(broad_filter, api_fixed_filters, entity_filters)
+                    if _is_invalid_filter_combo(merged_filters):
+                        continue
                     merged_key = tuple((f.get("property"), f.get("value")) for f in merged_filters)
                     if merged_key in seen_filter_variants:
                         continue
@@ -2544,13 +2559,13 @@ class GenesysAPI:
             for base_filters in async_base_variants:
                 for entity_filters in entity_id_filter_variants:
                     merged_filters = _merge_filters(base_filters, api_fixed_filters, entity_filters)
+                    if _is_invalid_filter_combo(merged_filters):
+                        continue
                     merged_key = tuple((f.get("property"), f.get("value")) for f in merged_filters)
                     if merged_key in seen_filter_variants:
                         continue
                     seen_filter_variants.add(merged_key)
                     request_filter_variants.append(merged_filters)
-                    if len(request_filter_variants) >= 20:
-                        break
                 if len(request_filter_variants) >= 20:
                     break
             if not request_filter_variants:
@@ -2616,6 +2631,8 @@ class GenesysAPI:
                 seen_filter_variants = set()
                 for entity_filters in entity_id_filter_variants:
                     merged_filters = _merge_filters(broad_filter, api_fixed_filters, entity_filters)
+                    if _is_invalid_filter_combo(merged_filters):
+                        continue
                     merged_key = tuple((f.get("property"), f.get("value")) for f in merged_filters)
                     if merged_key in seen_filter_variants:
                         continue
