@@ -194,7 +194,7 @@ jobs:
             dist/build-info-linux.txt
 
   windows-exe:
-    name: Windows EXE Artifact
+    name: Windows Onedir Artifact
     runs-on: windows-latest
     needs: [create-tag-release]
 
@@ -224,10 +224,9 @@ jobs:
         run: |
           python -m compileall -q app.py run_app.py src
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (onedir)
         run: |
-          pyinstaller --clean --noconfirm --onefile --noconsole --name "GenesysReporting" `
-            --runtime-tmpdir "." `
+          pyinstaller --clean --noconfirm --onedir --noconsole --name "GenesysReporting" `
             --collect-all streamlit `
             --collect-all streamlit_autorefresh `
             --collect-all streamlit_cookies_manager `
@@ -256,7 +255,9 @@ jobs:
           if (Test-Path $stdoutPath) { Remove-Item $stdoutPath -Force }
           if (Test-Path $stderrPath) { Remove-Item $stderrPath -Force }
 
-          $proc = Start-Process -FilePath "dist/GenesysReporting.exe" `
+          $exePath = Join-Path $PWD "dist/GenesysReporting/GenesysReporting.exe"
+          $proc = Start-Process -FilePath $exePath `
+            -WorkingDirectory (Split-Path $exePath) `
             -PassThru `
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath
@@ -303,12 +304,19 @@ jobs:
           built_at_utc=$(Get-Date -AsUTC -Format o)
           "@ | Out-File -FilePath "dist/build-info-windows.txt" -Encoding utf8
 
-      - name: Upload EXE Artifact
+      - name: Pack Windows onedir artifact
+        shell: pwsh
+        run: |
+          $zipPath = "dist/GenesysReporting-windows-onedir.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "dist/GenesysReporting/*" -DestinationPath $zipPath
+
+      - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GenesysReporting-windows-exe
+          name: GenesysReporting-windows-onedir
           path: |
-            dist/GenesysReporting.exe
+            dist/GenesysReporting-windows-onedir.zip
             dist/build-info-windows.txt
 
   release-assets:
@@ -338,7 +346,7 @@ jobs:
           gh release upload "$TAG_NAME" \
             --repo "$GH_REPO" \
             release/GenesysReporting-linux \
-            release/GenesysReporting.exe \
+            release/GenesysReporting-windows-onedir.zip \
             release/build-info-linux.txt \
             release/build-info-windows.txt \
             --clobber

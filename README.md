@@ -43,9 +43,9 @@ IMAGE_REPOSITORY=ghcr.io/<owner>/genesys-cloud-reporting IMAGE_TAG=latest docker
 ### Windows EXE (GitHub Artifact/Release)
 GitHub Actions her `main/master` push'unda otomatik tag + release üretir.
 - Önce benzersiz bir `v*` tag oluşturulur ve release açılır.
-- Aynı akışta Linux binary (`GenesysReporting-linux`) ve Windows EXE (`GenesysReporting.exe`) build edilir.
+- Aynı akışta Linux binary (`GenesysReporting-linux`) ve Windows onedir paketi (`GenesysReporting-windows-onedir.zip`) build edilir.
 - Linux/Windows binary build'leri GitHub Actions üzerinde Python 3.11 ile alınır.
-- Windows EXE build'inde `--runtime-tmpdir "."` kullanılır; EXE kendi klasöründen çalıştırıldığında açılım klasörü de bu dizin olur.
+- Windows build `--onedir` olarak alınır; her çalıştırmada yeni `_MEIxxxx` açılım klasörü üretilmez.
 - Dosyalar otomatik olarak bu tag release'ine eklenir.
 - Release/Artifact içinde izleme için `build-info-linux.txt` ve `build-info-windows.txt` bulunur.
 - Güncellik doğrulaması için `build-info-*.txt` dosyalarındaki `sha` ve `python_version` alanlarını kontrol edin.
@@ -110,7 +110,7 @@ Notlar:
    - Varsayılan: `GENESYS_WINDOWS_SERVICE_AUTO_INSTALL=1`
    - Servis adı özelleştirme: `GENESYS_WINDOWS_SERVICE_NAME=GenesysReporting`
    - Startup tipi: `GENESYS_WINDOWS_SERVICE_START_MODE=auto`
-   - Servis `binPath` değeri EXE klasörüne `cd` ederek başlatılacak şekilde yazılır; böylece onefile açılımı EXE klasörüne yönlenir.
+   - Servis `binPath` değeri EXE klasörüne `cd` ederek başlatılacak şekilde yazılır; uygulama her zaman aynı ana klasörden çalışır.
    - İndirilen yeni `.exe` ilk açılışta mevcut servisin `binPath` değerini güncel exe'ye otomatik senkronlar.
    - Servis eski bir exe'ye bağlıysa ve çalışıyorsa, yönetici yetkisiyle açıldığında servis durdurulup yol güncellenir.
    - Not: Servis oluşturmak için bir kez **Administrator** olarak çalıştırmak gerekir.

@@ -119,7 +119,7 @@ def _build_windows_service_bin_path():
     if getattr(sys, "frozen", False):
         exe_path = os.path.abspath(sys.executable)
         exe_dir = os.path.dirname(exe_path)
-        # Force service launch cwd to exe dir so PyInstaller onefile unpacks there.
+        # Force service launch cwd to exe dir for stable runtime paths.
         return f'cmd.exe /d /c "cd /d ""{exe_dir}"" && ""{exe_path}"""'
     return f"\"{sys.executable}\" \"{os.path.abspath(__file__)}\""
 

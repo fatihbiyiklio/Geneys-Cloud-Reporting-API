@@ -1,4 +1,4 @@
-import time
+import time as pytime
 from typing import Any, Dict
 
 from src.app.context import bind_context
@@ -41,7 +41,7 @@ def _trim_attempts_for_storage(attempts, max_items=ADMIN_QUEUE_AUDIT_MAX_ATTEMPT
 
 def _prune_admin_runtime_caches(session_state, current_org):
     """Trim admin panel session caches to avoid long-running session bloat."""
-    now_ts = time.time()
+    now_ts = pytime.time()
 
     # 1) Status audit cache: TTL + max entry bound.
     status_cache = session_state.get("admin_status_audit_cache")
@@ -1419,7 +1419,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             elif (fallback_payload or {}).get("_error") and not (audit_payload or {}).get("_error"):
                                                 audit_payload = fallback_payload
                                     cache_payload = dict(audit_payload or {})
-                                    cache_payload["_cached_at_ts"] = time.time()
+                                    cache_payload["_cached_at_ts"] = pytime.time()
                                     cache_payload["_attempts"] = _trim_attempts_for_storage(cache_payload.get("_attempts"))
                                     audit_cache_store[audit_cache_key] = cache_payload
                                     st.session_state.admin_status_audit_cache = audit_cache_store
@@ -2020,7 +2020,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                     st.session_state[meta_key] = {
                         "executed": False,
                         "range_text": f"{queue_start_date.isoformat()} - {queue_end_date.isoformat()}",
-                        "_cached_at_ts": time.time(),
+                        "_cached_at_ts": pytime.time(),
                     }
                 else:
                     try:
@@ -2170,7 +2170,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "raw_entity_count": len(entities),
                             "raw_preview_rows": raw_preview_rows,
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
-                            "_cached_at_ts": time.time(),
+                            "_cached_at_ts": pytime.time(),
                         }
                     except Exception as qe:
                         st.session_state[rows_key] = []
@@ -2179,7 +2179,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "error": str(qe),
                             "range_text": f"{queue_start_date.isoformat()} - {queue_end_date.isoformat()}",
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
-                            "_cached_at_ts": time.time(),
+                            "_cached_at_ts": pytime.time(),
                         }
 
             rows_all = st.session_state.get(rows_key) or []
