@@ -142,6 +142,18 @@ def _ensure_app_home_cwd():
         pass
 
 
+def _configure_stdio_encoding():
+    """Avoid hard crashes on Windows code pages when logs contain unicode."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def ensure_windows_service_registration(log_func):
     """Register or sync this app as a Windows service (startup: automatic)."""
     if not platform.system().lower().startswith("win"):
@@ -343,6 +355,7 @@ def check_single_instance():
 if __name__ == "__main__":
     import psutil
 
+    _configure_stdio_encoding()
     _ensure_app_home_cwd()
     _ensure_state_dir_env()
 
@@ -394,7 +407,7 @@ if __name__ == "__main__":
                 if not is_app_proc:
                     return False
             name = proc.name()
-            print(f"🔪 Killing process {name} (PID: {pid})...")
+            print(f"[KILL] Killing process {name} (PID: {pid})...")
             proc.terminate()
             try:
                 proc.wait(timeout=3)
@@ -444,7 +457,7 @@ if __name__ == "__main__":
         return "localhost"
 
     # Launch Streamlit in a loop for auto-restart
-    print("🚀 Starting Genesys Reporting App...")
+    print("[START] Starting Genesys Reporting App...")
     
     restart_count = 0
     last_restart = time.time()
@@ -473,7 +486,7 @@ if __name__ == "__main__":
             kill_proc_on_port(8501)
             if _is_port_busy(8501):
                 msg = "Port 8501 is in use by a non-app process. Refusing to terminate unrelated process."
-                print(f"❌ {msg}")
+                print(f"[ERROR] {msg}")
                 if not force_port_cleanup:
                     print("Set GENESYS_FORCE_PORT_CLEANUP=1 only if you want to force-terminate any process on this port.")
                 log(msg)
@@ -484,7 +497,7 @@ if __name__ == "__main__":
             exit_code = run_streamlit()
             
             if exit_code == 0:
-                print("🛑 Application stopped gracefully (Exit Code 0).")
+                print("[STOP] Application stopped gracefully (Exit Code 0).")
                 log("Exit code 0. Wrapper stopping.")
                 final_exit_code = 0
                 break
@@ -496,23 +509,23 @@ if __name__ == "__main__":
             last_restart = now
             log(f"Exit code {exit_code}. Restart count: {restart_count}")
             if restart_count >= 8:
-                print("❌ Too many restarts. Exiting.")
+                print("[ERROR] Too many restarts. Exiting.")
                 log("Too many restarts. Exiting.")
                 final_exit_code = exit_code if exit_code not in restart_exit_codes else 1
                 break
 
             if exit_code in restart_exit_codes:
-                print(f"♻️ Restart requested (Exit Code {exit_code}). Restarting in 2 seconds...")
+                print(f"[RESTART] Restart requested (Exit Code {exit_code}). Restarting in 2 seconds...")
                 time.sleep(2)
             else:
-                print(f"⚠️ Unexpected exit code {exit_code}. Restarting in 5 seconds...")
+                print(f"[WARN] Unexpected exit code {exit_code}. Restarting in 5 seconds...")
                 time.sleep(5)
         except KeyboardInterrupt:
-            print("\n👋 Manual interruption. Exiting...")
+            print("\n[INFO] Manual interruption. Exiting...")
             final_exit_code = 130
             break
         except Exception as e:
-            print(f"❌ Fatal Error in wrapper: {e}")
+            print(f"[ERROR] Fatal Error in wrapper: {e}")
             log(f"Fatal Error in wrapper: {e}")
             time.sleep(5)
             
