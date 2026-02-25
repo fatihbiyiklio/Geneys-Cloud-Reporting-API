@@ -754,6 +754,7 @@ def _build_active_calls(conversations, lang, queue_id_to_name=None, users_info=N
             "queue_name": queue_name,
             "wait_seconds": wait_s,
             "phone": _extract_phone_from_conv(conv),
+            "state": state,
             "direction_label": direction_label,
             "state_label": state_label,
             "media_type": mt,

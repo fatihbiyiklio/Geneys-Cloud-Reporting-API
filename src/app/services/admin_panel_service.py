@@ -4,8 +4,15 @@ from typing import Any, Dict
 from src.app.context import bind_context
 
 
+
 ADMIN_STATUS_AUDIT_CACHE_TTL_SECONDS = 1800
 ADMIN_STATUS_AUDIT_CACHE_MAX_ENTRIES = 20
+ADMIN_STATUS_TIMELINE_CACHE_TTL_SECONDS = 1800
+ADMIN_STATUS_TIMELINE_CACHE_MAX_ENTRIES = 20
+ADMIN_STATUS_AUDIT_TAB_CACHE_TTL_SECONDS = 1800
+ADMIN_STATUS_AUDIT_MAX_ATTEMPTS = 40
+ADMIN_STATUS_AUDIT_MAX_PREVIEW_ROWS = 80
+ADMIN_STATUS_AUDIT_MAX_ROWS = 5000
 ADMIN_QUEUE_AUDIT_CACHE_TTL_SECONDS = 1800
 ADMIN_QUEUE_AUDIT_MAX_ATTEMPTS = 40
 ADMIN_QUEUE_AUDIT_MAX_PREVIEW_ROWS = 80
@@ -71,6 +78,77 @@ def _prune_admin_runtime_caches(session_state, current_org):
             cleaned = {k: v for k, v in cleaned.items() if k in keep_keys}
         session_state["admin_status_audit_cache"] = cleaned
 
+    # 1b) Status timeline cache: TTL + max entry bound.
+    timeline_cache = session_state.get("admin_status_timeline_cache")
+    if isinstance(timeline_cache, dict):
+        cleaned = {}
+        indexed = []
+        for key, payload in timeline_cache.items():
+            if not isinstance(payload, dict):
+                continue
+            cached_at = float(payload.get("_cached_at_ts", 0) or 0)
+            if cached_at <= 0:
+                cached_at = now_ts
+                payload = dict(payload)
+                payload["_cached_at_ts"] = cached_at
+            if (now_ts - cached_at) > ADMIN_STATUS_TIMELINE_CACHE_TTL_SECONDS:
+                continue
+            cleaned[key] = dict(payload)
+            indexed.append((key, cached_at))
+
+        if len(cleaned) > ADMIN_STATUS_TIMELINE_CACHE_MAX_ENTRIES:
+            keep_keys = {
+                key
+                for key, _ in sorted(indexed, key=lambda kv: kv[1], reverse=True)[:ADMIN_STATUS_TIMELINE_CACHE_MAX_ENTRIES]
+            }
+            cleaned = {k: v for k, v in cleaned.items() if k in keep_keys}
+        session_state["admin_status_timeline_cache"] = cleaned
+
+    # 1c) Status audit tab cache (per org): bound row/attempt/preview sizes + TTL for stale org keys.
+    status_meta_keys = [
+        key
+        for key in list(session_state.keys())
+        if key.startswith("admin_status_audit_tab7_") and key.endswith("_meta")
+    ]
+    for meta_key in status_meta_keys:
+        meta = session_state.get(meta_key) or {}
+        if not isinstance(meta, dict):
+            continue
+
+        cached_at = float(meta.get("_cached_at_ts", 0) or 0)
+        if cached_at <= 0:
+            cached_at = now_ts
+            meta = dict(meta)
+            meta["_cached_at_ts"] = cached_at
+
+        is_current_org_key = meta_key.startswith(f"admin_status_audit_tab7_{str(current_org or '').strip()}_")
+        if (not is_current_org_key) and ((now_ts - cached_at) > ADMIN_STATUS_AUDIT_TAB_CACHE_TTL_SECONDS):
+            session_state.pop(meta_key, None)
+            rows_key = meta_key[:-5] + "_rows"
+            session_state.pop(rows_key, None)
+            continue
+
+        attempts = _trim_attempts_for_storage(meta.get("attempts"), max_items=ADMIN_STATUS_AUDIT_MAX_ATTEMPTS)
+        raw_preview_rows = meta.get("raw_preview_rows")
+        if isinstance(raw_preview_rows, list):
+            raw_preview_rows = raw_preview_rows[:ADMIN_STATUS_AUDIT_MAX_PREVIEW_ROWS]
+        else:
+            raw_preview_rows = []
+        meta["attempts"] = attempts
+        meta["raw_preview_rows"] = raw_preview_rows
+        session_state[meta_key] = meta
+
+        rows_key = meta_key[:-5] + "_rows"
+        rows = session_state.get(rows_key)
+        if isinstance(rows, list) and len(rows) > ADMIN_STATUS_AUDIT_MAX_ROWS:
+            session_state[rows_key] = rows[:ADMIN_STATUS_AUDIT_MAX_ROWS]
+            meta["warning"] = str(meta.get("warning") or "").strip() or (
+                f"Sonuçlar bellek koruması için ilk {ADMIN_STATUS_AUDIT_MAX_ROWS} satır ile sınırlandı."
+            )
+            meta["_rows_truncated"] = True
+            meta["_rows_original_count"] = len(rows)
+            session_state[meta_key] = meta
+
     # 2) Queue audit tab cache (per org): bound row/attempt/preview sizes + TTL for stale org keys.
     queue_meta_keys = [
         key
@@ -124,7 +202,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
     _prune_admin_runtime_caches(st.session_state, current_org)
     st.title(f"🛡️ {get_text(lang, 'admin_panel')}")
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama", "🧾 Kuyruk Üyelik Değişimleri"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama", "🧾 Audit"])
     
     with tab1:
         stats = monitor.get_stats()
@@ -747,96 +825,15 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 if not failed_groups:
                                     st.rerun()
                         
-                        # --- Assign Group to Queues ---
-                        st.divider()
-                        st.markdown(f"### 📋 {get_text(lang, 'group_to_queue')}")
-                        selected_group_for_queue_id = st.selectbox(
-                            get_text(lang, "group_select"),
-                            options=list(group_options.keys()),
-                            format_func=lambda x: group_options.get(x, x),
-                            key="admin_group_select_for_queue"
-                        )
-                        selected_group_for_queue = next((g for g in groups if g['id'] == selected_group_for_queue_id), None)
-                        if selected_group_for_queue:
-                            st.info(f"**{selected_group_for_queue['name']}** grubu, seçtiğiniz kuyruklara üye grup olarak eklenecek veya çıkarılacaktır.")
-                        
                         # Fetch queues
                         if 'admin_queues_cache' not in st.session_state:
                             with st.spinner("Kuyruklar yükleniyor..."):
                                 st.session_state.admin_queues_cache = api.get_queues()
                         
                         all_queues = st.session_state.get('admin_queues_cache', [])
+                        queue_options = {q['id']: q['name'] for q in all_queues}
                         
                         if all_queues:
-                            queue_options = {q['id']: q['name'] for q in all_queues}
-                            
-                            # Search filter for queues
-                            queue_search = st.text_input("🔍 Kuyruk Ara", placeholder="Kuyruk adı ile filtrele", key=f"queue_search_{selected_group_for_queue_id}")
-                            
-                            if queue_search:
-                                filtered_queues = {qid: qname for qid, qname in queue_options.items() if queue_search.lower() in qname.lower()}
-                            else:
-                                filtered_queues = queue_options
-                            
-                            selected_queue_ids = st.multiselect(
-                                get_text(lang, "group_queue_select"),
-                                options=list(filtered_queues.keys()),
-                                format_func=lambda x: filtered_queues.get(x, queue_options.get(x, x)),
-                                key=f"queue_assign_{selected_group_for_queue_id}"
-                            )
-                            
-                            col_add_q, col_remove_q = st.columns(2)
-                            
-                            with col_add_q:
-                                if selected_queue_ids and st.button(f"➕ {len(selected_queue_ids)} Kuyruğa Ekle", type="primary", key=f"add_to_queue_btn_{selected_group_for_queue_id}"):
-                                    with st.spinner("Grup kuyruklara ekleniyor..."):
-                                        results = api.add_group_to_queues(selected_group_for_queue_id, selected_queue_ids)
-                                        success_count = sum(1 for r in results.values() if r['success'])
-                                        fail_count = sum(1 for r in results.values() if not r['success'])
-                                        
-                                        if fail_count == 0:
-                                            st.success(f"✅ {get_text(lang, 'group_queue_success')} ({success_count} kuyruk)")
-                                        elif success_count == 0:
-                                            st.error(f"❌ {get_text(lang, 'group_queue_error')}")
-                                        else:
-                                            st.warning(f"⚠️ {get_text(lang, 'group_queue_partial')} ✅ {success_count} / ❌ {fail_count}")
-                                        
-                                        for qid, result in results.items():
-                                            qname = queue_options.get(qid, qid)
-                                            if result.get('success') and result.get('already'):
-                                                st.caption(f"ℹ️ {qname}: Grup zaten bu kuyruğun üyesi")
-                                            elif result.get('success'):
-                                                st.caption(f"✅ {qname}")
-                                            else:
-                                                st.caption(f"❌ {qname}: {result.get('error', '')}")
-                                        
-                                        logging.info(f"[ADMIN GROUP] Added group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' to {success_count}/{len(selected_queue_ids)} queues")
-                            
-                            with col_remove_q:
-                                if selected_queue_ids and st.button(f"🗑️ {len(selected_queue_ids)} Kuyruktan Çıkar", type="secondary", key=f"remove_from_queue_btn_{selected_group_for_queue_id}"):
-                                    with st.spinner("Grup kuyruklardan çıkarılıyor..."):
-                                        results = api.remove_group_from_queues(selected_group_for_queue_id, selected_queue_ids)
-                                        success_count = sum(1 for r in results.values() if r['success'])
-                                        fail_count = sum(1 for r in results.values() if not r['success'])
-                                        
-                                        if fail_count == 0:
-                                            st.success(f"✅ {get_text(lang, 'group_queue_remove_success')} ({success_count} kuyruk)")
-                                        elif success_count == 0:
-                                            st.error(f"❌ {get_text(lang, 'group_queue_remove_error')}")
-                                        else:
-                                            st.warning(f"⚠️ {get_text(lang, 'group_queue_partial')} ✅ {success_count} / ❌ {fail_count}")
-                                        
-                                        for qid, result in results.items():
-                                            qname = queue_options.get(qid, qid)
-                                            if result.get('success') and result.get('not_found'):
-                                                st.caption(f"ℹ️ {qname}: Grup bu kuyruğun üyesi değildi")
-                                            elif result.get('success'):
-                                                st.caption(f"✅ {qname}")
-                                            else:
-                                                st.caption(f"❌ {qname}: {result.get('error', '')}")
-                                        
-                                        logging.info(f"[ADMIN GROUP] Removed group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' from {success_count}/{len(selected_queue_ids)} queues")
-
                             # --- Queue Wrap-up Timeout Management ---
                             st.divider()
                             st.markdown("### ⏱️ Kuyruk Bazlı Wrap-up Süresi")
@@ -1208,6 +1205,107 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             )
                                         else:
                                             st.caption(f"❌ {qname}: {result.get('error', '')}")
+
+                        # --- Assign Group to Queues (moved to bottom, collapsed by default) ---
+                        st.divider()
+                        with st.expander(f"📋 {get_text(lang, 'group_to_queue')}", expanded=False):
+                            selected_group_for_queue_id = st.selectbox(
+                                get_text(lang, "group_select"),
+                                options=list(group_options.keys()),
+                                format_func=lambda x: group_options.get(x, x),
+                                key="admin_group_select_for_queue"
+                            )
+                            selected_group_for_queue = next((g for g in groups if g['id'] == selected_group_for_queue_id), None)
+                            if selected_group_for_queue:
+                                st.info(f"**{selected_group_for_queue['name']}** grubu, seçtiğiniz kuyruklara üye grup olarak eklenecek veya çıkarılacaktır.")
+
+                            if all_queues:
+                                queue_search = st.text_input(
+                                    "🔍 Kuyruk Ara",
+                                    placeholder="Kuyruk adı ile filtrele",
+                                    key=f"queue_search_{selected_group_for_queue_id}"
+                                )
+                                if queue_search:
+                                    filtered_queues = {
+                                        qid: qname for qid, qname in queue_options.items()
+                                        if queue_search.lower() in qname.lower()
+                                    }
+                                else:
+                                    filtered_queues = queue_options
+
+                                selected_queue_ids = st.multiselect(
+                                    get_text(lang, "group_queue_select"),
+                                    options=list(filtered_queues.keys()),
+                                    format_func=lambda x: filtered_queues.get(x, queue_options.get(x, x)),
+                                    key=f"queue_assign_{selected_group_for_queue_id}"
+                                )
+
+                                col_add_q, col_remove_q = st.columns(2)
+                                with col_add_q:
+                                    if selected_queue_ids and st.button(
+                                        f"➕ {len(selected_queue_ids)} Kuyruğa Ekle",
+                                        type="primary",
+                                        key=f"add_to_queue_btn_{selected_group_for_queue_id}"
+                                    ):
+                                        with st.spinner("Grup kuyruklara ekleniyor..."):
+                                            results = api.add_group_to_queues(selected_group_for_queue_id, selected_queue_ids)
+                                            success_count = sum(1 for r in results.values() if r['success'])
+                                            fail_count = sum(1 for r in results.values() if not r['success'])
+
+                                            if fail_count == 0:
+                                                st.success(f"✅ {get_text(lang, 'group_queue_success')} ({success_count} kuyruk)")
+                                            elif success_count == 0:
+                                                st.error(f"❌ {get_text(lang, 'group_queue_error')}")
+                                            else:
+                                                st.warning(f"⚠️ {get_text(lang, 'group_queue_partial')} ✅ {success_count} / ❌ {fail_count}")
+
+                                            for qid, result in results.items():
+                                                qname = queue_options.get(qid, qid)
+                                                if result.get('success') and result.get('already'):
+                                                    st.caption(f"ℹ️ {qname}: Grup zaten bu kuyruğun üyesi")
+                                                elif result.get('success'):
+                                                    st.caption(f"✅ {qname}")
+                                                else:
+                                                    st.caption(f"❌ {qname}: {result.get('error', '')}")
+
+                                            logging.info(
+                                                f"[ADMIN GROUP] Added group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' "
+                                                f"to {success_count}/{len(selected_queue_ids)} queues"
+                                            )
+
+                                with col_remove_q:
+                                    if selected_queue_ids and st.button(
+                                        f"🗑️ {len(selected_queue_ids)} Kuyruktan Çıkar",
+                                        type="secondary",
+                                        key=f"remove_from_queue_btn_{selected_group_for_queue_id}"
+                                    ):
+                                        with st.spinner("Grup kuyruklardan çıkarılıyor..."):
+                                            results = api.remove_group_from_queues(selected_group_for_queue_id, selected_queue_ids)
+                                            success_count = sum(1 for r in results.values() if r['success'])
+                                            fail_count = sum(1 for r in results.values() if not r['success'])
+
+                                            if fail_count == 0:
+                                                st.success(f"✅ {get_text(lang, 'group_queue_remove_success')} ({success_count} kuyruk)")
+                                            elif success_count == 0:
+                                                st.error(f"❌ {get_text(lang, 'group_queue_remove_error')}")
+                                            else:
+                                                st.warning(f"⚠️ {get_text(lang, 'group_queue_partial')} ✅ {success_count} / ❌ {fail_count}")
+
+                                            for qid, result in results.items():
+                                                qname = queue_options.get(qid, qid)
+                                                if result.get('success') and result.get('not_found'):
+                                                    st.caption(f"ℹ️ {qname}: Grup bu kuyruğun üyesi değildi")
+                                                elif result.get('success'):
+                                                    st.caption(f"✅ {qname}")
+                                                else:
+                                                    st.caption(f"❌ {qname}: {result.get('error', '')}")
+
+                                            logging.info(
+                                                f"[ADMIN GROUP] Removed group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' "
+                                                f"from {success_count}/{len(selected_queue_ids)} queues"
+                                            )
+                            else:
+                                st.warning("Kuyruk bulunamadı.")
             except Exception as e:
                 st.error(f"❌ {get_text(lang, 'group_fetch_error')}: {e}")
 
@@ -1283,10 +1381,10 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                     "Maksimum sayfa",
                     min_value=1,
                     max_value=50,
-                    value=int(st.session_state.get("admin_status_history_pages", 8)),
+                    value=int(st.session_state.get("admin_status_history_pages", 20)),
                     step=1,
                     key="admin_status_history_pages",
-                    help="Her sayfa en fazla 100 kayıt döner."
+                    help="Her sayfa en fazla 100 kayıt döner. Yoğun orglarda eksik kayıt riskini azaltmak için 20+ önerilir."
                 )
             
             active_user_search = bool(st.session_state.get("admin_user_search_triggered"))
@@ -1347,176 +1445,6 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                         st.markdown(f"**Routing Status:** {routing.get('status', 'N/A')}")
                                         if routing.get('startTime'):
                                             st.markdown(f"**Başlangıç:** {routing.get('startTime', 'N/A')}")
-
-                            # Status Change History (Audit)
-                            st.divider()
-                            st.markdown("### 🧭 Statü Değişim Geçmişi (Audit)")
-                            st.caption("Bu bölümde seçilen agent için status/presence/routing değişiklikleri ve değişikliği yapan kullanıcı listelenir.")
-                            audit_enabled = st.toggle(
-                                "Audit sorgusunu yükle",
-                                value=False,
-                                key=f"admin_status_audit_enabled_{user_id_clean}",
-                                help="Açık olduğunda Genesys Audit API çağrılır. Kapalı olduğunda çağrı atılmaz.",
-                            )
-                            audit_refresh_clicked = st.button(
-                                "🔄 Audit Geçmişini Yenile",
-                                key=f"admin_status_audit_refresh_{user_id_clean}",
-                                disabled=not audit_enabled,
-                                use_container_width=True,
-                            )
-                            try:
-                                offset_hours = _resolve_org_utc_offset_hours(org_code=org, default=3.0, force_reload=False)
-                            except Exception:
-                                offset_hours = 3.0
-
-                            if not audit_enabled:
-                                st.info("Audit sorgusu kapalı. İhtiyaç olduğunda yukarıdan açıp manuel yenileyin.")
-                            else:
-                                audit_cache_store = st.session_state.get("admin_status_audit_cache")
-                                if not isinstance(audit_cache_store, dict):
-                                    audit_cache_store = {}
-                                st.session_state.admin_status_audit_cache = audit_cache_store
-
-                                audit_cache_key = (
-                                    f"{org}|{user_id_clean}|mode:status|days:{int(audit_history_days)}|"
-                                    f"pages:{int(audit_history_pages)}"
-                                )
-                                if audit_refresh_clicked and audit_cache_key in audit_cache_store:
-                                    audit_cache_store.pop(audit_cache_key, None)
-                                    st.session_state.admin_status_audit_cache = audit_cache_store
-
-                                if audit_cache_key not in audit_cache_store:
-                                    history_end_utc = datetime.now(timezone.utc)
-                                    history_start_utc = history_end_utc - timedelta(days=int(audit_history_days))
-                                    with st.spinner("Statü değişim geçmişi getiriliyor..."):
-                                        audit_payload = api.get_user_status_audit_logs(
-                                            user_id=user_id_clean,
-                                            start_date=history_start_utc,
-                                            end_date=history_end_utc,
-                                            page_size=100,
-                                            max_pages=int(audit_history_pages),
-                                            service_name="Presence",
-                                        )
-                                        primary_entities = (audit_payload or {}).get("entities") or []
-                                        if not primary_entities:
-                                            fallback_payload = api.get_user_status_audit_logs(
-                                                user_id=user_id_clean,
-                                                start_date=history_start_utc,
-                                                end_date=history_end_utc,
-                                                page_size=100,
-                                                max_pages=int(audit_history_pages),
-                                                service_name=None,
-                                            )
-                                            fallback_entities = (fallback_payload or {}).get("entities") or []
-                                            if fallback_entities:
-                                                fb_warning = str((fallback_payload or {}).get("_warning") or "").strip()
-                                                extra_warning = "Presence servisinde kayıt bulunamadığı için tüm servislerde tarama yapıldı."
-                                                if fb_warning:
-                                                    fallback_payload["_warning"] = f"{extra_warning} {fb_warning}".strip()
-                                                else:
-                                                    fallback_payload["_warning"] = extra_warning
-                                                audit_payload = fallback_payload
-                                            elif (fallback_payload or {}).get("_error") and not (audit_payload or {}).get("_error"):
-                                                audit_payload = fallback_payload
-                                    cache_payload = dict(audit_payload or {})
-                                    cache_payload["_cached_at_ts"] = pytime.time()
-                                    cache_payload["_attempts"] = _trim_attempts_for_storage(cache_payload.get("_attempts"))
-                                    audit_cache_store[audit_cache_key] = cache_payload
-                                    st.session_state.admin_status_audit_cache = audit_cache_store
-
-                                audit_payload = audit_cache_store.get(audit_cache_key) or {}
-                                audit_error = (audit_payload or {}).get("_error")
-                                audit_entities = (audit_payload or {}).get("entities") or []
-                                audit_source = str((audit_payload or {}).get("source") or "-")
-                                audit_filter_variant = (audit_payload or {}).get("filter_variant") or []
-                                audit_warning = str((audit_payload or {}).get("_warning") or "").strip()
-                                if audit_error:
-                                    audit_err_text = str(audit_error)
-                                    audit_err_lower = audit_err_text.lower()
-                                    if ("audits:audit:view" in audit_err_lower) or ("missing the following permission" in audit_err_lower):
-                                        st.warning(
-                                            "Audit geçmişi alınamadı. Yetki gerekli: `audits:audit:view`.\n\n"
-                                            f"Hata detayı: {audit_error}"
-                                        )
-                                    else:
-                                        st.warning(f"Audit geçmişi sorgusunda hata oluştu.\n\nHata detayı: {audit_error}")
-                                else:
-                                    status_rows = _build_status_audit_rows(
-                                        audit_entities=audit_entities,
-                                        target_user_id=user_id_clean,
-                                        users_info=st.session_state.get("users_info", {}),
-                                        presence_map=st.session_state.get("presence_map", {}),
-                                        utc_offset_hours=offset_hours,
-                                    )
-                                    if status_rows:
-                                        df_status_history = pd.DataFrame(status_rows)
-                                        st.success(
-                                            f"{len(df_status_history)} adet statü değişim kaydı bulundu "
-                                            f"(tarama aralığı: son {int(audit_history_days)} gün)."
-                                        )
-                                        st.caption(f"Audit kaynağı: `{audit_source}`")
-                                        if audit_filter_variant:
-                                            st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
-                                        if audit_warning:
-                                            st.info(audit_warning)
-                                        st.dataframe(df_status_history, width='stretch')
-                                        st.download_button(
-                                            "📥 Statü Geçmişini CSV İndir",
-                                            data=df_status_history.to_csv(index=False).encode("utf-8"),
-                                            file_name=f"status_history_{user_id_clean}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                            mime="text/csv",
-                                            key=f"admin_status_history_download_{user_id_clean}",
-                                        )
-                                    else:
-                                        if audit_entities:
-                                            st.warning(
-                                                f"Audit tarafında {len(audit_entities)} kayıt bulundu ancak status filtresine uymadı. "
-                                                "Aşağıda ham audit önizlemesi gösteriliyor."
-                                            )
-                                            st.caption(f"Audit kaynağı: `{audit_source}`")
-                                            if audit_filter_variant:
-                                                st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
-                                            if audit_warning:
-                                                st.info(audit_warning)
-                                            raw_preview_rows = []
-                                            for item in audit_entities[:300]:
-                                                if not isinstance(item, dict):
-                                                    continue
-                                                actor_obj = item.get("user") or {}
-                                                actor_id = str(actor_obj.get("id") or "").strip()
-                                                actor_name = _resolve_user_label(
-                                                    user_id=actor_id,
-                                                    users_info=st.session_state.get("users_info", {}),
-                                                    fallback_name=actor_obj.get("name") or actor_obj.get("displayName"),
-                                                )
-                                                entity_obj = item.get("entity") or {}
-                                                message_obj = item.get("message") or {}
-                                                raw_preview_rows.append({
-                                                    "Zaman": _format_iso_with_utc_offset(item.get("eventDate"), utc_offset_hours=offset_hours),
-                                                    "Servis": item.get("serviceName") or "-",
-                                                    "Aksiyon": item.get("action") or "-",
-                                                    "EntityType": item.get("entityType") or "-",
-                                                    "EntityId": entity_obj.get("id") if isinstance(entity_obj, dict) else "-",
-                                                    "Değiştiren": actor_name,
-                                                    "Değiştiren ID": actor_id or "-",
-                                                    "Mesaj": (
-                                                        message_obj.get("message")
-                                                        or message_obj.get("messageWithParams")
-                                                        or "-"
-                                                    ) if isinstance(message_obj, dict) else "-",
-                                                    "Audit ID": item.get("id") or "-",
-                                                })
-                                            if raw_preview_rows:
-                                                st.dataframe(pd.DataFrame(raw_preview_rows), width='stretch')
-                                        else:
-                                            st.info(
-                                                "Seçilen aralıkta statü değişim kaydı bulunamadı. "
-                                                "Gün aralığını artırıp tekrar deneyin."
-                                            )
-                                            if audit_filter_variant:
-                                                st.caption(f"Audit filtreleri: `{audit_filter_variant}`")
-                                            if audit_warning:
-                                                st.info(audit_warning)
 
                             # Groups
                             current_org = str(org or "").strip()
@@ -1852,12 +1780,11 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                         st.error(f"❌ Hata: {e}")
 
     with tab7:
-        st.subheader("🧾 Kuyruk Üyelik Değişimleri (Audit)")
+        st.subheader("🧾 Audit")
         st.caption(
-            "Bu sayfa kuyruk üyelik değişimlerini (ekleme, çıkarma, aktif/pasif) listeler. "
+            "Bu sayfada hem agent statü değişimleri hem kuyruk üyelik değişimleri listelenir. "
             "Filtreler: değişen kullanıcı (etkilenen) ve değiştiren kullanıcı (actor)."
         )
-        st.caption("Realtime audit endpoint 14 günle sınırlıdır; bu sayfa gerektiğinde async audit fallback kullanır.")
 
         if not st.session_state.get("api_client"):
             st.error("Bu özellik için Genesys Cloud bağlantısı gereklidir.")
@@ -1870,48 +1797,403 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             today_local = datetime.now(tz_local).date()
             default_start_date = today_local - timedelta(days=3)
 
-            state_prefix = f"admin_queue_audit_tab7_{org}"
-            rows_key = f"{state_prefix}_rows"
-            meta_key = f"{state_prefix}_meta"
-
             if not st.session_state.get("users_info") or not st.session_state.get("queues_map"):
                 try:
                     recover_org_maps_if_needed(org, force=False)
                 except Exception:
                     pass
 
-            cached_rows = st.session_state.get(rows_key) or []
-            user_options = [""]
-            user_labels = {"": "(Tümü)"}
+            # ────────────────────────────────────────────
+            # Ortak: kullanıcı filtre seçenekleri
+            # ────────────────────────────────────────────
             users_info = st.session_state.get("users_info", {}) or {}
-            if isinstance(users_info, dict):
-                for uid, info in users_info.items():
-                    user_id_opt = str(uid or "").strip()
-                    if not user_id_opt:
-                        continue
-                    if user_id_opt not in user_options:
-                        user_options.append(user_id_opt)
-                    info_obj = info if isinstance(info, dict) else {}
-                    user_name_opt = str(info_obj.get("name") or info_obj.get("username") or user_id_opt).strip()
-                    user_labels[user_id_opt] = f"{user_name_opt} ({user_id_opt})"
 
-            if isinstance(cached_rows, list):
-                for row in cached_rows:
+            def _build_user_filter_options(cached_rows):
+                options = [""]
+                labels = {"": "(Tümü)"}
+                if isinstance(users_info, dict):
+                    for uid, info in users_info.items():
+                        user_id_opt = str(uid or "").strip()
+                        if not user_id_opt:
+                            continue
+                        if user_id_opt not in options:
+                            options.append(user_id_opt)
+                        info_obj = info if isinstance(info, dict) else {}
+                        user_name_opt = str(info_obj.get("name") or info_obj.get("username") or user_id_opt).strip()
+                        labels[user_id_opt] = f"{user_name_opt} ({user_id_opt})"
+
+                if isinstance(cached_rows, list):
+                    for row in cached_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        for id_key, name_key in (("Değiştiren ID", "Değiştiren"), ("Etkilenen ID", "Etkilenen")):
+                            uid_val = str(row.get(id_key) or "").strip()
+                            uname_val = str(row.get(name_key) or "").strip()
+                            if not uid_val or uid_val == "-":
+                                continue
+                            if uid_val not in options:
+                                options.append(uid_val)
+                            if uid_val not in labels:
+                                labels[uid_val] = f"{(uname_val or uid_val)} ({uid_val})"
+
+                options = [""] + sorted(
+                    [opt for opt in options if opt],
+                    key=lambda x: labels.get(x, x).lower(),
+                )
+                return options, labels
+
+            # ────────────────────────────────────────────
+            # 1) AGENT STATÜ DEĞİŞİMLERİ
+            # ────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 👤 Agent Statü Değişimleri")
+            st.caption(
+                "Presence/Routing statü geçişlerini listeler. "
+                "Filtreler boş bırakılırsa tüm agent kayıtları getirilir."
+            )
+
+            status_prefix = f"admin_status_audit_tab7_{org}"
+            status_rows_key = f"{status_prefix}_rows"
+            status_meta_key = f"{status_prefix}_meta"
+            status_cached_rows = st.session_state.get(status_rows_key) or []
+            status_user_options, status_user_labels = _build_user_filter_options(status_cached_rows)
+
+            status_cfg_col1, status_cfg_col2, status_cfg_col3 = st.columns(3)
+            with status_cfg_col1:
+                status_start_date = st.date_input(
+                    "Statü Başlangıç Tarihi",
+                    value=st.session_state.get(f"{status_prefix}_start_date", default_start_date),
+                    key=f"{status_prefix}_start_date",
+                )
+            with status_cfg_col2:
+                status_end_date = st.date_input(
+                    "Statü Bitiş Tarihi",
+                    value=st.session_state.get(f"{status_prefix}_end_date", today_local),
+                    key=f"{status_prefix}_end_date",
+                )
+            with status_cfg_col3:
+                status_max_pages = int(
+                    st.number_input(
+                        "Statü Maksimum Sayfa",
+                        min_value=1,
+                        max_value=50,
+                        value=int(st.session_state.get(f"{status_prefix}_max_pages", 12)),
+                        step=1,
+                        key=f"{status_prefix}_max_pages",
+                        help="Her sayfada en fazla 100 audit kaydı çekilir.",
+                    )
+                )
+
+            status_filter_col1, status_filter_col2 = st.columns(2)
+            with status_filter_col1:
+                status_selected_target_user = st.selectbox(
+                    "Etkilenen Agent Filtresi",
+                    options=status_user_options,
+                    format_func=lambda x: status_user_labels.get(x, x),
+                    key=f"{status_prefix}_target_filter",
+                )
+            with status_filter_col2:
+                status_selected_actor_user = st.selectbox(
+                    "Değiştiren Kullanıcı (Actor) Filtresi",
+                    options=status_user_options,
+                    format_func=lambda x: status_user_labels.get(x, x),
+                    key=f"{status_prefix}_actor_filter",
+                )
+
+            status_search_input = str(st.text_input(
+                "Statü Geçmişinde Ara",
+                placeholder="Agent adı, ID, eski/yeni statü, mesaj",
+                key=f"{status_prefix}_search",
+            ) or "").strip()
+            status_search_token = status_search_input.lower()
+
+            status_action_col1, status_action_col2 = st.columns(2)
+            with status_action_col1:
+                run_status_query_clicked = st.button(
+                    "🔎 Statü Audit Sorgusunu Çalıştır",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"{status_prefix}_run_btn",
+                )
+            with status_action_col2:
+                clear_status_results_clicked = st.button(
+                    "🧹 Statü Sonuçlarını Temizle",
+                    use_container_width=True,
+                    key=f"{status_prefix}_clear_btn",
+                )
+
+            if clear_status_results_clicked:
+                st.session_state.pop(status_rows_key, None)
+                st.session_state.pop(status_meta_key, None)
+                st.rerun()
+
+            if run_status_query_clicked:
+                status_date_invalid = False
+                if status_end_date < status_start_date:
+                    st.error("Statü bitiş tarihi başlangıç tarihinden önce olamaz.")
+                    status_date_invalid = True
+
+                if status_date_invalid:
+                    st.session_state[status_rows_key] = []
+                    st.session_state[status_meta_key] = {
+                        "executed": False,
+                        "range_text": f"{status_start_date.isoformat()} - {status_end_date.isoformat()}",
+                        "_cached_at_ts": pytime.time(),
+                    }
+                else:
+                    try:
+                        if ((status_end_date - status_start_date).days + 1) > 14:
+                            st.info("14 günden uzun aralık seçildi. Realtime + async fallback ile sorgu çalıştırılıyor, işlem daha uzun sürebilir.")
+                        status_start_local_dt = datetime(
+                            status_start_date.year,
+                            status_start_date.month,
+                            status_start_date.day,
+                            0,
+                            0,
+                            0,
+                            tzinfo=tz_local,
+                        )
+                        status_end_local_dt = datetime(
+                            status_end_date.year,
+                            status_end_date.month,
+                            status_end_date.day,
+                            23,
+                            59,
+                            59,
+                            tzinfo=tz_local,
+                        )
+                        status_api = GenesysAPI(st.session_state.api_client)
+                        with st.spinner("Agent statü audit kayıtları getiriliyor..."):
+                            status_payload = status_api.get_agents_status_audit_logs(
+                                start_date=status_start_local_dt,
+                                end_date=status_end_local_dt,
+                                page_size=100,
+                                max_pages=int(status_max_pages),
+                                service_names=["Presence", "Routing"],
+                                actor_user_id=status_selected_actor_user or None,
+                                affected_user_id=status_selected_target_user or None,
+                                include_async_query=True,
+                            )
+                            status_entities = (status_payload or {}).get("entities") or []
+                            status_query_error = (status_payload or {}).get("_error")
+                            status_query_warning = str((status_payload or {}).get("_warning") or "").strip()
+                            status_query_attempts = _trim_attempts_for_storage((status_payload or {}).get("_attempts"))
+
+                            status_raw_preview_rows = []
+                            for item in status_entities[:ADMIN_STATUS_AUDIT_MAX_PREVIEW_ROWS]:
+                                if not isinstance(item, dict):
+                                    continue
+                                actor_obj = item.get("user") or {}
+                                actor_id = str(actor_obj.get("id") or "").strip()
+                                actor_name = _resolve_user_label(
+                                    user_id=actor_id,
+                                    users_info=users_info,
+                                    fallback_name=actor_obj.get("name") or actor_obj.get("displayName"),
+                                )
+                                entity_obj = item.get("entity") or {}
+                                message_obj = item.get("message") or {}
+                                status_raw_preview_rows.append({
+                                    "Zaman": _format_iso_with_utc_offset(item.get("eventDate"), utc_offset_hours=offset_hours),
+                                    "Servis": item.get("serviceName") or "-",
+                                    "Aksiyon": item.get("action") or "-",
+                                    "EntityType": item.get("entityType") or "-",
+                                    "EntityId": entity_obj.get("id") if isinstance(entity_obj, dict) else "-",
+                                    "Değiştiren": actor_name,
+                                    "Değiştiren ID": actor_id or "-",
+                                    "Mesaj": (
+                                        message_obj.get("message")
+                                        or message_obj.get("messageWithParams")
+                                        or "-"
+                                    ) if isinstance(message_obj, dict) else "-",
+                                    "Audit ID": item.get("id") or "-",
+                                })
+
+                            status_rows = _build_status_audit_rows(
+                                audit_entities=status_entities,
+                                target_user_id=status_selected_target_user or None,
+                                users_info=users_info,
+                                presence_map=st.session_state.get("presence_map", {}),
+                                utc_offset_hours=offset_hours,
+                                audit_mode="status",
+                            )
+                            for row in status_rows:
+                                if not isinstance(row, dict):
+                                    continue
+                                target_id = str(row.get("Etkilenen ID") or "").strip()
+                                row["Etkilenen"] = _resolve_user_label(
+                                    user_id=target_id,
+                                    users_info=users_info,
+                                    fallback_name=row.get("Etkilenen"),
+                                )
+                            status_rows = sorted(
+                                [row for row in status_rows if isinstance(row, dict)],
+                                key=lambda row: str(row.get("Zaman") or ""),
+                                reverse=True,
+                            )
+                            if len(status_rows) > ADMIN_STATUS_AUDIT_MAX_ROWS:
+                                status_rows = status_rows[:ADMIN_STATUS_AUDIT_MAX_ROWS]
+                                status_query_warning = (status_query_warning + " " if status_query_warning else "") + (
+                                    f"Sonuçlar bellek koruması için ilk {ADMIN_STATUS_AUDIT_MAX_ROWS} satır ile sınırlandı."
+                                )
+
+                        st.session_state[status_rows_key] = status_rows
+                        st.session_state[status_meta_key] = {
+                            "executed": True,
+                            "source": str((status_payload or {}).get("source") or "-"),
+                            "service_name": str((status_payload or {}).get("service_name") or "-"),
+                            "filter_variant": (status_payload or {}).get("filter_variant") or [],
+                            "attempts": status_query_attempts,
+                            "warning": status_query_warning,
+                            "error": status_query_error,
+                            "range_text": f"{status_start_date.isoformat()} - {status_end_date.isoformat()}",
+                            "result_count": len(status_rows),
+                            "raw_entity_count": len(status_entities),
+                            "raw_preview_rows": status_raw_preview_rows,
+                            "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
+                            "_cached_at_ts": pytime.time(),
+                        }
+                    except Exception as se:
+                        st.session_state[status_rows_key] = []
+                        st.session_state[status_meta_key] = {
+                            "executed": True,
+                            "error": str(se),
+                            "range_text": f"{status_start_date.isoformat()} - {status_end_date.isoformat()}",
+                            "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
+                            "_cached_at_ts": pytime.time(),
+                        }
+
+            status_rows_all = st.session_state.get(status_rows_key) or []
+            status_meta = st.session_state.get(status_meta_key) or {}
+
+            if status_meta.get("error"):
+                st.warning(f"Statü audit sorgusunda hata oluştu.\n\nHata detayı: {status_meta.get('error')}")
+            if status_meta.get("warning"):
+                st.info(str(status_meta.get("warning")))
+            if status_meta.get("executed") and status_meta.get("ran_at"):
+                st.caption(f"Statü son sorgu zamanı: {status_meta.get('ran_at')}")
+            if status_meta.get("executed"):
+                st.caption(
+                    f"Statü ham audit kaydı: {int(status_meta.get('raw_entity_count') or 0)} | "
+                    f"Parse edilen satır: {int(status_meta.get('result_count') or 0)}"
+                )
+                status_attempts = status_meta.get("attempts") or []
+                if status_attempts:
+                    with st.expander(f"Statü Sorgu Diagnostiği ({len(status_attempts)} deneme)", expanded=False):
+                        status_attempt_rows = []
+                        for item in status_attempts:
+                            if not isinstance(item, dict):
+                                continue
+                            row = dict(item)
+                            filters_val = row.get("filters")
+                            if isinstance(filters_val, list):
+                                filters_text = ", ".join(
+                                    f"{str(f.get('property') or '').strip()}={str(f.get('value') or '').strip()}"
+                                    for f in filters_val
+                                    if isinstance(f, dict)
+                                    and str(f.get("property") or "").strip()
+                                    and str(f.get("value") or "").strip()
+                                )
+                                row["filters"] = filters_text or "-"
+                            else:
+                                row["filters"] = str(filters_val or "-")
+                            status_attempt_rows.append(row)
+                        st.dataframe(pd.DataFrame(status_attempt_rows), width='stretch')
+
+            if not status_rows_all:
+                if status_meta.get("executed"):
+                    status_raw_count = int(status_meta.get("raw_entity_count") or 0)
+                    if status_raw_count > 0:
+                        st.warning(
+                            f"Statü sorgusu çalıştırıldı, {status_raw_count} ham audit kaydı bulundu ancak statü satırına parse edilemedi."
+                        )
+                        status_raw_preview_rows = status_meta.get("raw_preview_rows") or []
+                        if status_raw_preview_rows:
+                            st.dataframe(pd.DataFrame(status_raw_preview_rows), width='stretch')
+                    else:
+                        st.info(
+                            "Statü sorgusu çalıştırıldı ancak kayıt bulunamadı. "
+                            "Tarih aralığını genişletip veya filtreleri azaltıp tekrar deneyin."
+                        )
+                else:
+                    st.info("Henüz statü sonucu yok. Tarih aralığını seçip sorguyu çalıştırın.")
+            else:
+                status_target_filter = str(status_selected_target_user or "").strip().lower()
+                status_actor_filter = str(status_selected_actor_user or "").strip().lower()
+                status_filtered_rows = []
+                for row in status_rows_all:
                     if not isinstance(row, dict):
                         continue
-                    for id_key, name_key in (("Değiştiren ID", "Değiştiren"), ("Etkilenen ID", "Etkilenen")):
-                        uid_val = str(row.get(id_key) or "").strip()
-                        uname_val = str(row.get(name_key) or "").strip()
-                        if not uid_val or uid_val == "-":
+                    if status_target_filter and str(row.get("Etkilenen ID") or "").strip().lower() != status_target_filter:
+                        continue
+                    if status_actor_filter and str(row.get("Değiştiren ID") or "").strip().lower() != status_actor_filter:
+                        continue
+                    if status_search_token:
+                        row_blob = " ".join([
+                            str(row.get("Etkilenen") or ""),
+                            str(row.get("Etkilenen ID") or ""),
+                            str(row.get("Değiştiren") or ""),
+                            str(row.get("Değiştiren ID") or ""),
+                            str(row.get("Eski Değer") or ""),
+                            str(row.get("Yeni Değer") or ""),
+                            str(row.get("Alan") or ""),
+                            str(row.get("Mesaj") or ""),
+                            str(row.get("Servis") or ""),
+                            str(row.get("Aksiyon") or ""),
+                        ]).lower()
+                        if status_search_token not in row_blob:
                             continue
-                        if uid_val not in user_options:
-                            user_options.append(uid_val)
-                        if uid_val not in user_labels:
-                            user_labels[uid_val] = f"{(uname_val or uid_val)} ({uid_val})"
-            user_options = [""] + sorted(
-                [opt for opt in user_options if opt],
-                key=lambda x: user_labels.get(x, x).lower(),
-            )
+                    status_filtered_rows.append(row)
+
+                if not status_filtered_rows:
+                    st.info("Seçilen filtrelere uygun agent statü kaydı bulunamadı.")
+                else:
+                    df_status_history = pd.DataFrame(status_filtered_rows)
+                    status_preferred_cols = [
+                        "Zaman",
+                        "Etkilenen",
+                        "Etkilenen ID",
+                        "Eski Değer",
+                        "Yeni Değer",
+                        "Değiştiren",
+                        "Değiştiren ID",
+                        "Değiştiren Türü",
+                        "Servis",
+                        "Aksiyon",
+                        "Alan",
+                        "Mesaj",
+                        "Audit ID",
+                    ]
+                    status_visible_cols = [c for c in status_preferred_cols if c in df_status_history.columns]
+                    status_visible_cols.extend([c for c in df_status_history.columns if c not in status_visible_cols])
+                    df_status_history = df_status_history[status_visible_cols]
+
+                    st.success(f"{len(df_status_history)} adet agent statü kaydı listeleniyor.")
+                    st.caption(
+                        f"Kaynak: `{status_meta.get('source', '-')}` | Servis: `{status_meta.get('service_name', '-')}` "
+                        f"| Aralık: `{status_meta.get('range_text', '-')}`"
+                    )
+                    st.dataframe(df_status_history, width='stretch')
+                    st.download_button(
+                        "📥 Agent Statü Geçmişini CSV İndir",
+                        data=df_status_history.to_csv(index=False).encode("utf-8"),
+                        file_name=f"agent_status_history_{org}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        key=f"{status_prefix}_download_csv",
+                    )
+
+            # ────────────────────────────────────────────
+            # 2) KUYRUK ÜYELİK DEĞİŞİMLERİ
+            # ────────────────────────────────────────────
+            st.divider()
+            st.markdown("### 🎛️ Kuyruk Üyelik Değişimleri")
+            st.caption("Realtime audit endpoint 14 günle sınırlıdır; gerektiğinde async audit fallback kullanır.")
+
+            state_prefix = f"admin_queue_audit_tab7_{org}"
+            rows_key = f"{state_prefix}_rows"
+            meta_key = f"{state_prefix}_meta"
+
+            cached_rows = st.session_state.get(rows_key) or []
+            user_options, user_labels = _build_user_filter_options(cached_rows)
 
             cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
             with cfg_col1:

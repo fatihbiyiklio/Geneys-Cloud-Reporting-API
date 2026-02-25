@@ -1460,6 +1460,27 @@ class GenesysAPI:
         params = {"expand": "user"} if expand_user else None
         return self._post("/api/v2/audits/query/realtime", payload, timeout=30, retries=1, params=params)
 
+    def query_audits_realtime_related(
+        self,
+        audit_id,
+        trustor_org_id=None,
+        sort_order="descending",
+        expand_user=True,
+    ):
+        """Fetch audits created by the same action as the given realtime audit id."""
+        aid = str(audit_id or "").strip()
+        if not aid:
+            return {"entities": []}
+        sort_value = "descending" if str(sort_order).strip().lower() == "descending" else "ascending"
+        payload = {
+            "auditId": aid,
+            "sort": [{"name": "Timestamp", "sortOrder": sort_value}],
+        }
+        if trustor_org_id:
+            payload["trustorOrgId"] = str(trustor_org_id).strip()
+        params = {"expand": "user"} if expand_user else None
+        return self._post("/api/v2/audits/query/realtime/related", payload, timeout=30, retries=1, params=params)
+
     def start_audit_query(
         self,
         interval,
@@ -1600,6 +1621,709 @@ class GenesysAPI:
             "state": state or "succeeded",
         }
 
+    def get_agents_status_audit_logs(
+        self,
+        start_date,
+        end_date,
+        page_size=100,
+        max_pages=10,
+        service_names=None,
+        actor_user_id=None,
+        affected_user_id=None,
+        include_async_query=True,
+    ):
+        """Fetch agent status-change audits (presence/routing) with optional actor/affected filters."""
+
+        def _to_utc_iso(dt):
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        def _to_blob_lower(payload):
+            try:
+                return str(payload or "").lower()
+            except Exception:
+                return ""
+
+        def _normalize_filter_payload(filters):
+            normalized = []
+            if not isinstance(filters, list):
+                return normalized
+            for item in filters:
+                if not isinstance(item, dict):
+                    continue
+                prop = str(item.get("property") or "").strip()
+                value = str(item.get("value") or "").strip()
+                if not prop or not value:
+                    continue
+                normalized.append({"property": prop, "value": value})
+            return normalized
+
+        uuid_pattern = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+        def _looks_like_uuid(value):
+            val = str(value or "").strip()
+            return bool(val and uuid_pattern.match(val))
+
+        def _entity_key(audit_item):
+            if not isinstance(audit_item, dict):
+                return None
+            aid = str(audit_item.get("id") or "").strip()
+            if aid:
+                return f"id:{aid}"
+            entity_obj = audit_item.get("entity") or {}
+            message_obj = audit_item.get("message") or {}
+            return (
+                f"fp:{str(audit_item.get('eventDate') or '').strip()}|"
+                f"{str(audit_item.get('serviceName') or '').strip().lower()}|"
+                f"{str(audit_item.get('action') or '').strip().lower()}|"
+                f"{str(entity_obj.get('id') or '').strip().lower()}|"
+                f"{str(message_obj.get('message') or message_obj.get('messageWithParams') or '').strip().lower()[:180]}"
+            )
+
+        actor_key_tokens = (
+            "actoruserid",
+            "actinguserid",
+            "modifiedby",
+            "changedby",
+            "initiatedbyuserid",
+            "requestinguserid",
+            "performedbyuserid",
+            "updatedby",
+            "updatedbyuserid",
+        )
+        target_key_tokens = (
+            "userid",
+            "targetuserid",
+            "affecteduserid",
+            "memberuserid",
+            "agentid",
+            "subjectuserid",
+            "entityuserid",
+        )
+
+        def _is_actor_key(key):
+            key_l = str(key or "").strip().lower()
+            if not key_l:
+                return False
+            if any(tok in key_l for tok in actor_key_tokens):
+                return True
+            return ("actor" in key_l) and (("user" in key_l) or ("id" in key_l))
+
+        def _is_target_key(key):
+            key_l = str(key or "").strip().lower()
+            if not key_l:
+                return False
+            if any(tok == key_l or tok in key_l for tok in target_key_tokens):
+                return True
+            if ("user" in key_l) or ("agent" in key_l):
+                return not _is_actor_key(key_l)
+            return False
+
+        def _collect_context_user_ids(obj):
+            actor_ids = set()
+            target_ids = set()
+            if obj is None:
+                return actor_ids, target_ids
+
+            def _add_if_uuid(bucket, value):
+                val = str(value or "").strip()
+                if _looks_like_uuid(val):
+                    bucket.add(val.lower())
+
+            def _walk(node):
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        key_l = str(key or "").strip().lower()
+                        if isinstance(value, dict):
+                            for ik in ("id", "userId", "userid", "agentId", "agentid"):
+                                vv = value.get(ik)
+                                if vv in (None, ""):
+                                    continue
+                                if _is_actor_key(key_l):
+                                    _add_if_uuid(actor_ids, vv)
+                                elif _is_target_key(key_l):
+                                    _add_if_uuid(target_ids, vv)
+                                break
+                            _walk(value)
+                            continue
+                        if isinstance(value, (list, tuple)):
+                            for item in value:
+                                if isinstance(item, dict):
+                                    for ik in ("id", "userId", "userid", "agentId", "agentid"):
+                                        vv = item.get(ik)
+                                        if vv in (None, ""):
+                                            continue
+                                        if _is_actor_key(key_l):
+                                            _add_if_uuid(actor_ids, vv)
+                                        elif _is_target_key(key_l):
+                                            _add_if_uuid(target_ids, vv)
+                                        break
+                                else:
+                                    if _is_actor_key(key_l):
+                                        _add_if_uuid(actor_ids, item)
+                                    elif _is_target_key(key_l):
+                                        _add_if_uuid(target_ids, item)
+                            for item in value:
+                                _walk(item)
+                            continue
+                        if value in (None, ""):
+                            continue
+                        if _is_actor_key(key_l):
+                            _add_if_uuid(actor_ids, value)
+                        elif _is_target_key(key_l):
+                            _add_if_uuid(target_ids, value)
+                elif isinstance(node, (list, tuple)):
+                    for item in node:
+                        _walk(item)
+
+            _walk(obj)
+            return actor_ids, target_ids
+
+        def _audit_matches_actor(audit_item, user_id):
+            uid = str(user_id or "").strip().lower()
+            if not uid:
+                return True
+            if not isinstance(audit_item, dict):
+                return False
+            actor = audit_item.get("user") or {}
+            actor_id = str(actor.get("id") or "").strip().lower()
+            if actor_id == uid:
+                return True
+            ctx_actor_ids, _ = _collect_context_user_ids(audit_item.get("context"))
+            if uid in ctx_actor_ids:
+                return True
+            return False
+
+        def _audit_matches_affected(audit_item, user_id):
+            uid = str(user_id or "").strip().lower()
+            if not uid:
+                return True
+            if not isinstance(audit_item, dict):
+                return False
+            entity = audit_item.get("entity") or {}
+            entity_id = str(entity.get("id") or "").strip().lower()
+            if entity_id == uid:
+                return True
+            _, ctx_target_ids = _collect_context_user_ids(audit_item.get("context"))
+            if uid in ctx_target_ids:
+                return True
+            blob = _to_blob_lower({
+                "context": audit_item.get("context"),
+                "message": audit_item.get("message"),
+                "propertyChanges": audit_item.get("propertyChanges"),
+                "entityChanges": audit_item.get("entityChanges"),
+                "entity": audit_item.get("entity"),
+            })
+            return uid in blob
+
+        status_property_hints = (
+            "presence",
+            "routingstatus",
+            "routing",
+            "onqueue",
+            "organizationpresence",
+            "systempresence",
+            "primarypresence",
+        )
+        status_text_hints = (
+            "presence",
+            "routingstatus",
+            "routing status",
+            "onqueue",
+            "offqueue",
+            "on queue",
+            "organizationpresence",
+            "systempresence",
+            "primarypresence",
+        )
+
+        def _is_queue_membership_like(combined_text, entity_type, action):
+            has_queue = (
+                ("queue" in combined_text)
+                or ("routingqueue" in combined_text)
+                or ("workgroup" in combined_text)
+                or ("/queues" in combined_text)
+            )
+            has_membership = (
+                ("member" in combined_text)
+                or ("membership" in combined_text)
+                or ("joined" in combined_text)
+                or ("join" in action)
+                or ("unjoin" in action)
+                or ("add" in action)
+                or ("remove" in action)
+                or ("activate" in action)
+                or ("deactivate" in action)
+                or ("assign" in action)
+                or ("unassign" in action)
+            )
+            entity_type_match = (
+                (("queue" in entity_type) or ("workgroup" in entity_type) or ("routingqueue" in entity_type))
+                and (
+                    ("member" in entity_type)
+                    or ("membership" in entity_type)
+                    or ("user" in entity_type)
+                    or ("agent" in entity_type)
+                    or ("joined" in entity_type)
+                )
+            )
+            return (has_queue and has_membership) or entity_type_match
+
+        def _is_status_like(audit_item):
+            if not isinstance(audit_item, dict):
+                return False
+            entity = audit_item.get("entity") or {}
+            entity_type = str(audit_item.get("entityType") or entity.get("type") or "").strip().lower()
+            action = str(audit_item.get("action") or "").strip().lower()
+            service = str(audit_item.get("serviceName") or "").strip().lower()
+            message_obj = audit_item.get("message") or {}
+            combined = _to_blob_lower({
+                "service": service,
+                "action": action,
+                "entityType": entity_type,
+                "entity": entity,
+                "message": message_obj,
+                "context": audit_item.get("context"),
+                "propertyChanges": audit_item.get("propertyChanges"),
+                "entityChanges": audit_item.get("entityChanges"),
+            })
+
+            if _is_queue_membership_like(combined, entity_type, action):
+                return False
+
+            property_changes = audit_item.get("propertyChanges") or []
+            for change in property_changes:
+                if not isinstance(change, dict):
+                    continue
+                prop_name = str(change.get("property") or "").strip().lower()
+                if not prop_name:
+                    continue
+                if any(h in prop_name for h in status_property_hints):
+                    return True
+                if prop_name in {"status", "state", "presencestatus"}:
+                    if any(h in combined for h in status_text_hints):
+                        return True
+
+            for change in (audit_item.get("entityChanges") or []):
+                if any(h in str(change).lower() for h in status_text_hints):
+                    return True
+
+            return any(h in combined for h in status_text_hints)
+
+        def _collect_realtime(interval_value, scan_service_name=None, filters=None, scan_pages=1, scan_size=100):
+            entities = []
+            seen_ids = set()
+            page_count = None
+            realtime_error = None
+
+            for page_number in range(1, max(1, int(scan_pages or 1)) + 1):
+                try:
+                    resp = self.query_audits_realtime(
+                        interval=interval_value,
+                        service_name=scan_service_name,
+                        filters=filters,
+                        page_number=page_number,
+                        page_size=scan_size,
+                        sort_order="descending",
+                        expand_user=True,
+                    )
+                except Exception as e:
+                    realtime_error = self._extract_error_detail(e)
+                    break
+
+                if not isinstance(resp, dict):
+                    break
+
+                page_entities = resp.get("entities") or []
+                for item in page_entities:
+                    aid = str((item or {}).get("id") or "").strip()
+                    if aid and aid in seen_ids:
+                        continue
+                    if aid:
+                        seen_ids.add(aid)
+                    entities.append(item)
+
+                if page_count is None:
+                    page_count = resp.get("pageCount")
+                if not page_entities:
+                    break
+                if page_count and page_number >= int(page_count):
+                    break
+                if len(page_entities) < int(scan_size or 100):
+                    break
+
+            return {
+                "entities": entities,
+                "page_count": page_count,
+                "_error": realtime_error,
+            }
+
+        def _collect_async(interval_value, scan_service_name=None, filters=None, scan_pages=20, scan_size=100):
+            async_resp = self.query_audits(
+                interval=interval_value,
+                service_name=scan_service_name,
+                filters=filters,
+                page_size=scan_size,
+                max_pages=scan_pages,
+                sort_order="descending",
+                expand_user=True,
+            ) or {}
+            return {
+                "entities": async_resp.get("entities") or [],
+                "transaction_id": async_resp.get("transaction_id"),
+                "_error": async_resp.get("_error"),
+            }
+
+        def _append_unique_entities(target_rows, seen_keys, source_rows):
+            for item in source_rows or []:
+                if not isinstance(item, dict):
+                    continue
+                row_key = _entity_key(item)
+                if not row_key:
+                    continue
+                if row_key in seen_keys:
+                    continue
+                seen_keys.add(row_key)
+                target_rows.append(item)
+
+        def _sort_entities_desc(items):
+            return sorted(
+                list(items or []),
+                key=lambda row: str((row or {}).get("eventDate") or "").strip(),
+                reverse=True,
+            )
+
+        def _merge_filters(*groups):
+            merged = []
+            seen = set()
+            for group in groups:
+                for item in (group or []):
+                    if not isinstance(item, dict):
+                        continue
+                    prop = str(item.get("property") or "").strip()
+                    val = str(item.get("value") or "").strip()
+                    if not prop or not val:
+                        continue
+                    key = (prop.lower(), val.lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append({"property": prop, "value": val})
+            return merged
+
+        def _is_invalid_filter_combo(filters):
+            props = {
+                str((item or {}).get("property") or "").strip().lower()
+                for item in (filters or [])
+                if isinstance(item, dict)
+            }
+            has_entity_id = "entityid" in props
+            has_entity_type = "entitytype" in props
+            return has_entity_id and (not has_entity_type)
+
+        interval = f"{_to_utc_iso(start_date)}/{_to_utc_iso(end_date)}"
+        pages_to_scan = max(1, int(max_pages or 1))
+        size = max(1, min(int(page_size or 100), 500))
+        async_pages = max(10, min(80, pages_to_scan * 3))
+
+        actor_uid = str(actor_user_id or "").strip()
+        affected_uid = str(affected_user_id or "").strip()
+        if actor_uid and (not _looks_like_uuid(actor_uid)):
+            actor_uid = ""
+        if affected_uid and (not _looks_like_uuid(affected_uid)):
+            affected_uid = ""
+
+        service_candidates = []
+        seen_services = set()
+
+        def _push_service(service_value):
+            key = str(service_value).strip().lower() if service_value is not None else "__none__"
+            if key in seen_services:
+                return
+            seen_services.add(key)
+            service_candidates.append(service_value)
+
+        for item in (service_names or []):
+            service_name_val = str(item or "").strip()
+            if service_name_val:
+                _push_service(service_name_val)
+        for fallback_service in ("Presence", "Routing", "Users", "ContactCenter", "Contact Center"):
+            _push_service(fallback_service)
+        _push_service(None)
+
+        base_filters = []
+        if actor_uid:
+            base_filters.append({"property": "UserId", "value": actor_uid})
+
+        filter_variants = []
+        if affected_uid:
+            filter_variants.extend([
+                _merge_filters(base_filters, [{"property": "EntityType", "value": "USER"}, {"property": "EntityId", "value": affected_uid}]),
+                _merge_filters(base_filters, [{"property": "EntityId", "value": affected_uid}]),
+            ])
+        elif base_filters:
+            filter_variants.append(_merge_filters(base_filters))
+
+        if not filter_variants:
+            filter_variants = [None]
+        else:
+            filter_variants.append(None)
+
+        dedup_filter_keys = set()
+        normalized_filter_variants = []
+        for variant in filter_variants:
+            normalized = _normalize_filter_payload(variant)
+            variant_key = tuple((f.get("property"), f.get("value")) for f in normalized)
+            if variant_key in dedup_filter_keys:
+                continue
+            dedup_filter_keys.add(variant_key)
+            normalized_filter_variants.append(normalized if normalized else None)
+        filter_variants = normalized_filter_variants or [None]
+
+        def _apply_client_filters(source_entities):
+            out = []
+            seen = set()
+            for item in source_entities or []:
+                if not _is_status_like(item):
+                    continue
+                if actor_uid and (not _audit_matches_actor(item, actor_uid)):
+                    continue
+                if affected_uid and (not _audit_matches_affected(item, affected_uid)):
+                    continue
+                row_key = _entity_key(item)
+                if row_key and row_key in seen:
+                    continue
+                if row_key:
+                    seen.add(row_key)
+                out.append(item)
+            return out
+
+        attempts = []
+
+        def _add_attempt(source, service_val, filters_val, raw_count, matched_count, error_val=None):
+            if len(attempts) >= 120:
+                return
+            attempts.append({
+                "source": source,
+                "service": str(service_val or "-"),
+                "filters": _normalize_filter_payload(filters_val),
+                "raw_count": int(raw_count or 0),
+                "matched_count": int(matched_count or 0),
+                "error": str(error_val or "").strip(),
+            })
+
+        merged_entities = []
+        merged_entity_keys = set()
+        merged_sources = []
+        merged_filter_variant = []
+        merged_filter_variant_keys = set()
+        last_error = None
+        should_try_unfiltered_realtime = any(v is None for v in filter_variants)
+
+        # Realtime pass: first filtered variants (if any), then unfiltered fallback.
+        realtime_variants = [v for v in filter_variants if v is not None]
+        if not realtime_variants and should_try_unfiltered_realtime:
+            realtime_variants = [None]
+
+        for request_filters in realtime_variants:
+            if _is_invalid_filter_combo(request_filters):
+                continue
+            for scan_service_name in service_candidates:
+                resp = _collect_realtime(
+                    interval_value=interval,
+                    scan_service_name=scan_service_name,
+                    filters=request_filters,
+                    scan_pages=pages_to_scan,
+                    scan_size=size,
+                )
+                raw_entities = resp.get("entities") or []
+                matched_entities = _apply_client_filters(raw_entities)
+                _add_attempt(
+                    source="realtime-filtered" if request_filters else "realtime",
+                    service_val=scan_service_name,
+                    filters_val=request_filters,
+                    raw_count=len(raw_entities),
+                    matched_count=len(matched_entities),
+                    error_val=resp.get("_error"),
+                )
+
+                if matched_entities:
+                    _append_unique_entities(merged_entities, merged_entity_keys, matched_entities)
+                    source_label = "realtime" if scan_service_name else "realtime-unfiltered"
+                    if source_label not in merged_sources:
+                        merged_sources.append(source_label)
+                    for item in _normalize_filter_payload(request_filters):
+                        key = (item.get("property"), item.get("value"))
+                        if key in merged_filter_variant_keys:
+                            continue
+                        merged_filter_variant_keys.add(key)
+                        merged_filter_variant.append(item)
+
+                if resp.get("_error"):
+                    error_text = str(resp.get("_error") or "").lower()
+                    if (
+                        ("unknown servicename" in error_text)
+                        or ("unknown entitytype" in error_text)
+                        or ("servicename is expected when passing entitytype" in error_text)
+                        or ("action" in error_text and "entitytype" in error_text)
+                    ):
+                        continue
+                    last_error = resp.get("_error")
+
+        if (not merged_entities) and should_try_unfiltered_realtime and realtime_variants != [None]:
+            for scan_service_name in service_candidates:
+                resp = _collect_realtime(
+                    interval_value=interval,
+                    scan_service_name=scan_service_name,
+                    filters=None,
+                    scan_pages=pages_to_scan,
+                    scan_size=size,
+                )
+                raw_entities = resp.get("entities") or []
+                matched_entities = _apply_client_filters(raw_entities)
+                _add_attempt(
+                    source="realtime-fallback",
+                    service_val=scan_service_name,
+                    filters_val=None,
+                    raw_count=len(raw_entities),
+                    matched_count=len(matched_entities),
+                    error_val=resp.get("_error"),
+                )
+                if matched_entities:
+                    _append_unique_entities(merged_entities, merged_entity_keys, matched_entities)
+                    source_label = "realtime" if scan_service_name else "realtime-unfiltered"
+                    if source_label not in merged_sources:
+                        merged_sources.append(source_label)
+                if resp.get("_error"):
+                    error_text = str(resp.get("_error") or "").lower()
+                    if (
+                        ("unknown servicename" in error_text)
+                        or ("unknown entitytype" in error_text)
+                        or ("servicename is expected when passing entitytype" in error_text)
+                        or ("action" in error_text and "entitytype" in error_text)
+                    ):
+                        continue
+                    last_error = resp.get("_error")
+
+        if (not merged_entities) and bool(include_async_query):
+            async_variants = [v for v in filter_variants if v is not None]
+            if not async_variants and should_try_unfiltered_realtime:
+                async_variants = [None]
+
+            for request_filters in async_variants:
+                if _is_invalid_filter_combo(request_filters):
+                    continue
+                for scan_service_name in service_candidates:
+                    resp = _collect_async(
+                        interval_value=interval,
+                        scan_service_name=scan_service_name,
+                        filters=request_filters,
+                        scan_pages=async_pages,
+                        scan_size=size,
+                    )
+                    raw_entities = resp.get("entities") or []
+                    matched_entities = _apply_client_filters(raw_entities)
+                    _add_attempt(
+                        source="async-filtered" if request_filters else "async",
+                        service_val=scan_service_name,
+                        filters_val=request_filters,
+                        raw_count=len(raw_entities),
+                        matched_count=len(matched_entities),
+                        error_val=resp.get("_error"),
+                    )
+                    if matched_entities:
+                        _append_unique_entities(merged_entities, merged_entity_keys, matched_entities)
+                        source_label = "async" if scan_service_name else "async-unfiltered"
+                        if source_label not in merged_sources:
+                            merged_sources.append(source_label)
+                        for item in _normalize_filter_payload(request_filters):
+                            key = (item.get("property"), item.get("value"))
+                            if key in merged_filter_variant_keys:
+                                continue
+                            merged_filter_variant_keys.add(key)
+                            merged_filter_variant.append(item)
+                    if resp.get("_error"):
+                        error_text = str(resp.get("_error") or "").lower()
+                        if (
+                            ("unknown servicename" in error_text)
+                            or ("unknown entitytype" in error_text)
+                            or ("servicename is expected when passing entitytype" in error_text)
+                            or ("action" in error_text and "entitytype" in error_text)
+                        ):
+                            continue
+                        last_error = resp.get("_error")
+
+            if (not merged_entities) and any(v is None for v in filter_variants) and async_variants != [None]:
+                for scan_service_name in service_candidates:
+                    resp = _collect_async(
+                        interval_value=interval,
+                        scan_service_name=scan_service_name,
+                        filters=None,
+                        scan_pages=async_pages,
+                        scan_size=size,
+                    )
+                    raw_entities = resp.get("entities") or []
+                    matched_entities = _apply_client_filters(raw_entities)
+                    _add_attempt(
+                        source="async-fallback",
+                        service_val=scan_service_name,
+                        filters_val=None,
+                        raw_count=len(raw_entities),
+                        matched_count=len(matched_entities),
+                        error_val=resp.get("_error"),
+                    )
+                    if matched_entities:
+                        _append_unique_entities(merged_entities, merged_entity_keys, matched_entities)
+                        source_label = "async" if scan_service_name else "async-unfiltered"
+                        if source_label not in merged_sources:
+                            merged_sources.append(source_label)
+                    if resp.get("_error"):
+                        error_text = str(resp.get("_error") or "").lower()
+                        if (
+                            ("unknown servicename" in error_text)
+                            or ("unknown entitytype" in error_text)
+                            or ("servicename is expected when passing entitytype" in error_text)
+                            or ("action" in error_text and "entitytype" in error_text)
+                        ):
+                            continue
+                        last_error = resp.get("_error")
+
+        if merged_entities:
+            result_warning = None
+            if any(attempt.get("source") in {"realtime-fallback", "async-fallback"} for attempt in attempts):
+                result_warning = (
+                    "Narrow filtrelerle sonuç bulunamadığı için geniş (filtersiz) fallback sorgusu kullanıldı."
+                )
+            return {
+                "entities": _sort_entities_desc(merged_entities),
+                "total": len(merged_entities),
+                "page_count": None,
+                "source": " + ".join(merged_sources) if merged_sources else "realtime",
+                "service_name": ",".join(
+                    [
+                        str(service or "-")
+                        for service in service_candidates
+                        if service is not None
+                    ][:6]
+                ) or "-",
+                "filter_variant": merged_filter_variant,
+                "_attempts": attempts,
+                "_warning": result_warning,
+            }
+
+        return {
+            "entities": [],
+            "total": 0,
+            "page_count": None,
+            "_error": last_error,
+            "_attempts": attempts,
+        }
+
     def get_user_status_audit_logs(
         self,
         user_id,
@@ -1609,6 +2333,10 @@ class GenesysAPI:
         max_pages=10,
         service_name=None,
         audit_scope="status",
+        include_async_query=True,
+        collect_all_variants=True,
+        strict_user_match=True,
+        realtime_first=True,
     ):
         """Fetch status-related audit logs for a target user via realtime audit query."""
         uid = str(user_id or "").strip()
@@ -1640,13 +2368,25 @@ class GenesysAPI:
         else:
             filter_variants = [
                 [
-                    {"property": "EntityId", "value": uid},
-                    {"property": "EntityType", "value": "USER"},
-                ],
-                [
                     {"property": "UserId", "value": uid},
                 ],
+                [
+                    {"property": "EntityId", "value": uid},
+                ],
             ]
+            # Many orgs reject EntityType when serviceName is omitted; only use
+            # EntityType variant when service is explicitly narrowed.
+            if str(service_name or "").strip():
+                filter_variants.append(
+                    [
+                        {"property": "EntityId", "value": uid},
+                        {"property": "EntityType", "value": "USER"},
+                    ]
+                )
+            if not bool(strict_user_match):
+                # For timeline actor matching we need unfiltered coverage too,
+                # because actor user can differ from affected user.
+                filter_variants = [None] + filter_variants
 
         def _audit_mentions_user(audit_item, target_uid, include_actor_match=True):
             tid = str(target_uid or "").strip().lower()
@@ -1698,8 +2438,10 @@ class GenesysAPI:
             page_count = None
             realtime_error = None
             pages_to_scan = max(1, int(scan_pages or max_pages or 1))
+            scanned_pages = 0
 
             for page_number in range(1, pages_to_scan + 1):
+                scanned_pages = page_number
                 try:
                     resp = self.query_audits_realtime(
                         interval=interval,
@@ -1738,19 +2480,160 @@ class GenesysAPI:
                 if len(page_entities) < int(page_size or 100):
                     break
 
+            truncated = False
+            try:
+                if (
+                    (not realtime_error)
+                    and page_count is not None
+                    and int(page_count) > int(pages_to_scan)
+                    and int(scanned_pages) >= int(pages_to_scan)
+                ):
+                    truncated = True
+            except Exception:
+                truncated = False
+
             return {
                 "entities": entities,
                 "total": total if total is not None else len(entities),
                 "page_count": page_count,
                 "_error": realtime_error,
+                "_truncated": truncated,
+                "_scanned_pages": scanned_pages,
+                "_pages_to_scan": pages_to_scan,
             }
 
+        def _entity_key(audit_item):
+            if not isinstance(audit_item, dict):
+                return None
+            aid = str(audit_item.get("id") or "").strip()
+            if aid:
+                return f"id:{aid}"
+            entity_obj = audit_item.get("entity") or {}
+            message_obj = audit_item.get("message") or {}
+            entity_id = (
+                str(entity_obj.get("id") or "").strip().lower()
+                if isinstance(entity_obj, dict)
+                else ""
+            )
+            message_text = (
+                str(
+                    message_obj.get("message")
+                    or message_obj.get("messageWithParams")
+                    or ""
+                ).strip().lower()
+                if isinstance(message_obj, dict)
+                else ""
+            )
+            return (
+                f"fp:{str(audit_item.get('eventDate') or '').strip()}|"
+                f"{str(audit_item.get('serviceName') or '').strip().lower()}|"
+                f"{str(audit_item.get('action') or '').strip().lower()}|"
+                f"{entity_id}|{message_text[:180]}"
+            )
+
+        def _append_unique_entities(target_rows, seen_keys, source_rows):
+            for item in source_rows or []:
+                if not isinstance(item, dict):
+                    continue
+                row_key = _entity_key(item)
+                if not row_key:
+                    continue
+                if row_key in seen_keys:
+                    continue
+                seen_keys.add(row_key)
+                target_rows.append(item)
+
+        def _append_filter_variant(filters_out, seen_filter_keys, filters_in):
+            if not isinstance(filters_in, list):
+                return
+            for item in filters_in:
+                if not isinstance(item, dict):
+                    continue
+                prop = str(item.get("property") or "").strip()
+                val = str(item.get("value") or "").strip()
+                if not prop or not val:
+                    continue
+                key = (prop.lower(), val.lower())
+                if key in seen_filter_keys:
+                    continue
+                seen_filter_keys.add(key)
+                filters_out.append({"property": prop, "value": val})
+
+        def _append_unique_text(bucket, value):
+            txt = str(value or "").strip()
+            if not txt:
+                return
+            txt_key = txt.lower()
+            if any(str(existing or "").strip().lower() == txt_key for existing in bucket):
+                return
+            bucket.append(txt)
+
+        def _describe_filters(filters):
+            if not isinstance(filters, list) or (not filters):
+                return "no-filter"
+            props = []
+            for item in filters:
+                if not isinstance(item, dict):
+                    continue
+                prop = str(item.get("property") or "").strip()
+                if prop:
+                    props.append(prop)
+            if not props:
+                return "no-filter"
+            return ",".join(sorted(set(props), key=lambda x: x.lower()))
+
+        def _sort_entities_desc(items):
+            return sorted(
+                list(items or []),
+                key=lambda row: str((row or {}).get("eventDate") or "").strip(),
+                reverse=True,
+            )
+
         last_error = None
+        merged_entities = []
+        merged_keys = set()
+        merged_filters = []
+        merged_filter_keys = set()
+        merged_sources = []
+        merged_warnings = []
+
         for filters in filter_variants:
-            realtime_resp = _collect_realtime(filters=filters, scan_service_name=service_name)
+            filter_desc = _describe_filters(filters)
+            variant_scan_pages = max(1, int(max_pages or 1))
+            if (filters is None) and (not bool(strict_user_match)):
+                variant_scan_pages = max(variant_scan_pages, 50)
+            if bool(realtime_first):
+                realtime_resp = _collect_realtime(
+                    filters=filters,
+                    scan_service_name=service_name,
+                    scan_pages=variant_scan_pages,
+                )
+            else:
+                realtime_resp = {
+                    "entities": [],
+                    "total": 0,
+                    "page_count": None,
+                    "_error": None,
+                    "_truncated": False,
+                }
             entities = realtime_resp.get("entities") or []
             if is_queue_scope and entities:
                 entities = [x for x in entities if _audit_mentions_user(x, uid, include_actor_match=False)]
+            has_entities_this_variant = bool(entities)
+            if entities:
+                _append_unique_entities(merged_entities, merged_keys, entities)
+                _append_filter_variant(merged_filters, merged_filter_keys, filters)
+                _append_unique_text(merged_sources, f"realtime[{filter_desc}]")
+            if realtime_resp.get("_truncated"):
+                _append_unique_text(
+                    merged_warnings,
+                    (
+                        f"Realtime sorgusu `{filter_desc}` filtresinde maksimum sayfa limitine takildi "
+                        f"({int(realtime_resp.get('_pages_to_scan') or max_pages or 1)} sayfa). "
+                        "Eksik kayitlar olabilir; maksimum sayfayi artirip tekrar deneyin."
+                    ),
+                )
+
             realtime_error = realtime_resp.get("_error")
             if realtime_error:
                 err_text = str(realtime_error).lower()
@@ -1764,27 +2647,39 @@ class GenesysAPI:
                 ):
                     last_error = realtime_error
 
-            if entities:
-                return {
-                    "entities": entities,
-                    "total": realtime_resp.get("total"),
-                    "page_count": realtime_resp.get("page_count"),
-                    "source": "realtime",
-                    "filter_variant": filters or [],
-                }
+            if (not bool(include_async_query)) and has_entities_this_variant and (not bool(collect_all_variants)):
+                break
 
             # Queue membership scope: avoid async query endpoint churn on orgs
             # that reject custom audit filters with HTTP 400.
             if is_queue_scope:
                 continue
 
-            # If realtime failed, try async with same filters before switching variant.
+            if not bool(include_async_query):
+                continue
+
+            should_force_async_variant = False
+            if (
+                (filters is None)
+                and (not bool(strict_user_match))
+                and bool(collect_all_variants)
+            ):
+                # Realtime no-filter can miss older slices; force async no-filter too.
+                should_force_async_variant = True
+
+            # Run async only if realtime produced no data or errored.
+            if has_entities_this_variant and (not realtime_error):
+                if not bool(collect_all_variants):
+                    break
+                if not should_force_async_variant:
+                    continue
+
             async_resp = self.query_audits(
                 interval=interval,
                 service_name=service_name,
                 filters=filters,
                 page_size=page_size,
-                max_pages=max_pages,
+                max_pages=variant_scan_pages,
                 sort_order="descending",
                 expand_user=True,
             )
@@ -1792,25 +2687,37 @@ class GenesysAPI:
             if is_queue_scope and async_entities:
                 async_entities = [x for x in async_entities if _audit_mentions_user(x, uid, include_actor_match=False)]
             if async_entities:
-                return {
-                    "entities": async_entities,
-                    "total": len(async_entities),
-                    "page_count": None,
-                    "source": "async",
-                    "transaction_id": (async_resp or {}).get("transaction_id"),
-                    "filter_variant": filters,
-                }
+                _append_unique_entities(merged_entities, merged_keys, async_entities)
+                _append_filter_variant(merged_filters, merged_filter_keys, filters)
+                _append_unique_text(merged_sources, f"async[{filter_desc}]")
+                if not bool(collect_all_variants):
+                    break
 
             if (async_resp or {}).get("_error"):
                 last_error = (async_resp or {}).get("_error")
 
+        if merged_entities:
+            payload = {
+                "entities": _sort_entities_desc(merged_entities),
+                "total": len(merged_entities),
+                "page_count": None,
+                "source": " + ".join(merged_sources) if merged_sources else "realtime",
+                "filter_variant": merged_filters,
+            }
+            if merged_warnings:
+                payload["_warning"] = " | ".join(merged_warnings)
+            return payload
+
         if is_queue_scope:
-            return {
+            payload = {
                 "entities": [],
                 "total": 0,
                 "page_count": None,
                 "_error": last_error,
             }
+            if merged_warnings:
+                payload["_warning"] = " | ".join(merged_warnings)
+            return payload
 
         # Some orgs return "entityId requires entityType" even with valid pair.
         # Fallback to broader server-side filters and narrow down client-side.
@@ -1819,6 +2726,13 @@ class GenesysAPI:
             {"filters": None, "source": "realtime-unfiltered"},
             {"filters": [{"property": "UserId", "value": uid}], "source": "realtime-userid"},
         ]
+        fallback_entities_merged = []
+        fallback_keys = set()
+        fallback_filters_merged = []
+        fallback_filter_keys = set()
+        fallback_sources = []
+        fallback_warnings = []
+
         for fb in fallback_variants:
             realtime_resp = _collect_realtime(
                 filters=fb["filters"],
@@ -1826,68 +2740,101 @@ class GenesysAPI:
                 scan_service_name=service_name,
             )
             entities = realtime_resp.get("entities") or []
-            entities = [
-                x for x in entities
-                if _audit_mentions_user(
-                    x,
-                    uid,
-                    include_actor_match=not is_queue_scope,
-                )
-            ]
+            should_filter_by_user = True
+            if (not bool(strict_user_match)) and (fb.get("filters") is None):
+                should_filter_by_user = False
+            if should_filter_by_user:
+                entities = [
+                    x for x in entities
+                    if _audit_mentions_user(
+                        x,
+                        uid,
+                        include_actor_match=not is_queue_scope,
+                    )
+                ]
             if entities:
-                return {
-                    "entities": entities,
-                    "total": len(entities),
-                    "page_count": realtime_resp.get("page_count"),
-                    "source": fb["source"],
-                    "filter_variant": fb["filters"] or [],
-                    "_warning": (
-                        "EntityId+EntityType filtreleri org tarafinda reddedildigi icin "
-                        "genis fallback filtre kullanildi."
+                _append_unique_entities(fallback_entities_merged, fallback_keys, entities)
+                _append_filter_variant(fallback_filters_merged, fallback_filter_keys, fb.get("filters"))
+                _append_unique_text(fallback_sources, str(fb.get("source") or "fallback"))
+            if realtime_resp.get("_truncated"):
+                _append_unique_text(
+                    fallback_warnings,
+                    (
+                        f"Fallback realtime sorgusu `{_describe_filters(fb.get('filters'))}` filtresinde "
+                        f"maksimum sayfa limitine takildi ({int(realtime_resp.get('_pages_to_scan') or fallback_scan_pages)} sayfa)."
                     ),
-                }
+                )
             if realtime_resp.get("_error"):
                 last_error = realtime_resp.get("_error")
 
-            async_resp = self.query_audits(
-                interval=interval,
-                service_name=service_name,
-                filters=fb["filters"],
-                page_size=page_size,
-                max_pages=fallback_scan_pages,
-                sort_order="descending",
-                expand_user=True,
-            )
-            async_entities = (async_resp or {}).get("entities") or []
-            async_entities = [
-                x for x in async_entities
-                if _audit_mentions_user(
-                    x,
-                    uid,
-                    include_actor_match=not is_queue_scope,
+            should_force_async = False
+            if (
+                bool(include_async_query)
+                and bool(collect_all_variants)
+                and (fb.get("filters") is None)
+                and (not bool(strict_user_match))
+            ):
+                # Realtime-unfiltered may omit older slices in some orgs.
+                # Force async-unfiltered to improve actor coverage in timeline mode.
+                should_force_async = True
+
+            if entities and (not realtime_resp.get("_error")) and (not should_force_async):
+                continue
+
+            if bool(include_async_query):
+                async_resp = self.query_audits(
+                    interval=interval,
+                    service_name=service_name,
+                    filters=fb["filters"],
+                    page_size=page_size,
+                    max_pages=fallback_scan_pages,
+                    sort_order="descending",
+                    expand_user=True,
                 )
-            ]
-            if async_entities:
-                return {
-                    "entities": async_entities,
-                    "total": len(async_entities),
-                    "page_count": None,
-                    "source": f"{fb['source']}-async",
-                    "transaction_id": (async_resp or {}).get("transaction_id"),
-                    "filter_variant": fb["filters"] or [],
-                    "_warning": (
-                        "EntityId+EntityType filtreleri org tarafinda reddedildigi icin "
-                        "genis fallback filtre kullanildi."
-                    ),
-                }
-            if (async_resp or {}).get("_error"):
-                last_error = (async_resp or {}).get("_error")
+                async_entities = (async_resp or {}).get("entities") or []
+                should_filter_async_by_user = True
+                if (not bool(strict_user_match)) and (fb.get("filters") is None):
+                    should_filter_async_by_user = False
+                if should_filter_async_by_user:
+                    async_entities = [
+                        x for x in async_entities
+                        if _audit_mentions_user(
+                            x,
+                            uid,
+                            include_actor_match=not is_queue_scope,
+                        )
+                    ]
+                if async_entities:
+                    _append_unique_entities(fallback_entities_merged, fallback_keys, async_entities)
+                    _append_filter_variant(fallback_filters_merged, fallback_filter_keys, fb.get("filters"))
+                    _append_unique_text(fallback_sources, f"{fb['source']}-async")
+                if (async_resp or {}).get("_error"):
+                    last_error = (async_resp or {}).get("_error")
+
+        if fallback_entities_merged:
+            fallback_warning = (
+                "EntityId+EntityType filtreleri org tarafinda reddedildigi icin "
+                "genis fallback filtre kullanildi."
+            )
+            all_warnings = []
+            _append_unique_text(all_warnings, fallback_warning)
+            for item in fallback_warnings:
+                _append_unique_text(all_warnings, item)
+            return {
+                "entities": _sort_entities_desc(fallback_entities_merged),
+                "total": len(fallback_entities_merged),
+                "page_count": None,
+                "source": " + ".join(fallback_sources) if fallback_sources else "fallback",
+                "filter_variant": fallback_filters_merged,
+                "_warning": " | ".join(all_warnings) if all_warnings else None,
+            }
 
         return {
             "entities": [],
             "total": 0,
             "page_count": None,
             "_error": last_error,
+            "_warning": " | ".join(merged_warnings) if merged_warnings else None,
         }
 
     def get_queue_membership_audit_logs(

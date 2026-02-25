@@ -1297,6 +1297,27 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                 now_ts = pytime.time()
                 queue_id_to_name = {v: k for k, v in st.session_state.queues_map.items()}
 
+                def _normalize_live_call_state(item):
+                    state_raw = str((item or {}).get("state") or "").strip().lower()
+                    if state_raw in {"interacting", "connected", "communicating", "active"}:
+                        return "interacting"
+                    if state_raw in {"waiting", "queued", "queue", "alerting", "offering", "dialing", "contacting"}:
+                        return "waiting"
+                    if state_raw in {"ivr", "flow"}:
+                        return "ivr"
+
+                    state_label_raw = str((item or {}).get("state_label") or "").strip().lower()
+                    if any(token in state_label_raw for token in ["görüşmede", "gorusmede", "bağlandı", "baglandi", "interacting", "connected"]):
+                        return "interacting"
+                    if "ivr" in state_label_raw or "flow" in state_label_raw:
+                        return "ivr"
+                    if any(token in state_label_raw for token in ["bekleyen", "waiting", "queued", "queue"]):
+                        return "waiting"
+
+                    if (item or {}).get("agent_name") or (item or {}).get("agent_id"):
+                        return "interacting"
+                    return "waiting"
+
                 # ========================================
                 # QUEUE-INDEPENDENT CALL PANEL (org-wide)
                 # Hybrid: API seed + WebSocket updates
@@ -1356,7 +1377,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         )
                         now_update = pytime.time()
                         for c in snapshot_calls:
-                            c.setdefault("state", "waiting")
+                            c["state"] = _normalize_live_call_state(c)
                             c.setdefault("wg", c.get("queue_name"))
                             c["last_update"] = now_update
                             if not c.get("media_type"):
@@ -1371,8 +1392,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
 
                 active_conversations = global_notif.get_active_conversations(max_age_seconds=active_ttl_s)
                 for c in active_conversations:
-                    if "state" not in c:
-                        c["state"] = "waiting"
+                    c["state"] = _normalize_live_call_state(c)
                     if "wg" not in c or not c.get("wg"):
                         c["wg"] = c.get("queue_name")
 

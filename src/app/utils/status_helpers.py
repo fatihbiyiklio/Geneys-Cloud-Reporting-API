@@ -62,6 +62,122 @@ def _resolve_user_label(user_id=None, users_info=None, fallback_name=None):
         return str(fallback_name)
     return uid or "-"
 
+def _resolve_audit_actor_display(audit_item, actor_id, actor_name, target_user_id=None, users_info=None):
+    def _coerce_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+        txt = str(value or "").strip().lower()
+        if txt in {"true", "1", "yes", "y"}:
+            return True
+        if txt in {"false", "0", "no", "n"}:
+            return False
+        return None
+
+    def _looks_like_uuid(value):
+        txt = str(value or "").strip()
+        if len(txt) != 36:
+            return False
+        parts = txt.split("-")
+        if len(parts) != 5:
+            return False
+        expected = (8, 4, 4, 4, 12)
+        hex_chars = "0123456789abcdefABCDEF"
+        for part, size in zip(parts, expected):
+            if len(part) != size:
+                return False
+            if any(ch not in hex_chars for ch in part):
+                return False
+        return True
+
+    def _collect_context_actor_id(context_obj):
+        if not isinstance(context_obj, (dict, list, tuple)):
+            return ""
+        actor_key_hints = (
+            "actoruserid",
+            "actinguserid",
+            "modifiedby",
+            "changedby",
+            "updatedby",
+            "initiatedbyuserid",
+            "performedbyuserid",
+            "requestinguserid",
+        )
+
+        def _walk(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    key_lower = str(key or "").strip().lower()
+                    if isinstance(value, (dict, list, tuple)):
+                        nested = _walk(value)
+                        if nested:
+                            return nested
+                        continue
+                    val = str(value or "").strip()
+                    if (not val) or (not _looks_like_uuid(val)):
+                        continue
+                    if any(hint in key_lower for hint in actor_key_hints) or ("actor" in key_lower):
+                        return val
+            elif isinstance(node, (list, tuple)):
+                for item in node:
+                    nested = _walk(item)
+                    if nested:
+                        return nested
+            return ""
+
+        return _walk(context_obj)
+
+    actor_uid = str(actor_id or "").strip()
+    target_uid = str(target_user_id or "").strip()
+    actor_label = str(actor_name or "").strip()
+    level = str((audit_item or {}).get("level") or "").strip().upper()
+    transaction_initiator = _coerce_bool((audit_item or {}).get("transactionInitiator"))
+
+    if level in {"SYSTEM", "GENESYS_INTERNAL"}:
+        return ("Sistem", "-", "Sistem")
+
+    if actor_uid and target_uid and (actor_uid.lower() == target_uid.lower()):
+        if transaction_initiator is False:
+            context_actor_id = _collect_context_actor_id((audit_item or {}).get("context"))
+            if context_actor_id and context_actor_id.lower() != target_uid.lower():
+                return (
+                    _resolve_user_label(
+                        user_id=context_actor_id,
+                        users_info=users_info,
+                        fallback_name=None,
+                    ),
+                    context_actor_id,
+                    "Supervisor",
+                )
+        # Agent changed their own status.
+        return (
+            _resolve_user_label(
+                user_id=target_uid,
+                users_info=users_info,
+                fallback_name=actor_label if actor_label and actor_label != "-" else None,
+            ),
+            actor_uid,
+            "Agent",
+        )
+    if actor_uid:
+        # Non-self actor (typically supervisor/admin) changed the status.
+        return (
+            _resolve_user_label(
+                user_id=actor_uid,
+                users_info=users_info,
+                fallback_name=actor_label if actor_label and actor_label != "-" else None,
+            ),
+            actor_uid,
+            "Supervisor",
+        )
+    if actor_label and actor_label != "-":
+        return (actor_label, "-", "Supervisor")
+    return ("-", "-", "-")
+
 def _normalize_status_value(raw_value, presence_map=None):
     if isinstance(raw_value, dict):
         pd = raw_value.get("presenceDefinition")
@@ -625,6 +741,13 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
             users_info=users_info,
             fallback_name=actor.get("name") or actor.get("displayName"),
         )
+        actor_display, actor_display_id, actor_kind = _resolve_audit_actor_display(
+            audit_item=audit,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            target_user_id=target_uid,
+            users_info=users_info,
+        )
         if target_candidates_ordered:
             affected_user_id = max(
                 target_candidates_ordered,
@@ -756,8 +879,9 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                 "Özet": f"{(queue_name or queue_id or '-')} {operation}".strip(),
                 "Eski Değer": old_text,
                 "Yeni Değer": new_text,
-                "Değiştiren": actor_name,
-                "Değiştiren ID": actor_id or "-",
+                "Değiştiren": actor_display,
+                "Değiştiren ID": actor_display_id,
+                "Değiştiren Türü": actor_kind,
                 "Etkilenen": _resolve_user_label(user_id=affected_user_id, users_info=users_info, fallback_name=None),
                 "Etkilenen ID": affected_user_id or "-",
                 "Uygulama": application or "-",
@@ -836,8 +960,9 @@ def _build_queue_membership_audit_rows(audit_entities, target_user_id, users_inf
                 "Özet": f"{(queue_name or queue_id or '-')} {operation}".strip(),
                 "Eski Değer": old_text,
                 "Yeni Değer": new_text,
-                "Değiştiren": actor_name,
-                "Değiştiren ID": actor_id or "-",
+                "Değiştiren": actor_display,
+                "Değiştiren ID": actor_display_id,
+                "Değiştiren Türü": actor_kind,
                 "Etkilenen": _resolve_user_label(user_id=affected_user_id, users_info=users_info, fallback_name=None),
                 "Etkilenen ID": affected_user_id or "-",
                 "Uygulama": application or "-",
@@ -902,6 +1027,7 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
         "newRouting",
     ]
     target_uid = str(target_user_id or "").strip()
+    target_uid_lower = target_uid.lower()
 
     actor_key_tokens = (
         "actoruserid",
@@ -1032,9 +1158,12 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
                 target_candidates.add(entity_id)
 
         if target_uid:
-            target_match = target_uid in target_candidates
-            if (not target_match) and target_candidates:
-                continue
+            normalized_targets = {
+                str(candidate or "").strip().lower()
+                for candidate in target_candidates
+                if str(candidate or "").strip()
+            }
+            target_match = target_uid_lower in normalized_targets
             if not target_match:
                 payload_blob = ""
                 try:
@@ -1044,9 +1173,9 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
                     ).lower()
                 except Exception:
                     payload_blob = f"{entity} {context} {audit.get('message')}".lower()
-                if target_uid.lower() in payload_blob:
+                if target_uid_lower in payload_blob:
                     target_match = True
-                elif actor_id and actor_id == target_uid:
+                elif actor_id and actor_id.lower() == target_uid_lower and (not normalized_targets):
                     target_match = True
             if not target_match:
                 continue
@@ -1056,7 +1185,19 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
             users_info=users_info,
             fallback_name=actor.get("name") or actor.get("displayName"),
         )
+        actor_display, actor_display_id, actor_kind = _resolve_audit_actor_display(
+            audit_item=audit,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            target_user_id=target_uid,
+            users_info=users_info,
+        )
         affected_user_id = target_uid or (sorted(target_candidates)[0] if target_candidates else "-")
+        affected_user_label = _resolve_user_label(
+            user_id=affected_user_id if str(affected_user_id or "").strip() not in {"", "-"} else "",
+            users_info=users_info,
+            fallback_name=None,
+        )
 
         event_date_raw = audit.get("eventDate")
         event_date_local = _format_iso_with_utc_offset(event_date_raw, utc_offset_hours=utc_offset_hours)
@@ -1071,6 +1212,7 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
             or message_obj.get("messageWithParams")
             or ""
         ).strip()
+        status_hint_payload = f"{service_name} {entity_type} {action} {message_text} {str(context)}".lower()
 
         property_changes = audit.get("propertyChanges") or []
         entity_changes = audit.get("entityChanges") or []
@@ -1082,7 +1224,11 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
             prop_lower = prop_name.lower()
             if not prop_lower:
                 continue
-            if not any(h in prop_lower for h in status_property_hints):
+            prop_is_status_like = any(h in prop_lower for h in status_property_hints)
+            if (not prop_is_status_like) and (prop_lower in {"status", "state", "routingstatus", "presencestatus"}):
+                if any(h in status_hint_payload for h in status_text_hints):
+                    prop_is_status_like = True
+            if not prop_is_status_like:
                 continue
             matched = True
             old_text = _format_status_values(ch.get("oldValues"), presence_map=presence_map)
@@ -1094,8 +1240,10 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
                 "Alan": prop_name,
                 "Eski Değer": old_text,
                 "Yeni Değer": new_text,
-                "Değiştiren": actor_name,
-                "Değiştiren ID": actor_id or "-",
+                "Değiştiren": actor_display,
+                "Değiştiren ID": actor_display_id,
+                "Değiştiren Türü": actor_kind,
+                "Etkilenen": affected_user_label,
                 "Etkilenen ID": affected_user_id or "-",
                 "Uygulama": application or "-",
                 "Audit Durumu": audit_status or "-",
@@ -1115,8 +1263,10 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
                         "Alan": "entityChanges",
                         "Eski Değer": "-",
                         "Yeni Değer": "-",
-                        "Değiştiren": actor_name,
-                        "Değiştiren ID": actor_id or "-",
+                        "Değiştiren": actor_display,
+                        "Değiştiren ID": actor_display_id,
+                        "Değiştiren Türü": actor_kind,
+                        "Etkilenen": affected_user_label,
                         "Etkilenen ID": affected_user_id or "-",
                         "Uygulama": application or "-",
                         "Audit Durumu": audit_status or "-",
@@ -1156,8 +1306,10 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
                 "Alan": field_name,
                 "Eski Değer": old_text,
                 "Yeni Değer": new_text,
-                "Değiştiren": actor_name,
-                "Değiştiren ID": actor_id or "-",
+                "Değiştiren": actor_display,
+                "Değiştiren ID": actor_display_id,
+                "Değiştiren Türü": actor_kind,
+                "Etkilenen": affected_user_label,
                 "Etkilenen ID": affected_user_id or "-",
                 "Uygulama": application or "-",
                 "Audit Durumu": audit_status or "-",
@@ -1166,3 +1318,502 @@ def _build_status_audit_rows(audit_entities, target_user_id, users_info=None, pr
             })
 
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Timeline yardımcı fonksiyonları
+# (Tam Statü Timeline — Users Details bölümü için)
+# ---------------------------------------------------------------------------
+
+def _parse_iso_utc(iso_value):
+    """ISO 8601 tarih string'ini UTC datetime objesine çevirir."""
+    if not iso_value:
+        return None
+    try:
+        return datetime.fromisoformat(
+            str(iso_value).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _normalize_timeline_status_token(raw_value):
+    """Statü string'ini normalize eder (küçük harf, alias eşleştirme)."""
+    text = str(raw_value or "").strip().casefold()
+    if not text:
+        return "-"
+    text = text.replace(" ", "_").replace("-", "_")
+    _ALIASES = {
+        "on_queue": "on_queue",
+        "off_queue": "off_queue",
+        "interacting": "interacting",
+        "communicating": "interacting",
+        "available": "available",
+        "away": "away",
+        "offline": "offline",
+        "break": "break",
+    }
+    return _ALIASES.get(text, text)
+
+
+def _timeline_presence_label(seg, presence_map=None):
+    """Presence segmentinden okunabilir etiket üretir."""
+    if not isinstance(seg, dict):
+        return "-"
+    p_map = presence_map or {}
+    org_presence_id = seg.get("organizationPresenceId")
+    if org_presence_id:
+        mapped = p_map.get(org_presence_id) or p_map.get(str(org_presence_id))
+        if isinstance(mapped, dict):
+            label = str(
+                mapped.get("label") or mapped.get("systemPresence") or ""
+            ).strip()
+            if label:
+                return label
+    system_presence = seg.get("systemPresence")
+    if system_presence:
+        return str(system_presence).replace("_", " ").title()
+    return "-"
+
+
+def _timeline_routing_label(seg):
+    """Routing segmentinden okunabilir etiket üretir."""
+    if not isinstance(seg, dict):
+        return "-"
+    raw = str(seg.get("routingStatus") or seg.get("status") or "").strip().upper()
+    _ROUTING_MAP = {
+        "OFF_QUEUE": "Off Queue",
+        "IDLE": "On Queue",
+        "INTERACTING": "Görüşmede",
+        "NOT_RESPONDING": "Cevapsız",
+        "COMMUNICATING": "Görüşmede",
+    }
+    if raw in _ROUTING_MAP:
+        return _ROUTING_MAP[raw]
+    return raw.replace("_", " ").title() if raw else "-"
+
+
+def _infer_audit_service(audit_item):
+    """Audit kaydından servis adını (Presence/Routing) çıkarır."""
+    service = str((audit_item or {}).get("serviceName") or "").strip().lower()
+    if service in {"presence", "routing"}:
+        return service.title()
+    etype = str((audit_item or {}).get("entityType") or "").strip().lower()
+    if "presence" in etype:
+        return "Presence"
+    blob = (
+        f"{(audit_item or {}).get('propertyChanges')} "
+        f"{(audit_item or {}).get('context')}"
+    ).lower()
+    if any(tok in blob for tok in ("routing", "onqueue", "offqueue", "joined")):
+        return "Routing"
+    if "presence" in blob:
+        return "Presence"
+    return "-"
+
+
+def _extract_audit_transition_tokens(audit_item):
+    """PropertyChanges listesinden eski/yeni statü token'larını çıkarır."""
+    old_t = "-"
+    new_t = "-"
+    for change in (audit_item or {}).get("propertyChanges") or []:
+        if not isinstance(change, dict):
+            continue
+        prop = str(change.get("property") or "").strip().lower()
+        if not any(k in prop for k in ("presence", "routing", "status", "joined", "queue")):
+            continue
+        old_values = change.get("oldValues") or []
+        new_values = change.get("newValues") or []
+        old_raw = old_values[0] if isinstance(old_values, list) and old_values else old_values
+        new_raw = new_values[0] if isinstance(new_values, list) and new_values else new_values
+        old_t = _normalize_timeline_status_token(old_raw)
+        new_t = _normalize_timeline_status_token(new_raw)
+        break
+    return old_t, new_t
+
+
+def _collect_timeline_context_actor_id(context_obj):
+    """Context nesnesinden actor UUID'sini çıkarır (recursive walk)."""
+    if not isinstance(context_obj, (dict, list, tuple)):
+        return ""
+    _HINTS = (
+        "actoruserid", "actinguserid", "modifiedby", "changedby",
+        "updatedby", "initiatedbyuserid", "performedbyuserid",
+        "requestinguserid",
+    )
+
+    def _looks_like_uuid(v):
+        txt = str(v or "").strip()
+        if len(txt) != 36:
+            return False
+        parts = txt.split("-")
+        if len(parts) != 5:
+            return False
+        sizes = (8, 4, 4, 4, 12)
+        hex_chars = "0123456789abcdefABCDEF"
+        for part, size in zip(parts, sizes):
+            if len(part) != size:
+                return False
+            if any(ch not in hex_chars for ch in part):
+                return False
+        return True
+
+    def _walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_l = str(key or "").strip().lower()
+                if isinstance(value, (dict, list, tuple)):
+                    nested = _walk(value)
+                    if nested:
+                        return nested
+                    continue
+                val = str(value or "").strip()
+                if (not val) or (not _looks_like_uuid(val)):
+                    continue
+                if any(h in key_l for h in _HINTS) or "actor" in key_l:
+                    return val
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                nested = _walk(item)
+                if nested:
+                    return nested
+        return ""
+
+    return _walk(context_obj)
+
+
+def _classify_timeline_actor(audit_item, target_user_id, users_info=None):
+    """
+    Audit kaydındaki actor'u sınıflandırır.
+    Döndürür: (isim, id, tür)  — tür: "Agent" | "Supervisor" | "Sistem"
+    """
+    item = audit_item or {}
+    actor_obj = item.get("user") or {}
+    actor_id = str(actor_obj.get("id") or "").strip()
+    actor_name = str(
+        actor_obj.get("name") or actor_obj.get("displayName") or ""
+    ).strip()
+    level = str(item.get("level") or "").strip().upper()
+    initiator = item.get("transactionInitiator")
+    target_uid = str(target_user_id or "").strip().lower()
+
+    if level in {"SYSTEM", "GENESYS_INTERNAL"}:
+        return "Sistem", "-", "Sistem"
+
+    if actor_id and actor_id.lower() == target_uid and initiator is False:
+        ctx_actor = _collect_timeline_context_actor_id(item.get("context"))
+        if ctx_actor and ctx_actor.lower() != actor_id.lower():
+            return (
+                _resolve_user_label(
+                    user_id=ctx_actor, users_info=users_info, fallback_name=None
+                ),
+                ctx_actor,
+                "Supervisor",
+            )
+
+    if actor_id:
+        role = "Agent" if actor_id.lower() == target_uid else "Supervisor"
+        return (
+            _resolve_user_label(
+                user_id=actor_id,
+                users_info=users_info,
+                fallback_name=actor_name if actor_name else None,
+            ),
+            actor_id,
+            role,
+        )
+    if actor_name:
+        return actor_name, "-", "Supervisor"
+    return "-", "-", "-"
+
+
+def _timeline_actor_type_rank(changer_type):
+    """Actor türünü sıralama için sayıya çevirir (küçük = daha öncelikli)."""
+    c = str(changer_type or "").strip().lower()
+    if c == "supervisor":
+        return 0
+    if c == "sistem":
+        return 1
+    if c == "agent":
+        return 2
+    return 3
+
+
+def prepare_actor_events(
+    audit_entities, target_user_id, users_info=None,
+):
+    """
+    Audit entity listesinden actor olay listesi üretir.
+    Her eleman: {service, time_utc, old_token, new_token, changer, changer_id,
+                 changer_type, audit_id}
+    """
+    events = []
+    for item in audit_entities or []:
+        if not isinstance(item, dict):
+            continue
+        event_time = _parse_iso_utc(item.get("eventDate"))
+        if not isinstance(event_time, datetime):
+            continue
+        old_token, new_token = _extract_audit_transition_tokens(item)
+        changer_name, changer_id, changer_type = _classify_timeline_actor(
+            item, target_user_id, users_info=users_info,
+        )
+        events.append({
+            "service": _infer_audit_service(item),
+            "time_utc": event_time,
+            "old_token": old_token,
+            "new_token": new_token,
+            "changer": changer_name,
+            "changer_id": changer_id,
+            "changer_type": changer_type,
+            "audit_id": str(item.get("id") or "-").strip() or "-",
+        })
+    return events
+
+
+def find_best_actor_for_transition(
+    actor_events, source_name, start_utc, old_value, new_value,
+):
+    """
+    Verilen geçiş için en iyi actor eşleşmesini bulur.
+    Skor: (transition_penalty, zaman_farkı, actor_type_rank)
+    Döndürür: (isim, id, tür, audit_id) veya None
+    """
+    if not isinstance(start_utc, datetime):
+        return None
+    old_token = _normalize_timeline_status_token(old_value)
+    new_token = _normalize_timeline_status_token(new_value)
+    source_key = str(source_name or "").strip().lower()
+
+    best = None
+    best_score = None
+    for ev in actor_events or []:
+        event_time = ev.get("time_utc")
+        if not isinstance(event_time, datetime):
+            continue
+        delta = abs((event_time - start_utc).total_seconds())
+        if delta > 20 * 60:
+            continue
+        ev_service = str(ev.get("service") or "").strip().lower()
+        if source_key and ev_service and ev_service != source_key:
+            continue
+
+        transition_penalty = 2
+        ev_old = str(ev.get("old_token") or "-")
+        ev_new = str(ev.get("new_token") or "-")
+        if ev_old == old_token and ev_new == new_token:
+            transition_penalty = 0
+        elif ev_old == old_token or ev_new == new_token:
+            transition_penalty = 1
+
+        if transition_penalty == 2 and delta > 45:
+            continue
+
+        score = (transition_penalty, int(delta), _timeline_actor_type_rank(ev.get("changer_type")))
+        if (best is None) or (score < best_score):
+            best = ev
+            best_score = score
+
+    if not best:
+        return None
+    return (
+        str(best.get("changer") or "-").strip() or "-",
+        str(best.get("changer_id") or "-").strip() or "-",
+        str(best.get("changer_type") or "-").strip() or "-",
+        str(best.get("audit_id") or "-").strip() or "-",
+    )
+
+
+def build_timeline_rows_from_segments(
+    segments, source_name, value_resolver,
+    timeline_start_utc, timeline_end_utc,
+    actor_events, utc_offset_hours=3.0,
+    api_fn_actor_fallback=None,
+    actor_window_cache=None,
+    user_id_for_fallback=None,
+):
+    """
+    Users Details segmentlerinden timeline geçiş satırları üretir.
+
+    Parametreler:
+        segments: Presence veya Routing segment listesi
+        source_name: "Presence" veya "Routing"
+        value_resolver: segment → etiket fonksiyonu
+        timeline_start_utc, timeline_end_utc: Aralık sınırları
+        actor_events: prepare_actor_events() çıktısı
+        utc_offset_hours: UTC offset (saat)
+        api_fn_actor_fallback: Opsiyonel fallback API çağrısı
+        actor_window_cache: Fallback sonuçlarını cache'lemek için dict
+        user_id_for_fallback: Fallback sorgusunda kullanılacak user ID
+    """
+    # Segmentleri zamana göre sırala
+    ordered = []
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        start_raw = seg.get("startTime")
+        start_utc = _parse_iso_utc(start_raw)
+        if start_utc is None:
+            continue
+        end_raw = seg.get("endTime")
+        end_utc = _parse_iso_utc(end_raw)
+        display_value = str(value_resolver(seg) or "-").strip() or "-"
+        ordered.append({
+            "start_raw": start_raw,
+            "end_raw": end_raw,
+            "start_utc": start_utc,
+            "end_utc": end_utc,
+            "value": display_value,
+        })
+    ordered.sort(
+        key=lambda r: r.get("start_utc") or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+    if actor_window_cache is None:
+        actor_window_cache = {}
+
+    rows = []
+    for idx, row in enumerate(ordered):
+        start_ts = row.get("start_utc")
+        if start_ts is None:
+            continue
+        if (start_ts < timeline_start_utc) or (start_ts >= timeline_end_utc):
+            continue
+
+        prev_value = ordered[idx - 1]["value"] if idx > 0 else "-"
+        end_ts = row.get("end_utc") or timeline_end_utc
+        if end_ts > timeline_end_utc:
+            end_ts = timeline_end_utc
+        duration_seconds = int(max(0, (end_ts - start_ts).total_seconds()))
+
+        # Actor eşleştirmesi: önce mevcut listeden, sonra fallback
+        actor_result = find_best_actor_for_transition(
+            actor_events=actor_events,
+            source_name=source_name,
+            start_utc=start_ts,
+            old_value=prev_value,
+            new_value=row.get("value"),
+        )
+
+        if actor_result is None and api_fn_actor_fallback is not None:
+            old_token = _normalize_timeline_status_token(prev_value)
+            new_token = _normalize_timeline_status_token(row.get("value"))
+            cache_key = (
+                str(source_name or "").strip().lower(),
+                int(start_ts.timestamp()),
+                str(old_token or "-"),
+                str(new_token or "-"),
+            )
+            if cache_key not in actor_window_cache:
+                actor_window_cache[cache_key] = _fallback_actor_search(
+                    api_fn=api_fn_actor_fallback,
+                    user_id=user_id_for_fallback,
+                    source_name=source_name,
+                    start_utc=start_ts,
+                    old_token=old_token,
+                    new_token=new_token,
+                )
+            actor_result = actor_window_cache.get(cache_key)
+
+        if actor_result is None:
+            actor_result = ("-", "-", "-", "-")
+
+        changer_name, changer_id, changer_type, actor_audit_id = actor_result
+
+        rows.append({
+            "_sort_ts": start_ts,
+            "Kayıt Tipi": "Geçiş",
+            "Zaman": _format_iso_with_utc_offset(
+                row.get("start_raw"), utc_offset_hours=utc_offset_hours
+            ),
+            "Kaynak": source_name,
+            "Eski Değer": prev_value or "-",
+            "Yeni Değer": row.get("value") or "-",
+            "Değiştiren": changer_name,
+            "Değiştiren ID": changer_id,
+            "Değiştiren Türü": changer_type,
+            "Audit ID": actor_audit_id,
+            "Başlangıç": _format_iso_with_utc_offset(
+                row.get("start_raw"), utc_offset_hours=utc_offset_hours
+            ),
+            "Bitiş": (
+                _format_iso_with_utc_offset(
+                    row.get("end_raw"), utc_offset_hours=utc_offset_hours
+                )
+                if row.get("end_raw")
+                else "-"
+            ),
+            "Süre (sn)": duration_seconds,
+            "Süre": format_duration_seconds(duration_seconds),
+        })
+    return rows
+
+
+def _fallback_actor_search(
+    api_fn, user_id, source_name, start_utc, old_token, new_token,
+):
+    """
+    Mevcut actor listesinde eşleşme bulunamadığında pencere bazlı audit sorgusu yapar.
+    Döndürür: (isim, id, tür, audit_id) veya None
+    """
+    try:
+        window_start = start_utc - timedelta(minutes=20)
+        window_end = start_utc + timedelta(minutes=20)
+        source_clean = str(source_name or "").strip()
+        window_payload = api_fn(
+            user_id=user_id,
+            start_date=window_start,
+            end_date=window_end,
+            page_size=100,
+            max_pages=6,
+            service_name=source_clean or None,
+            include_async_query=True,
+            collect_all_variants=True,
+            strict_user_match=False,
+            realtime_first=False,
+        ) or {}
+        window_entities = window_payload.get("entities") or []
+    except Exception:
+        return None
+
+    best = None
+    best_score = None
+    for item in window_entities:
+        if not isinstance(item, dict):
+            continue
+        event_time = _parse_iso_utc(item.get("eventDate"))
+        if not isinstance(event_time, datetime):
+            continue
+        delta = abs((event_time - start_utc).total_seconds())
+        if delta > 20 * 60:
+            continue
+        item_service = str(_infer_audit_service(item) or "").strip().lower()
+        source_lower = str(source_name or "").strip().lower()
+        if source_lower and item_service and item_service != source_lower:
+            continue
+
+        item_old, item_new = _extract_audit_transition_tokens(item)
+        transition_penalty = 2
+        if str(item_old or "-") == old_token and str(item_new or "-") == new_token:
+            transition_penalty = 0
+        elif str(item_old or "-") == old_token or str(item_new or "-") == new_token:
+            transition_penalty = 1
+        if transition_penalty == 2 and delta > 45:
+            continue
+
+        changer_name, changer_id, changer_type = _classify_timeline_actor(
+            item, user_id,
+        )
+        if str(changer_name or "-").strip() == "-":
+            continue
+
+        score = (transition_penalty, int(delta), _timeline_actor_type_rank(changer_type))
+        if (best is None) or (score < best_score):
+            best = (
+                str(changer_name or "-").strip() or "-",
+                str(changer_id or "-").strip() or "-",
+                str(changer_type or "-").strip() or "-",
+                str(item.get("id") or "-").strip() or "-",
+            )
+            best_score = score
+    return best

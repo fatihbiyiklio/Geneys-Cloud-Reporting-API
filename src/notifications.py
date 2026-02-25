@@ -915,7 +915,10 @@ class AgentNotificationManager:
             wait_seconds = _parse_wait_seconds(event.get("conversationStart"))
 
         direction = event.get("originatingDirection") or event.get("direction")
-        state = _classify_conversation_state(event)
+        state = _canonical_conversation_state(
+            _classify_conversation_state(event),
+            has_agent=bool(agent_id or agent_name),
+        )
 
         with self._lock:
             self.active_calls[conv_id] = {
@@ -1104,11 +1107,34 @@ class GlobalConversationNotificationManager:
                             old_q = merged.get("queue_name")
                             if _is_generic_queue_name(value) and not _is_generic_queue_name(old_q):
                                 continue
+                        if key == "state":
+                            # Never downgrade state during periodic API reseed
+                            # (e.g. interacting -> waiting due sparse snapshot payload).
+                            continue
                         merged[key] = value
+                    existing_state = _canonical_conversation_state(
+                        merged.get("state"),
+                        state_label=merged.get("state_label"),
+                        has_agent=bool(merged.get("agent_name") or merged.get("agent_id")),
+                    )
+                    incoming_state = _canonical_conversation_state(
+                        conv.get("state"),
+                        state_label=conv.get("state_label"),
+                        has_agent=bool(conv.get("agent_name") or conv.get("agent_id")),
+                    )
+                    if _conversation_state_rank(incoming_state) >= _conversation_state_rank(existing_state):
+                        merged["state"] = incoming_state
+                    else:
+                        merged["state"] = existing_state
                     merged["last_update"] = now
                     self.active_conversations[conv_id] = merged
                 else:
                     item = dict(conv)
+                    item["state"] = _canonical_conversation_state(
+                        item.get("state"),
+                        state_label=item.get("state_label"),
+                        has_agent=bool(item.get("agent_name") or item.get("agent_id")),
+                    )
                     item["last_update"] = now
                     self.active_conversations[conv_id] = item
 
@@ -1434,7 +1460,10 @@ class GlobalConversationNotificationManager:
             direction_label = _infer_direction_from_event(event)
             if direction_label and not direction:
                 direction = direction_label.lower()
-        state = _classify_conversation_state(event)
+        state = _canonical_conversation_state(
+            _classify_conversation_state(event),
+            has_agent=bool(agent_id or agent_name),
+        )
         
         # Format IVR display
         ivr_display = None
@@ -1730,6 +1759,37 @@ def _classify_conversation_state(event):
     if has_ivr:
         return "ivr"
     return "unknown"
+
+def _conversation_state_rank(value):
+    state = str(value or "").strip().lower()
+    if state in {"interacting", "connected", "communicating", "active"}:
+        return 3
+    if state in {"waiting", "queued", "queue", "alerting", "offering", "dialing", "contacting"}:
+        return 2
+    if state in {"ivr", "flow"}:
+        return 1
+    return 0
+
+def _canonical_conversation_state(value, state_label=None, has_agent=False):
+    state = str(value or "").strip().lower()
+    if _conversation_state_rank(state) > 0:
+        if state in {"interacting", "connected", "communicating", "active"}:
+            return "interacting"
+        if state in {"ivr", "flow"}:
+            return "ivr"
+        return "waiting"
+
+    label = str(state_label or "").strip().lower()
+    if any(token in label for token in ["görüşmede", "gorusmede", "bağlandı", "baglandi", "interacting", "connected"]):
+        return "interacting"
+    if "ivr" in label or "flow" in label:
+        return "ivr"
+    if any(token in label for token in ["bekleyen", "waiting", "queued", "queue"]):
+        return "waiting"
+
+    if has_agent:
+        return "interacting"
+    return "waiting"
 
 def _normalize_presence(presence, presence_map=None):
     if not presence:
