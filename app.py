@@ -3311,7 +3311,12 @@ if not st.session_state.app_user:
                 disabled=remember_me_disabled,
             )
             
-            if st.form_submit_button(get_text(st.session_state.language, "login"), width='stretch'):
+            login_submitted = st.form_submit_button(
+                get_text(st.session_state.language, "login"),
+                key="app_login_submit_btn",
+                use_container_width=True,
+            )
+            if login_submitted:
                 u_name_clean = str(u_name or "").strip()
                 try:
                     u_org_safe = _safe_org_code(u_org)
