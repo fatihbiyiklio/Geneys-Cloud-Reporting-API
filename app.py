@@ -242,6 +242,9 @@ LOGIN_WINDOW_SECONDS = int(os.environ.get("GENESYS_LOGIN_WINDOW_SECONDS", "900")
 LOGIN_LOCK_SECONDS = int(os.environ.get("GENESYS_LOGIN_LOCK_SECONDS", "900"))
 LOGIN_MAX_FAILURES = int(os.environ.get("GENESYS_LOGIN_MAX_FAILURES", "5"))
 LOGIN_ATTEMPT_MAX_ENTRIES = int(os.environ.get("GENESYS_LOGIN_ATTEMPT_MAX_ENTRIES", "5000"))
+COOKIE_BOOT_AUTOREFRESH_MS = int(os.environ.get("GENESYS_COOKIE_BOOT_AUTOREFRESH_MS", "700"))
+COOKIE_BOOT_HARD_RESET_EVERY = int(os.environ.get("GENESYS_COOKIE_BOOT_HARD_RESET_EVERY", "3"))
+COOKIE_BOOT_MAX_HARD_RESETS = int(os.environ.get("GENESYS_COOKIE_BOOT_MAX_HARD_RESETS", "2"))
 DATA_MANAGER_IMPL_VERSION = 2
 
 def _rm_debug(msg, *args):
@@ -837,6 +840,25 @@ def _get_cipher():
 
 _cookie_manager = None
 
+def _reset_cookie_manager(reason="manual"):
+    global _cookie_manager
+    _cookie_manager = None
+    _rm_debug("cookie manager reset requested (%s)", reason)
+
+def _enable_cookie_degraded_mode(reason=None):
+    reason_text = str(reason or "unknown").strip() or "unknown"
+    already_enabled = bool(st.session_state.get("_cookie_degraded_mode"))
+    st.session_state["_cookie_degraded_mode"] = True
+    st.session_state["_cookie_degraded_reason"] = reason_text
+    st.session_state.remember_me_enabled = False
+    st.session_state.pop("_remember_me_pending_payload", None)
+    st.session_state["_remember_me_pending_retries"] = 0
+    st.session_state["_remember_me_pending_delete"] = False
+    st.session_state["_remember_me_pending_delete_retries"] = 0
+    if not already_enabled:
+        logger.warning("Cookie degraded mode enabled (reason=%s)", reason_text)
+        _rm_debug("cookie degraded mode enabled (reason=%s)", reason_text)
+
 def _get_cookie_manager():
     global _cookie_manager
     if not Runtime.exists():
@@ -1040,6 +1062,10 @@ def delete_app_session():
         pass
 
 def _flush_pending_remember_me_delete(block_ui=True, max_retries=20):
+    if bool(st.session_state.get("_cookie_degraded_mode")):
+        st.session_state["_remember_me_pending_delete"] = False
+        st.session_state["_remember_me_pending_delete_retries"] = 0
+        return True
     if not st.session_state.get("_remember_me_pending_delete"):
         return True
     retries = int(st.session_state.get("_remember_me_pending_delete_retries", 0))
@@ -1092,6 +1118,11 @@ def _flush_pending_remember_me_delete(block_ui=True, max_retries=20):
     return True
 
 def _flush_pending_remember_me(block_ui=True, max_retries=20):
+    if bool(st.session_state.get("_cookie_degraded_mode")):
+        st.session_state.pop("_remember_me_pending_payload", None)
+        st.session_state["_remember_me_pending_retries"] = 0
+        st.session_state.remember_me_enabled = False
+        return True
     payload = st.session_state.get("_remember_me_pending_payload")
     if not payload:
         return True
@@ -1160,20 +1191,53 @@ def _flush_pending_remember_me(block_ui=True, max_retries=20):
         return False
     return True
 
-def _ensure_cookie_component_ready(max_retries=8):
+def _ensure_cookie_component_ready(max_retries=8, block_ui=True):
     retries = int(st.session_state.get("_cookie_boot_retries", 0))
     cm = _get_cookie_manager()
     if cm is not None:
         st.session_state["_cookie_boot_retries"] = 0
+        st.session_state["_cookie_boot_resets"] = 0
+        st.session_state["_cookie_degraded_mode"] = False
+        st.session_state["_cookie_degraded_reason"] = ""
         _rm_debug("cookie component ready at retry=%s", retries)
         return True
-    if retries < max_retries:
-        st.session_state["_cookie_boot_retries"] = retries + 1
-        _rm_debug("cookie component boot retry=%s/%s", retries + 1, max_retries)
-        _safe_autorefresh(interval=700, key=f"cookie_boot_retry_{retries}")
+
+    retries += 1
+    st.session_state["_cookie_boot_retries"] = retries
+    _rm_debug("cookie component boot retry=%s/%s", retries, max_retries)
+
+    # Self-heal: recreate cookie manager instance before giving up.
+    reset_every = max(1, int(COOKIE_BOOT_HARD_RESET_EVERY or 1))
+    reset_cap = max(0, int(COOKIE_BOOT_MAX_HARD_RESETS or 0))
+    reset_count = int(st.session_state.get("_cookie_boot_resets", 0) or 0)
+    if (retries % reset_every) == 0 and reset_count < reset_cap:
+        _reset_cookie_manager(reason=f"boot-retry-{retries}")
+        st.session_state["_cookie_boot_resets"] = reset_count + 1
+        _rm_debug(
+            "cookie component hard reset applied count=%s/%s",
+            st.session_state.get("_cookie_boot_resets"),
+            reset_cap,
+        )
+
+    if block_ui and retries <= max_retries:
+        _safe_autorefresh(interval=max(300, int(COOKIE_BOOT_AUTOREFRESH_MS or 700)), key=f"cookie_boot_retry_{retries}")
         st.info("Oturum bileşeni hazırlanıyor, lütfen bekleyin...")
         st.stop()
-    _rm_debug("cookie component not ready after max retries=%s", max_retries)
+
+    if retries > max_retries:
+        _enable_cookie_degraded_mode(reason="cookie-manager-unavailable")
+        last_notice_ts = float(st.session_state.get("_cookie_boot_notice_ts", 0) or 0)
+        now_ts = pytime.time()
+        if (now_ts - last_notice_ts) > 10:
+            st.session_state["_cookie_boot_notice_ts"] = now_ts
+            st.warning(
+                "Oturum bileşeni başlatılamadı. Uygulama devam ediyor ancak `Beni Hatırla` geçici olarak devre dışı."
+            )
+    elif not block_ui:
+        # Non-blocking path: keep UI responsive while component boots.
+        if retries == 1:
+            st.info("Oturum bileşeni hazırlanıyor. Giriş ekranı kullanılabilir, `Beni Hatırla` gecikebilir.")
+
     return False
 
 
@@ -3118,6 +3182,10 @@ def init_session_state():
     if '_remember_me_pending_delete' not in st.session_state: st.session_state._remember_me_pending_delete = False
     if '_remember_me_pending_delete_retries' not in st.session_state: st.session_state._remember_me_pending_delete_retries = 0
     if '_cookie_boot_retries' not in st.session_state: st.session_state._cookie_boot_retries = 0
+    if '_cookie_boot_resets' not in st.session_state: st.session_state._cookie_boot_resets = 0
+    if '_cookie_boot_notice_ts' not in st.session_state: st.session_state._cookie_boot_notice_ts = 0.0
+    if '_cookie_degraded_mode' not in st.session_state: st.session_state._cookie_degraded_mode = False
+    if '_cookie_degraded_reason' not in st.session_state: st.session_state._cookie_degraded_reason = ""
     if 'remember_me_enabled' not in st.session_state: st.session_state.remember_me_enabled = False
     if 'rep_auto_row_limit' not in st.session_state: st.session_state.rep_auto_row_limit = 50000
 
@@ -3138,7 +3206,7 @@ init_session_state()
 _inject_reboot_path_bridge_script()
 _start_periodic_reboot_scheduler()
 _maybe_periodic_temp_cleanup()
-_cookie_flow_blocking = not bool(st.session_state.get("app_user"))
+_cookie_flow_blocking = bool(st.session_state.get("app_user")) and (not bool(st.session_state.get("_cookie_degraded_mode")))
 _flush_pending_remember_me_delete(block_ui=_cookie_flow_blocking)
 _flush_pending_remember_me(block_ui=_cookie_flow_blocking)
 
@@ -3204,7 +3272,7 @@ if not st.session_state.app_user:
                             st.error(msg)
         st.stop()
 
-    _ensure_cookie_component_ready(max_retries=8)
+    _ensure_cookie_component_ready(max_retries=8, block_ui=False)
     # Try Auto-Login from Encrypted Session File
     saved_session = load_app_session()
     if saved_session:
@@ -3232,7 +3300,16 @@ if not st.session_state.app_user:
             u_org = st.text_input(get_text(st.session_state.language, "org_code"), value="default")
             u_name = st.text_input(get_text(st.session_state.language, "username"))
             u_pass = st.text_input(get_text(st.session_state.language, "password"), type="password")
-            remember_me = st.checkbox(get_text(st.session_state.language, "remember_me"), value=False, help="Bu cihazda oturumu hatirla.")
+            remember_me_disabled = bool(st.session_state.get("_cookie_degraded_mode"))
+            remember_me_help = "Bu cihazda oturumu hatirla."
+            if remember_me_disabled:
+                remember_me_help = "Oturum bileşeni hazır olmadığından Beni Hatırla geçici devre dışı."
+            remember_me = st.checkbox(
+                get_text(st.session_state.language, "remember_me"),
+                value=False,
+                help=remember_me_help,
+                disabled=remember_me_disabled,
+            )
             
             if st.form_submit_button(get_text(st.session_state.language, "login"), width='stretch'):
                 u_name_clean = str(u_name or "").strip()
