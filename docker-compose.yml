@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   genesys-reporting:
     image: ${IMAGE_REPOSITORY:-ghcr.io/fbiyikli/genesys-cloud-reporting}:${IMAGE_TAG:-latest}
@@ -23,6 +21,7 @@ services:
       - GENESYS_MEMORY_HARD_LIMIT_MB=1024
       - GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC=60
       - GENESYS_MEMORY_RESTART_COOLDOWN_SEC=300
+      - GENESYS_RESTART_EXIT_CODE=42
       # Optional: Set timezone
       - TZ=Europe/Istanbul
     healthcheck:
@@ -37,6 +36,8 @@ services:
           memory: 2G
         reservations:
           memory: 512M
+    mem_limit: 2g
+    mem_reservation: 512m
     logging:
       driver: "json-file"
       options:

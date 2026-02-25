@@ -17,24 +17,38 @@ echo "Platform: ${PLATFORM}"
 echo "Push: ${PUSH_IMAGE}"
 echo "========================================="
 
-# Clean Python cache before build context send
-find . -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
-find . -type f -name "*.pyc" -delete 2>/dev/null || true
+# Optional preflight: catch syntax errors before Docker build
+if command -v python3 >/dev/null 2>&1; then
+  echo "Running Python syntax preflight..."
+  python3 -m compileall -q app.py run_app.py src
+fi
 
-if [ "${PUSH_IMAGE}" = "1" ]; then
-  docker buildx build \
-    --platform "${PLATFORM}" \
-    --pull \
-    -t "${FULL_IMAGE}" \
-    --push \
-    .
+if docker buildx version >/dev/null 2>&1; then
+  echo "Using docker buildx"
+  if [ "${PUSH_IMAGE}" = "1" ]; then
+    docker buildx build \
+      --platform "${PLATFORM}" \
+      --pull \
+      -t "${FULL_IMAGE}" \
+      --push \
+      .
+  else
+    docker buildx build \
+      --platform "${PLATFORM}" \
+      --pull \
+      -t "${FULL_IMAGE}" \
+      --load \
+      .
+  fi
 else
-  docker buildx build \
-    --platform "${PLATFORM}" \
+  echo "docker buildx not found, falling back to docker build"
+  docker build \
     --pull \
     -t "${FULL_IMAGE}" \
-    --load \
     .
+  if [ "${PUSH_IMAGE}" = "1" ]; then
+    docker push "${FULL_IMAGE}"
+  fi
 fi
 
 echo ""
