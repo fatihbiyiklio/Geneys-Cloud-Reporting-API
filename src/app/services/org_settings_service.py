@@ -3,6 +3,21 @@ from typing import Any, Dict
 from src.app.context import bind_context
 
 
+def _audit_user_action(action, detail=None, status="info", metadata=None):
+    audit_fn = globals().get("_log_user_action")
+    if callable(audit_fn):
+        try:
+            audit_fn(
+                action=action,
+                detail=detail,
+                status=status,
+                metadata=metadata,
+                source="org-settings-service",
+            )
+        except Exception:
+            pass
+
+
 def render_org_settings_service(context: Dict[str, Any]) -> None:
     """Render organization settings page using injected app context."""
     bind_context(globals(), context)
@@ -40,9 +55,21 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
                         else:
                             ok, msg = auth_manager.add_organization(new_org_safe, new_admin, new_admin_pw)
                         if ok:
+                            _audit_user_action(
+                                action="organization_create",
+                                detail=f"Organization '{new_org_safe}' created.",
+                                status="success",
+                                metadata={"organization": new_org_safe, "admin": new_admin},
+                            )
                             st.success(msg)
                             st.rerun()
                         else:
+                            _audit_user_action(
+                                action="organization_create",
+                                detail=str(msg or f"Organization '{new_org}' creation failed."),
+                                status="error",
+                                metadata={"organization": new_org, "admin": new_admin},
+                            )
                             st.error(msg)
 
         with c_org2:
@@ -63,6 +90,12 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
                     else:
                         ok, msg = auth_manager.delete_organization(del_org)
                         if ok:
+                            _audit_user_action(
+                                action="organization_delete",
+                                detail=f"Organization '{del_org}' deleted.",
+                                status="success",
+                                metadata={"organization": del_org},
+                            )
                             delete_org_files(del_org)
                             remove_shared_data_manager(del_org)
                             try:
@@ -74,6 +107,12 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
                             st.success(msg)
                             st.rerun()
                         else:
+                            _audit_user_action(
+                                action="organization_delete",
+                                detail=str(msg or f"Organization '{del_org}' deletion failed."),
+                                status="error",
+                                metadata={"organization": del_org},
+                            )
                             st.error(msg)
     else:
         st.subheader(get_text(lang, "organization"))
@@ -110,6 +149,12 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
     c_dm5, c_dm6 = st.columns(2)
     with c_dm5:
         if st.button(get_text(lang, "org_dm_start")):
+            _audit_user_action(
+                action="org_dm_start",
+                detail=f"DataManager start requested for '{org_sel}'.",
+                status="success",
+                metadata={"organization": org_sel},
+            )
             if org_sel == current_org:
                 set_dm_enabled(current_org, True)
                 ensure_data_manager()
@@ -127,6 +172,12 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
             st.rerun()
     with c_dm6:
         if st.button(get_text(lang, "org_dm_stop")):
+            _audit_user_action(
+                action="org_dm_stop",
+                detail=f"DataManager stop requested for '{org_sel}'.",
+                status="success",
+                metadata={"organization": org_sel},
+            )
             dm = get_existing_data_manager(org_sel)
             if dm and dm.is_running():
                 dm.force_stop()
@@ -166,6 +217,12 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
                     _clear_live_panel_caches(org, clear_shared=True)
                 except Exception:
                     pass
+            _audit_user_action(
+                action="org_general_settings_save",
+                detail=f"General settings saved for '{org}'.",
+                status="success",
+                metadata={"organization": org, "utc_offset": int(u_off), "refresh_interval": int(ref_i)},
+            )
             st.success(get_text(lang, "view_saved"))
             st.rerun()
 
@@ -179,9 +236,42 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
     
     if st.button(get_text(lang, "login_genesys")):
         if c_id and c_sec:
+            prev_client_id = str(conf.get("client_id") or "")
+            prev_client_secret = str(conf.get("client_secret") or "")
+            prev_region = str(conf.get("region") or "")
+            credentials_changed = (
+                (str(c_id) != prev_client_id)
+                or (str(c_sec) != prev_client_secret)
+                or (str(region) != prev_region)
+            )
+            credentials_change_meta = {
+                "organization": org,
+                "region": region,
+                "client_id_changed": bool(str(c_id) != prev_client_id),
+                "client_secret_changed": bool(str(c_sec) != prev_client_secret),
+                "region_changed": bool(str(region) != prev_region),
+            }
+            if credentials_changed:
+                _audit_user_action(
+                    action="genesys_api_credentials_change",
+                    detail=f"Genesys API credentials changed for '{org}'.",
+                    status="info",
+                    metadata=credentials_change_meta,
+                )
             with st.spinner("Authenticating..."):
                 client, err = authenticate(c_id, c_sec, region, org_code=org)
                 if client:
+                    _audit_user_action(
+                        action="genesys_login",
+                        detail=f"Genesys login successful for '{org}'.",
+                        status="success",
+                        metadata={
+                            "organization": org,
+                            "region": region,
+                            "credentials_changed": credentials_changed,
+                            **credentials_change_meta,
+                        },
+                    )
                     st.session_state.api_client = client
                     st.session_state.genesys_logged_out = False
                     # Use existing offsets/intervals if available
@@ -206,11 +296,29 @@ def render_org_settings_service(context: Dict[str, Any]) -> None:
                     # Start with empty queues to prevent full fetch
                     st.session_state.data_manager.start({}, {}) 
                     st.rerun()
-                else: st.error(f"Error: {err}")
+                else:
+                    _audit_user_action(
+                        action="genesys_login",
+                        detail=f"Genesys login failed for '{org}': {err}",
+                        status="error",
+                        metadata={
+                            "organization": org,
+                            "region": region,
+                            "credentials_changed": credentials_changed,
+                            **credentials_change_meta,
+                        },
+                    )
+                    st.error(f"Error: {err}")
     
     if st.session_state.api_client:
         st.divider()
         if st.button(get_text(lang, "logout_genesys"), type="primary"):
+            _audit_user_action(
+                action="genesys_logout",
+                detail=f"Genesys logout requested for '{org}'.",
+                status="success",
+                metadata={"organization": org},
+            )
             # Stop background fetch for this org and clear API client
             dm = st.session_state.get('data_manager')
             if dm:

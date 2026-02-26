@@ -3,6 +3,21 @@ from typing import Any, Dict
 from src.app.context import bind_context
 
 
+def _audit_user_action(action, detail=None, status="info", metadata=None):
+    audit_fn = globals().get("_log_user_action")
+    if callable(audit_fn):
+        try:
+            audit_fn(
+                action=action,
+                detail=detail,
+                status=status,
+                metadata=metadata,
+                source="reports-service",
+            )
+        except Exception:
+            pass
+
+
 def render_reports_service(context: Dict[str, Any]) -> None:
     """Render reports page using injected app context."""
     bind_context(globals(), context)
@@ -359,6 +374,32 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             series = pd.Series(series_in, index=index, dtype="float64")
             series = pd.to_numeric(series, errors="coerce")
         return series.replace([float("inf"), float("-inf")], 0).fillna(0)
+
+    def _audit_report_fetch(status="info", rows=None, detail=None, extra=None):
+        metadata = {
+            "report_type": str(r_type or ""),
+            "selected_entities": len(sel_names or []),
+            "selected_metrics": len(sel_mets or []),
+            "start_date": str(sd),
+            "end_date": str(ed),
+            "start_time": str(st_),
+            "end_time": str(et),
+            "granularity": str(gran_opt.get(sel_gran) if isinstance(gran_opt, dict) else sel_gran),
+            "media_types": list(sel_media_types or []),
+        }
+        if rows is not None:
+            try:
+                metadata["row_count"] = int(rows)
+            except Exception:
+                metadata["row_count"] = rows
+        if isinstance(extra, dict):
+            metadata.update(extra)
+        _audit_user_action(
+            action="report_fetch",
+            detail=detail or f"Report fetched: {r_type}",
+            status=status,
+            metadata=metadata,
+        )
 
     def _normalize_detail_media_token(raw_media):
         token = str(raw_media or "").strip().lower()
@@ -1096,20 +1137,32 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         df_chat = _apply_selected_duration_view(df_chat)
                         final_df = df_chat.rename(columns=rename_final)
                         final_df = _apply_report_row_limit(final_df, label="Chat detay raporu")
+                        _audit_report_fetch(
+                            status="success",
+                            rows=len(final_df),
+                            detail="Chat detail report fetched.",
+                        )
                         final_df_view = render_table_with_export_view(final_df, "chat_detail")
                         _store_report_result("chat_detail", final_df, "chat_detail")
                         render_downloads(final_df_view, "chat_detail", key_base="chat_detail")
                         report_rendered_this_run = True
                     elif not df.empty:
                         _clear_report_result("chat_detail")
+                        _audit_report_fetch(
+                            status="warning",
+                            rows=0,
+                            detail="Chat detail report returned no chat/message rows.",
+                        )
                         st.warning(
                             "Seçilen tarih aralığında hiç 'Chat/Mesaj' kaydı bulunamadı. (Sesli çağrılar hariç tutuldu)"
                         )
                     else:
                         _clear_report_result("chat_detail")
+                        _audit_report_fetch(status="warning", rows=0, detail="Chat detail report returned no data.")
                         st.warning(get_text(lang, "no_data"))
                 else:
                     _clear_report_result("chat_detail")
+                    _audit_report_fetch(status="warning", rows=0, detail="Chat detail report returned no data.")
                     st.warning(get_text(lang, "no_data"))
                 try:
                     import gc as _gc
@@ -1269,6 +1322,11 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                          final_df = df_filtered.rename(columns=rename_final)
                          final_df = _apply_report_row_limit(final_df, label="Kaçan etkileşim raporu")
                          
+                         _audit_report_fetch(
+                             status="success",
+                             rows=len(final_df),
+                             detail="Missed interactions report fetched.",
+                         )
                          st.success(f"{len(final_df)} adet kaçan etkileşim bulundu.")
                          final_df_view = render_table_with_export_view(final_df, "missed_interactions")
                          _store_report_result("missed_interactions", final_df, "missed_interactions")
@@ -1276,9 +1334,11 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                          report_rendered_this_run = True
                      else:
                          _clear_report_result("missed_interactions")
+                         _audit_report_fetch(status="warning", rows=0, detail="Missed interactions report returned no rows.")
                          st.warning("Seçilen kriterlere uygun kaçan çağrı/etkileşim bulunamadı.")
                  else:
                      _clear_report_result("missed_interactions")
+                     _audit_report_fetch(status="warning", rows=0, detail="Missed interactions report returned no data.")
                      st.warning(get_text(lang, "no_data"))
                  try:
                      import gc as _gc
@@ -1379,12 +1439,18 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                      df_filtered = _apply_selected_duration_view(df_filtered)
                      final_df = df_filtered.rename(columns=rename_final)
                      final_df = _apply_report_row_limit(final_df, label="Etkileşim arama raporu")
+                     _audit_report_fetch(
+                         status="success",
+                         rows=len(final_df),
+                         detail="Interaction search report fetched.",
+                     )
                      final_df_view = render_table_with_export_view(final_df, "interaction_search")
                      _store_report_result("interaction_search", final_df, "interactions")
                      render_downloads(final_df_view, "interactions", key_base="interaction_search")
                      report_rendered_this_run = True
                  else:
                      _clear_report_result("interaction_search")
+                     _audit_report_fetch(status="warning", rows=0, detail="Interaction search report returned no data.")
                      st.warning(get_text(lang, "no_data"))
                  try:
                      import gc as _gc
@@ -1394,7 +1460,9 @@ def render_reports_service(context: Dict[str, Any]) -> None:
 
     # --- STANDARD REPORTS ---
     elif r_type not in ["chat_detail", "missed_interactions"] and st.button(get_text(lang, "fetch_report"), type="primary", width='stretch'):
-        if not sel_mets: st.warning("Lütfen metrik seçiniz.")
+        if not sel_mets:
+            _audit_report_fetch(status="warning", rows=0, detail="Report fetch blocked: no metric selected.")
+            st.warning("Lütfen metrik seçiniz.")
         else:
             unsupported_aggregate_metrics = {
                 "tOrganizationResponse", "tAcdWait", "nConsultConnected", "nConsultAnswered",
@@ -1446,6 +1514,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 m in chat_metric_keys for m in (sel_mets or [])
             )
             if not sel_mets_effective and not chat_metrics_requested:
+                _audit_report_fetch(status="warning", rows=0, detail="Report fetch blocked: no supported metric selected.")
                 st.warning("Desteklenen bir metrik seçiniz.")
                 st.stop()
 
@@ -1780,6 +1849,11 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     rename.update({m: get_text(lang, m) for m in sel_mets if m not in rename})
                     df_out = final_df.rename(columns=rename)
                     df_out = _apply_report_row_limit(df_out, label="Standart rapor")
+                    _audit_report_fetch(
+                        status="success",
+                        rows=len(df_out),
+                        detail=f"Standard report fetched: {r_type}",
+                    )
                     df_out_view = render_table_with_export_view(df_out, r_type)
                     _store_report_result(r_type, df_out, f"report_{r_type}")
                     report_rendered_this_run = True
@@ -1813,6 +1887,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     render_downloads(df_out_view, f"report_{r_type}", key_base=r_type)
                 else:
                     _clear_report_result(r_type)
+                    _audit_report_fetch(status="warning", rows=0, detail=f"Standard report returned no data: {r_type}")
                     st.warning(get_text(lang, "no_data"))
 
     if not report_rendered_this_run:

@@ -87,6 +87,10 @@ TEMP_CLEANUP_INTERVAL_SEC = int(os.environ.get("GENESYS_TEMP_CLEANUP_INTERVAL_SE
 TEMP_FILE_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MAX_AGE_HOURS", "6"))
 TEMP_FILE_MANUAL_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MANUAL_MAX_AGE_HOURS", "0"))
 TEMP_KEEP_RECENT_SECONDS = int(os.environ.get("GENESYS_TEMP_KEEP_RECENT_SECONDS", "120"))
+LOG_FILE_MAX_AGE_HOURS = float(os.environ.get("GENESYS_LOG_FILE_MAX_AGE_HOURS", "72"))
+USER_ACTION_LOG_RETENTION_DAYS = int(os.environ.get("GENESYS_USER_ACTION_LOG_RETENTION_DAYS", "3"))
+USER_ACTION_LOG_MAX_ENTRIES = int(os.environ.get("GENESYS_USER_ACTION_LOG_MAX_ENTRIES", "100000"))
+USER_ACTION_LOG_PRUNE_INTERVAL_SECONDS = int(os.environ.get("GENESYS_USER_ACTION_LOG_PRUNE_INTERVAL_SECONDS", "900"))
 
 
 def _resolve_periodic_reboot_interval_seconds():
@@ -462,7 +466,6 @@ def cleanup_temp_files(max_age_hours=None, aggressive=False):
         max_age_seconds = max(0, int(TEMP_FILE_MAX_AGE_HOURS * 3600))
 
     now = pytime.time()
-    cutoff_ts = now - max_age_seconds
     keep_recent_seconds = 0 if aggressive else max(0, TEMP_KEEP_RECENT_SECONDS)
     summary = {
         "temp_dir": "",
@@ -478,12 +481,14 @@ def cleanup_temp_files(max_age_hours=None, aggressive=False):
         if len(summary["errors"]) < 20:
             summary["errors"].append(message)
 
-    def _is_old_enough(path):
+    def _is_old_enough(path, age_seconds=None):
+        effective_age_seconds = max_age_seconds if age_seconds is None else max(0, int(age_seconds))
+        effective_cutoff_ts = now - effective_age_seconds
         try:
             mtime = os.path.getmtime(path)
             if keep_recent_seconds and (now - mtime) < keep_recent_seconds:
                 return False
-            if max_age_seconds > 0 and mtime > cutoff_ts:
+            if effective_age_seconds > 0 and mtime > effective_cutoff_ts:
                 return False
             return True
         except Exception:
@@ -564,7 +569,11 @@ def cleanup_temp_files(max_age_hours=None, aggressive=False):
     app_log_path = os.path.join(logs_dir, "app.log")
     if os.path.isfile(app_log_path):
         summary["scanned_files"] += 1
-        if force_target_cleanup or _is_old_enough(app_log_path):
+        try:
+            log_max_age_seconds = max(0, int(float(LOG_FILE_MAX_AGE_HOURS) * 3600))
+        except Exception:
+            log_max_age_seconds = 72 * 3600
+        if force_target_cleanup or _is_old_enough(app_log_path, age_seconds=log_max_age_seconds):
             _truncate_file(app_log_path)
 
     monitor_state_paths = []
@@ -581,12 +590,11 @@ def cleanup_temp_files(max_age_hours=None, aggressive=False):
         if normalized in seen_monitor_paths:
             continue
         seen_monitor_paths.add(normalized)
-        for candidate in (normalized, f"{normalized}.tmp"):
-            if not os.path.isfile(candidate):
-                continue
+        tmp_candidate = f"{normalized}.tmp"
+        if os.path.isfile(tmp_candidate):
             summary["scanned_files"] += 1
-            if force_target_cleanup or _is_old_enough(candidate):
-                _remove_file(candidate)
+            if force_target_cleanup or _is_old_enough(tmp_candidate):
+                _remove_file(tmp_candidate)
 
     return summary
 
@@ -950,7 +958,11 @@ def generate_password(length=12):
 def load_app_session():
     try:
         _cleanup_legacy_app_session_file()
-        session_data = _read_app_session_cookie()
+        cookie_status, session_data = _read_app_session_cookie(with_status=True)
+        if cookie_status == "invalid":
+            _rm_debug("load session: invalid cookie payload, deleting")
+            delete_app_session()
+            return None
         if not session_data:
             return None
         timestamp = session_data.get("timestamp", 0)
@@ -1655,6 +1667,314 @@ def _shared_periodic_reboot_store():
 @st.cache_resource(show_spinner=False)
 def _shared_reboot_event_store():
     return {"lock": threading.Lock()}
+
+
+@st.cache_resource(show_spinner=False)
+def _shared_user_action_store():
+    return {"lock": threading.Lock(), "last_prune_ts": 0.0}
+
+
+def _user_action_file_path():
+    try:
+        monitor_dir = os.path.join(ORG_BASE_DIR, "_monitor")
+        os.makedirs(monitor_dir, exist_ok=True)
+        return os.path.join(monitor_dir, "user_actions.jsonl")
+    except Exception:
+        return None
+
+
+def _sanitize_action_metadata(value, depth=0):
+    if depth > 3:
+        return "<max-depth>"
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return float(value) if isinstance(value, float) else int(value)
+        except Exception:
+            return str(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) > 280:
+            return text[:277] + "..."
+        return text
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for item in list(value)[:40]:
+            out.append(_sanitize_action_metadata(item, depth=depth + 1))
+        return out
+    if isinstance(value, dict):
+        out = {}
+        for key, val in list(value.items())[:40]:
+            key_text = str(key)
+            key_lower = key_text.lower()
+            if any(token in key_lower for token in ("password", "secret", "token", "client_secret")):
+                out[key_text] = "***"
+                continue
+            out[key_text] = _sanitize_action_metadata(val, depth=depth + 1)
+        return out
+    return str(value)
+
+
+def _parse_user_action_timestamp(raw_value):
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def _read_user_actions_locked():
+    path = _user_action_file_path()
+    if not path or (not os.path.exists(path)):
+        return []
+    events = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                row = str(line or "").strip()
+                if not row:
+                    continue
+                try:
+                    item = json.loads(row)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                event = {
+                    "timestamp": str(item.get("timestamp") or "").strip(),
+                    "action": str(item.get("action") or "-").strip() or "-",
+                    "status": str(item.get("status") or "info").strip() or "info",
+                    "source": str(item.get("source") or "-").strip() or "-",
+                    "username": str(item.get("username") or "-").strip() or "-",
+                    "org_code": str(item.get("org_code") or "-").strip() or "-",
+                    "role": str(item.get("role") or "-").strip() or "-",
+                    "page": str(item.get("page") or "-").strip() or "-",
+                    "detail": str(item.get("detail") or "").strip(),
+                    "metadata": _sanitize_action_metadata(item.get("metadata")),
+                }
+                events.append(event)
+    except Exception:
+        return []
+    return events
+
+
+def _write_user_actions_locked(events):
+    path = _user_action_file_path()
+    if not path:
+        return False
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for event in events or []:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def _prune_user_actions_locked(now_ts=None):
+    store = _shared_user_action_store()
+    current_ts = float(now_ts if now_ts is not None else pytime.time())
+    last_prune_ts = float(store.get("last_prune_ts", 0) or 0)
+    if (current_ts - last_prune_ts) < max(30, int(USER_ACTION_LOG_PRUNE_INTERVAL_SECONDS or 900)):
+        return
+    events = _read_user_actions_locked()
+    if not events:
+        store["last_prune_ts"] = current_ts
+        return
+    retention_days = max(1, int(USER_ACTION_LOG_RETENTION_DAYS or 1))
+    cutoff_dt = datetime.now() - timedelta(days=retention_days)
+    kept = []
+    for event in events:
+        ts = _parse_user_action_timestamp(event.get("timestamp"))
+        if ts and ts >= cutoff_dt:
+            kept.append(event)
+    max_entries = max(1000, int(USER_ACTION_LOG_MAX_ENTRIES or 1000))
+    if len(kept) > max_entries:
+        kept = kept[-max_entries:]
+    _write_user_actions_locked(kept)
+    store["last_prune_ts"] = current_ts
+
+
+def _append_user_action(action, username=None, org_code=None, role=None, page=None, status="info", detail=None, metadata=None, source="app"):
+    safe_action = str(action or "").strip() or "unknown"
+    event = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "action": safe_action,
+        "status": str(status or "info").strip() or "info",
+        "source": str(source or "app").strip() or "app",
+        "username": str(username or "-").strip() or "-",
+        "org_code": str(org_code or "-").strip() or "-",
+        "role": str(role or "-").strip() or "-",
+        "page": str(page or "-").strip() or "-",
+        "detail": str(detail or "").strip(),
+        "metadata": _sanitize_action_metadata(metadata),
+    }
+    store = _shared_user_action_store()
+    with store["lock"]:
+        _prune_user_actions_locked(now_ts=pytime.time())
+        path = _user_action_file_path()
+        if not path:
+            return event
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    return event
+
+
+def _get_user_action_events(limit=500, org_code=None, username=None, action=None, status=None, source=None, since_hours=None):
+    store = _shared_user_action_store()
+    with store["lock"]:
+        _prune_user_actions_locked(now_ts=pytime.time())
+        events = _read_user_actions_locked()
+
+    org_filter = str(org_code or "").strip().lower()
+    user_filter = str(username or "").strip().lower()
+    action_filter = str(action or "").strip().lower()
+    status_filter = str(status or "").strip().lower()
+    source_filter = str(source or "").strip().lower()
+    since_cutoff = None
+    if since_hours is not None:
+        try:
+            hours = float(since_hours)
+            if hours > 0:
+                since_cutoff = datetime.now() - timedelta(hours=hours)
+        except Exception:
+            since_cutoff = None
+
+    filtered = []
+    excluded_actions = {"page_navigation", "admin_widget_action"}
+    for event in events:
+        action_value = str(event.get("action") or "").strip()
+        if action_value in excluded_actions:
+            continue
+        if org_filter and str(event.get("org_code") or "").strip().lower() != org_filter:
+            continue
+        if user_filter and user_filter not in str(event.get("username") or "").strip().lower():
+            continue
+        if action_filter and action_filter not in action_value.lower():
+            continue
+        if status_filter and status_filter != str(event.get("status") or "").strip().lower():
+            continue
+        if source_filter and source_filter not in str(event.get("source") or "").strip().lower():
+            continue
+        if since_cutoff is not None:
+            ts = _parse_user_action_timestamp(event.get("timestamp"))
+            if ts is None or ts < since_cutoff:
+                continue
+        filtered.append(event)
+
+    filtered.sort(
+        key=lambda ev: _parse_user_action_timestamp(ev.get("timestamp")) or datetime.min,
+        reverse=True,
+    )
+    if limit is None:
+        return filtered
+    try:
+        lim = max(1, int(limit))
+    except Exception:
+        lim = 500
+    return filtered[:lim]
+
+
+def _log_user_action(action, detail=None, metadata=None, status="info", source="app", username=None, org_code=None, role=None, page=None):
+    try:
+        app_user = st.session_state.get("app_user") or {}
+    except Exception:
+        app_user = {}
+    resolved_username = str(username or app_user.get("username") or "-").strip() or "-"
+    resolved_org = str(org_code or app_user.get("org_code") or "-").strip() or "-"
+    resolved_role = str(role or app_user.get("role") or "-").strip() or "-"
+    try:
+        resolved_page = str(page or st.session_state.get("page") or "-").strip() or "-"
+    except Exception:
+        resolved_page = str(page or "-").strip() or "-"
+    return _append_user_action(
+        action=action,
+        username=resolved_username,
+        org_code=resolved_org,
+        role=resolved_role,
+        page=resolved_page,
+        status=status,
+        detail=detail,
+        metadata=metadata,
+        source=source,
+    )
+
+
+def _monitor_api_call_audit_observer(entry):
+    if not isinstance(entry, dict):
+        return
+    endpoint = str(entry.get("endpoint") or "").strip()
+    method = str(entry.get("method") or "").strip().upper() or "GET"
+    raw_status = entry.get("status_code")
+    try:
+        status_code = int(raw_status)
+    except Exception:
+        status_code = None
+    if status_code is None:
+        action_status = "warning"
+    elif 200 <= status_code < 400:
+        action_status = "success"
+    elif 400 <= status_code < 500:
+        action_status = "warning"
+    else:
+        action_status = "error"
+
+    try:
+        app_user = st.session_state.get("app_user") or {}
+        username = str(app_user.get("username") or "-").strip() or "-"
+        org_code = str(app_user.get("org_code") or "-").strip() or "-"
+        role = str(app_user.get("role") or "-").strip() or "-"
+        page = str(st.session_state.get("page") or "-").strip() or "-"
+    except Exception:
+        username = "-"
+        org_code = "-"
+        role = "-"
+        page = "-"
+
+    _append_user_action(
+        action="api_request",
+        username=username,
+        org_code=org_code,
+        role=role,
+        page=page,
+        status=action_status,
+        detail=f"{method} {endpoint}" if endpoint else method,
+        metadata={
+            "method": method,
+            "endpoint": endpoint,
+            "status_code": status_code,
+            "duration_ms": entry.get("duration_ms"),
+            "timestamp": entry.get("timestamp"),
+        },
+        source="api-monitor",
+    )
+
+
+try:
+    monitor.register_api_call_observer("user-action-audit", _monitor_api_call_audit_observer)
+except Exception:
+    pass
 
 
 def _reboot_events_file_path():
@@ -3266,9 +3586,29 @@ if not st.session_state.app_user:
                         ok, msg = auth_manager.reset_password("default", "admin", new_pw)
                         if ok:
                             _clear_login_failures("default", "admin")
+                            _log_user_action(
+                                action="bootstrap_admin_password_set",
+                                detail="Initial admin password configured.",
+                                status="success",
+                                source="auth",
+                                username="admin",
+                                org_code="default",
+                                role="Admin",
+                                page="LOGIN",
+                            )
                             st.success("Admin şifresi oluşturuldu. Giriş ekranına yönlendiriliyorsunuz.")
                             st.rerun()
                         else:
+                            _log_user_action(
+                                action="bootstrap_admin_password_set",
+                                detail=str(msg or "Initial admin password setup failed."),
+                                status="error",
+                                source="auth",
+                                username="admin",
+                                org_code="default",
+                                role="Admin",
+                                page="LOGIN",
+                            )
                             st.error(msg)
         st.stop()
 
@@ -3286,6 +3626,16 @@ if not st.session_state.app_user:
                 hydrated_user.get("username"),
                 hydrated_user.get("org_code"),
             )
+            _log_user_action(
+                action="app_auto_login_cookie",
+                detail="Auto login from remember-me cookie.",
+                status="success",
+                source="auth",
+                username=hydrated_user.get("username"),
+                org_code=hydrated_user.get("org_code"),
+                role=hydrated_user.get("role"),
+                page="LOGIN",
+            )
             st.session_state.app_user = hydrated_user
             st.session_state.remember_me_enabled = True
             ensure_data_manager()
@@ -3295,101 +3645,160 @@ if not st.session_state.app_user:
     st.markdown("<h1 style='text-align: center;'>Genesys Reporting API</h1>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
-        with st.form("app_login_form"):
-            st.subheader(get_text(st.session_state.language, "login_title"))
-            u_org = st.text_input(get_text(st.session_state.language, "org_code"), value="default")
-            u_name = st.text_input(get_text(st.session_state.language, "username"))
-            u_pass = st.text_input(get_text(st.session_state.language, "password"), type="password")
-            remember_me_disabled = bool(st.session_state.get("_cookie_degraded_mode"))
-            remember_me_help = "Bu cihazda oturumu hatirla."
-            if remember_me_disabled:
-                remember_me_help = "Oturum bileşeni hazır olmadığından Beni Hatırla geçici devre dışı."
-            remember_me = st.checkbox(
-                get_text(st.session_state.language, "remember_me"),
-                value=False,
-                help=remember_me_help,
-                disabled=remember_me_disabled,
-            )
-            
-            login_submitted = st.form_submit_button(
-                get_text(st.session_state.language, "login"),
-                key="app_login_submit_btn",
-                use_container_width=True,
-            )
-            if login_submitted:
-                u_name_clean = str(u_name or "").strip()
-                try:
-                    u_org_safe = _safe_org_code(u_org)
-                except ValueError as exc:
-                    st.error(str(exc))
-                    u_org_safe = None
+        st.subheader(get_text(st.session_state.language, "login_title"))
+        u_org = st.text_input(get_text(st.session_state.language, "org_code"), value="default")
+        u_name = st.text_input(get_text(st.session_state.language, "username"))
+        u_pass = st.text_input(get_text(st.session_state.language, "password"), type="password")
+        remember_me_disabled = bool(st.session_state.get("_cookie_degraded_mode"))
+        remember_me_help = "Bu cihazda oturumu hatirla."
+        if remember_me_disabled:
+            remember_me_help = "Oturum bileşeni hazır olmadığından Beni Hatırla geçici devre dışı."
+        remember_me = st.checkbox(
+            get_text(st.session_state.language, "remember_me"),
+            value=False,
+            help=remember_me_help,
+            disabled=remember_me_disabled,
+        )
 
-                if u_org_safe and u_name_clean:
-                    lock_state = _get_login_lock_state(u_org_safe, u_name_clean)
-                    if lock_state.get("locked"):
-                        remaining = int(lock_state.get("remaining", 0))
-                        logger.warning("app login blocked user=%s org=%s remaining=%ss", u_name_clean, u_org_safe, remaining)
-                        st.error(f"Çok fazla başarısız deneme. {remaining} saniye sonra tekrar deneyin.")
-                    else:
-                        user_data = auth_manager.authenticate(u_org_safe, u_name_clean, u_pass)
-                        if user_data:
-                            _clear_login_failures(u_org_safe, u_name_clean)
-                            logger.info("app login success user=%s org=%s", u_name_clean, u_org_safe)
-                            # Exclude password hash from session state and file
-                            safe_user_data = {k: v for k, v in user_data.items() if k != 'password'}
-                            full_user = {"username": u_name_clean, **safe_user_data}
-                            
-                            # Handle Remember Me
-                            if remember_me and full_user.get("must_change_password"):
-                                _rm_debug(
-                                    "remember-me skipped on login for user=%s org=%s due to must_change_password",
-                                    u_name_clean,
-                                    u_org_safe,
-                                )
-                                st.session_state.remember_me_enabled = False
-                                st.session_state._remember_me_pending_payload = None
-                                st.session_state._remember_me_pending_retries = 0
-                                st.session_state._remember_me_pending_delete = True
-                                st.session_state._remember_me_pending_delete_retries = 0
-                                delete_app_session()
-                            elif remember_me:
-                                _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name_clean, u_org_safe)
-                                remember_payload = {
-                                    "username": u_name_clean,
-                                    "org_code": full_user.get("org_code", u_org_safe),
-                                }
-                                st.session_state.remember_me_enabled = True
-                                st.session_state._remember_me_pending_payload = remember_payload
-                                st.session_state._remember_me_pending_retries = 0
-                                _rm_debug("remember-me queued for verified write")
-                            else:
-                                _rm_debug("login submit with remember-me OFF for user=%s org=%s", u_name_clean, u_org_safe)
-                                st.session_state.remember_me_enabled = False
-                                st.session_state._remember_me_pending_delete = True
-                                st.session_state._remember_me_pending_delete_retries = 0
-                                delete_app_session()
-                                
-                            st.session_state.app_user = full_user
-                            st.session_state.genesys_logged_out = False
-                            st.session_state.dashboard_config_loaded = False
-                            st.session_state.pop("_dashboard_config_owner", None)
-                            ensure_data_manager()
-                            st.rerun()
-                        else:
-                            lock_info = _register_login_failure(u_org_safe, u_name_clean)
-                            logger.warning(
-                                "app login failed user=%s org=%s attempts=%s locked=%s",
+        # Keep login flow resilient across Streamlit builds that can mis-handle form submit state.
+        login_submitted = st.button(
+            get_text(st.session_state.language, "login"),
+            key="app_login_submit_btn",
+            use_container_width=True,
+        )
+        if login_submitted:
+            u_name_clean = str(u_name or "").strip()
+            try:
+                u_org_safe = _safe_org_code(u_org)
+            except ValueError as exc:
+                _log_user_action(
+                    action="app_login_validation_error",
+                    detail=str(exc),
+                    status="warning",
+                    source="auth",
+                    page="LOGIN",
+                    metadata={"organization_raw": str(u_org or "")},
+                )
+                st.error(str(exc))
+                u_org_safe = None
+
+            if u_org_safe and u_name_clean:
+                lock_state = _get_login_lock_state(u_org_safe, u_name_clean)
+                if lock_state.get("locked"):
+                    remaining = int(lock_state.get("remaining", 0))
+                    logger.warning("app login blocked user=%s org=%s remaining=%ss", u_name_clean, u_org_safe, remaining)
+                    _log_user_action(
+                        action="app_login_blocked",
+                        detail=f"Too many failed attempts. Remaining lock seconds: {remaining}.",
+                        status="warning",
+                        source="auth",
+                        username=u_name_clean,
+                        org_code=u_org_safe,
+                        page="LOGIN",
+                    )
+                    st.error(f"Çok fazla başarısız deneme. {remaining} saniye sonra tekrar deneyin.")
+                else:
+                    user_data = auth_manager.authenticate(u_org_safe, u_name_clean, u_pass)
+                    if user_data:
+                        _clear_login_failures(u_org_safe, u_name_clean)
+                        logger.info("app login success user=%s org=%s", u_name_clean, u_org_safe)
+                        # Exclude password hash from session state and file
+                        safe_user_data = {k: v for k, v in user_data.items() if k != 'password'}
+                        full_user = {"username": u_name_clean, **safe_user_data}
+                        
+                        # Handle Remember Me
+                        if remember_me and full_user.get("must_change_password"):
+                            _rm_debug(
+                                "remember-me skipped on login for user=%s org=%s due to must_change_password",
                                 u_name_clean,
                                 u_org_safe,
-                                lock_info.get("count"),
-                                lock_info.get("locked"),
                             )
-                            if lock_info.get("locked"):
-                                st.error(f"Çok fazla başarısız deneme. {lock_info.get('remaining', 0)} saniye sonra tekrar deneyin.")
-                            else:
-                                st.error("Hatalı organizasyon, kullanıcı adı veya şifre!")
-                elif u_org_safe:
-                    st.error("Kullanıcı adı gereklidir.")
+                            st.session_state.remember_me_enabled = False
+                            st.session_state._remember_me_pending_payload = None
+                            st.session_state._remember_me_pending_retries = 0
+                            st.session_state._remember_me_pending_delete = True
+                            st.session_state._remember_me_pending_delete_retries = 0
+                            delete_app_session()
+                        elif remember_me:
+                            _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name_clean, u_org_safe)
+                            remember_payload = {
+                                "username": u_name_clean,
+                                "org_code": full_user.get("org_code", u_org_safe),
+                            }
+                            st.session_state.remember_me_enabled = True
+                            st.session_state._remember_me_pending_payload = remember_payload
+                            st.session_state._remember_me_pending_retries = 0
+                            _rm_debug("remember-me queued for verified write")
+                        else:
+                            _rm_debug("login submit with remember-me OFF for user=%s org=%s", u_name_clean, u_org_safe)
+                            st.session_state.remember_me_enabled = False
+                            st.session_state._remember_me_pending_delete = True
+                            st.session_state._remember_me_pending_delete_retries = 0
+                            delete_app_session()
+
+                        _log_user_action(
+                            action="app_login",
+                            detail="Application login successful.",
+                            status="success",
+                            source="auth",
+                            username=u_name_clean,
+                            org_code=u_org_safe,
+                            role=full_user.get("role"),
+                            page="LOGIN",
+                            metadata={
+                                "remember_me": bool(remember_me),
+                                "must_change_password": bool(full_user.get("must_change_password")),
+                            },
+                        )
+                        st.session_state.app_user = full_user
+                        st.session_state.genesys_logged_out = False
+                        st.session_state.dashboard_config_loaded = False
+                        st.session_state.pop("_dashboard_config_owner", None)
+                        ensure_data_manager()
+                        st.rerun()
+                    else:
+                        lock_info = _register_login_failure(u_org_safe, u_name_clean)
+                        logger.warning(
+                            "app login failed user=%s org=%s attempts=%s locked=%s",
+                            u_name_clean,
+                            u_org_safe,
+                            lock_info.get("count"),
+                            lock_info.get("locked"),
+                        )
+                        if lock_info.get("locked"):
+                            _log_user_action(
+                                action="app_login_failed",
+                                detail=f"Login failed and user locked. Remaining seconds: {lock_info.get('remaining', 0)}.",
+                                status="warning",
+                                source="auth",
+                                username=u_name_clean,
+                                org_code=u_org_safe,
+                                page="LOGIN",
+                                metadata={"attempts": lock_info.get("count"), "locked": True},
+                            )
+                            st.error(f"Çok fazla başarısız deneme. {lock_info.get('remaining', 0)} saniye sonra tekrar deneyin.")
+                        else:
+                            _log_user_action(
+                                action="app_login_failed",
+                                detail="Invalid organization, username or password.",
+                                status="warning",
+                                source="auth",
+                                username=u_name_clean,
+                                org_code=u_org_safe,
+                                page="LOGIN",
+                                metadata={"attempts": lock_info.get("count"), "locked": False},
+                            )
+                            st.error("Hatalı organizasyon, kullanıcı adı veya şifre!")
+            elif u_org_safe:
+                _log_user_action(
+                    action="app_login_validation_error",
+                    detail="Username is required.",
+                    status="warning",
+                    source="auth",
+                    org_code=u_org_safe,
+                    page="LOGIN",
+                )
+                st.error("Kullanıcı adı gereklidir.")
     st.stop()
 
 # --- FORCED PASSWORD CHANGE (BOOTSTRAP) ---
@@ -3411,6 +3820,14 @@ if st.session_state.get("app_user") and st.session_state.app_user.get("must_chan
             else:
                 ok, msg = auth_manager.reset_password(org, username, new_pw)
                 if ok:
+                    _log_user_action(
+                        action="force_password_change",
+                        detail="Initial password changed successfully.",
+                        status="success",
+                        source="auth",
+                        username=username,
+                        org_code=org,
+                    )
                     st.session_state.app_user["must_change_password"] = False
                     st.success("Şifre güncellendi. Lütfen tekrar giriş yapın.")
                     st.session_state.app_user = None
@@ -3419,6 +3836,14 @@ if st.session_state.get("app_user") and st.session_state.app_user.get("must_chan
                     st.session_state.genesys_logged_out = False
                     st.rerun()
                 else:
+                    _log_user_action(
+                        action="force_password_change",
+                        detail=str(msg or "Initial password change failed."),
+                        status="error",
+                        source="auth",
+                        username=username,
+                        org_code=org,
+                    )
                     st.error(msg)
     st.stop()
 
@@ -3467,6 +3892,12 @@ with st.sidebar:
     lang = st.session_state.language
     st.write(f"Hoş geldiniz, **{st.session_state.app_user['username']}** ({st.session_state.app_user['role']})")
     if st.button(get_text(lang, "logout_app"), type="secondary", width='stretch'):
+        _log_user_action(
+            action="app_logout",
+            detail="Application logout requested from sidebar.",
+            status="success",
+            source="auth",
+        )
         try:
             _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
         except Exception:
@@ -3512,9 +3943,24 @@ with st.sidebar:
     up_file = st.file_uploader(get_text(lang, "import_config"), type=["json"])
     if up_file and st.button(get_text(lang, "save"), key="import_btn"):
         if import_all_configs(up_file.getvalue().decode("utf-8")):
+            _log_user_action(
+                action="config_import",
+                detail="Configuration import completed.",
+                status="success",
+                source="sidebar",
+                metadata={"filename": getattr(up_file, "name", "")},
+            )
             st.success(get_text(lang, "config_imported"))
             if 'dashboard_config_loaded' in st.session_state: del st.session_state.dashboard_config_loaded
-        else: st.error(get_text(lang, "config_import_error"))
+        else:
+            _log_user_action(
+                action="config_import",
+                detail="Configuration import failed.",
+                status="error",
+                source="sidebar",
+                metadata={"filename": getattr(up_file, "name", "")},
+            )
+            st.error(get_text(lang, "config_import_error"))
 
     # --- ERROR CONSOLE SYNC ---
     # Check DataManager for new errors and log them to browser

@@ -3,6 +3,21 @@ from typing import Any, Dict
 from src.app.context import bind_context
 
 
+def _audit_user_action(action, detail=None, status="info", metadata=None):
+    audit_fn = globals().get("_log_user_action")
+    if callable(audit_fn):
+        try:
+            audit_fn(
+                action=action,
+                detail=detail,
+                status=status,
+                metadata=metadata,
+                source="dashboard-service",
+            )
+        except Exception:
+            pass
+
+
 def render_dashboard_service(context: Dict[str, Any]) -> None:
     """Render live dashboard page using injected app context."""
     bind_context(globals(), context)
@@ -97,7 +112,14 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                 st.caption("Henüz profil verisi yok.")
     c_c1, c_c2, c_c3 = st.columns([1, 2, 1])
     if c_c1.button(get_text(lang, "add_group"), width='stretch'):
-        st.session_state.dashboard_cards.append({"id": max([c['id'] for c in st.session_state.dashboard_cards], default=-1)+1, "title": "", "queues": [], "size": "medium", "live_metrics": ["Waiting", "Interacting", "On Queue"], "daily_metrics": ["Offered", "Answered", "Abandoned", "Answer Rate"]})
+        new_card_id = max([c['id'] for c in st.session_state.dashboard_cards], default=-1) + 1
+        st.session_state.dashboard_cards.append({"id": new_card_id, "title": "", "queues": [], "size": "medium", "live_metrics": ["Waiting", "Interacting", "On Queue"], "daily_metrics": ["Offered", "Answered", "Abandoned", "Answer Rate"]})
+        _audit_user_action(
+            action="dashboard_card_create",
+            detail=f"Dashboard kartı oluşturuldu (card_id={new_card_id}).",
+            status="success",
+            metadata={"card_id": new_card_id, "layout": st.session_state.dashboard_layout},
+        )
         save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
         refresh_data_manager_queues()
         st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
@@ -280,6 +302,21 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         if st.button("Delete", key=f"d_{card['id']}"):
                             to_del.append(idx)
                         if card != prev_card:
+                            changed_fields = [
+                                field_name
+                                for field_name in ["title", "size", "queues", "media_types", "live_metrics", "daily_metrics", "visual_metrics"]
+                                if prev_card.get(field_name) != card.get(field_name)
+                            ]
+                            _audit_user_action(
+                                action="dashboard_card_update",
+                                detail=f"Dashboard kartı güncellendi (card_id={card.get('id')}).",
+                                status="success",
+                                metadata={
+                                    "card_id": card.get("id"),
+                                    "card_title": card.get("title") or f"Grup #{card.get('id', 0) + 1}",
+                                    "changed_fields": changed_fields,
+                                },
+                            )
                             save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
                             if prev_card.get("queues") != card.get("queues"):
                                 refresh_data_manager_queues()
@@ -800,7 +837,27 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
     _dashboard_profile_record("cards.total", pytime.perf_counter() - cards_total_t0)
 
     if to_del:
-        for i in sorted(to_del, reverse=True): del st.session_state.dashboard_cards[i]
+        removed_cards = []
+        for i in sorted(set(to_del)):
+            try:
+                if 0 <= int(i) < len(st.session_state.dashboard_cards):
+                    card_obj = st.session_state.dashboard_cards[int(i)] or {}
+                    removed_cards.append(
+                        {
+                            "card_id": card_obj.get("id"),
+                            "card_title": card_obj.get("title") or f"Grup #{int(card_obj.get('id', 0)) + 1}",
+                        }
+                    )
+            except Exception:
+                continue
+        for i in sorted(to_del, reverse=True):
+            del st.session_state.dashboard_cards[i]
+        _audit_user_action(
+            action="dashboard_card_delete",
+            detail=f"{len(to_del)} dashboard kartı silindi.",
+            status="success",
+            metadata={"deleted_count": len(to_del), "deleted_cards": removed_cards[:20]},
+        )
         save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
         refresh_data_manager_queues()
         st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)

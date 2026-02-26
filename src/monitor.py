@@ -23,7 +23,14 @@ class AppMonitor:
     def __init__(self):
         if self._initialized:
             return
-            
+
+        def _env_int(name, default, minimum=0):
+            try:
+                value = int(float(os.environ.get(name, str(default))))
+            except Exception:
+                value = int(default)
+            return max(int(minimum), value)
+
         self.api_stats = {} # endpoint -> count
         self.api_calls_log = [] # list of dicts: {timestamp, endpoint, method, status_code, duration_ms}
         self.error_logs = [] # list of {timestamp, module, message, details}
@@ -36,7 +43,9 @@ class AppMonitor:
         self.MAX_ENDPOINT_STATS = 200  # Max unique endpoints to track
         self.STATS_PRUNE_INTERVAL = 3600  # Prune every hour
         self.MAX_API_CALL_LOG_ENTRIES = 20000  # Keep enough data for admin traffic charts.
-        self.API_CALL_LOG_RETENTION_HOURS = 48
+        self.MAX_ERROR_LOG_ENTRIES = _env_int("GENESYS_MAX_ERROR_LOG_ENTRIES", 500, minimum=50)
+        self.API_CALL_LOG_RETENTION_HOURS = _env_int("GENESYS_API_CALL_LOG_RETENTION_HOURS", 72, minimum=1)
+        self.ERROR_LOG_RETENTION_HOURS = _env_int("GENESYS_ERROR_LOG_RETENTION_HOURS", 72, minimum=1)
         self.LOG_PRUNE_INTERVAL_SECONDS = 30
         self.BUCKET_PRUNE_INTERVAL_SECONDS = 30
         self.MINUTE_BUCKET_RETENTION_HOURS = max(48, self.API_CALL_LOG_RETENTION_HOURS)
@@ -45,8 +54,11 @@ class AppMonitor:
         self.MAX_HOUR_BUCKETS = self.HOUR_BUCKET_RETENTION_HOURS + 48
         self.minute_buckets = {}  # minute datetime -> count
         self.hour_buckets = {}    # hour datetime -> count
-        self.PERSIST_INTERVAL_SECONDS = 30
+        self._api_call_observers = {}
+        self.PERSIST_INTERVAL_SECONDS = _env_int("GENESYS_MONITOR_PERSIST_INTERVAL_SECONDS", 30, minimum=5)
+        self.REFRESH_FROM_DISK_INTERVAL_SECONDS = _env_int("GENESYS_MONITOR_REFRESH_FROM_DISK_INTERVAL_SECONDS", 15, minimum=1)
         self._last_persist_ts = 0
+        self._last_disk_refresh_ts = 0
         self._persist_path = self._resolve_persist_path()
         self._load_persisted_state()
         self._initialized = True
@@ -94,6 +106,63 @@ class AppMonitor:
                 continue
         return out
 
+    def _serialize_error_logs(self, error_logs):
+        payload = []
+        for row in error_logs or []:
+            if not isinstance(row, dict):
+                continue
+            ts = row.get("timestamp")
+            if isinstance(ts, datetime):
+                ts_raw = ts.isoformat(timespec="seconds")
+            else:
+                ts_raw = str(ts or "").strip()
+            if not ts_raw:
+                continue
+            payload.append(
+                {
+                    "timestamp": ts_raw,
+                    "module": str(row.get("module") or "").strip(),
+                    "message": str(row.get("message") or "").strip(),
+                    "details": str(row.get("details") or ""),
+                }
+            )
+        return payload
+
+    def _deserialize_error_logs(self, payload):
+        logs = []
+        for row in payload or []:
+            if not isinstance(row, dict):
+                continue
+            ts_raw = str(row.get("timestamp") or "").strip()
+            if not ts_raw:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+            except Exception:
+                continue
+            logs.append(
+                {
+                    "timestamp": ts,
+                    "module": str(row.get("module") or "").strip(),
+                    "message": str(row.get("message") or "").strip(),
+                    "details": str(row.get("details") or ""),
+                }
+            )
+        return logs
+
+    def _prune_error_logs(self, now_dt):
+        cutoff_dt = now_dt - timedelta(hours=self.ERROR_LOG_RETENTION_HOURS)
+        kept = []
+        for entry in self.error_logs:
+            ts = entry.get("timestamp")
+            if not isinstance(ts, datetime):
+                continue
+            if ts >= cutoff_dt:
+                kept.append(entry)
+        if len(kept) > self.MAX_ERROR_LOG_ENTRIES:
+            kept = kept[-self.MAX_ERROR_LOG_ENTRIES:]
+        self.error_logs = kept
+
     def _load_persisted_state(self):
         path = self._persist_path
         if not path or not os.path.exists(path):
@@ -111,6 +180,46 @@ class AppMonitor:
                 int(data.get("total_api_calls", 0) or 0),
                 int(self.total_api_calls or 0),
             )
+            persisted_endpoint_stats = data.get("endpoint_stats") or {}
+            if isinstance(persisted_endpoint_stats, dict):
+                for endpoint, count in persisted_endpoint_stats.items():
+                    endpoint_key = str(endpoint or "").strip()
+                    if not endpoint_key:
+                        continue
+                    try:
+                        count_int = int(count or 0)
+                    except Exception:
+                        continue
+                    if count_int <= 0:
+                        continue
+                    current = int(self.api_stats.get(endpoint_key, 0) or 0)
+                    if count_int > current:
+                        self.api_stats[endpoint_key] = count_int
+
+            persisted_errors = self._deserialize_error_logs(data.get("error_logs"))
+            if persisted_errors:
+                seen = {
+                    (
+                        row.get("timestamp").isoformat(timespec="seconds"),
+                        row.get("module"),
+                        row.get("message"),
+                        row.get("details"),
+                    )
+                    for row in self.error_logs
+                    if isinstance(row, dict) and isinstance(row.get("timestamp"), datetime)
+                }
+                for row in persisted_errors:
+                    key = (
+                        row["timestamp"].isoformat(timespec="seconds"),
+                        row.get("module"),
+                        row.get("message"),
+                        row.get("details"),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    self.error_logs.append(row)
+
             start_raw = data.get("start_time")
             if start_raw:
                 try:
@@ -119,7 +228,12 @@ class AppMonitor:
                         self.start_time = persisted_start
                 except Exception:
                     pass
-            self._prune_time_buckets(datetime.now())
+            now_dt = datetime.now()
+            self._prune_time_buckets(now_dt)
+            self._prune_error_logs(now_dt)
+            if len(self.api_stats) > self.MAX_ENDPOINT_STATS:
+                sorted_stats = sorted(self.api_stats.items(), key=lambda x: x[1], reverse=True)
+                self.api_stats = dict(sorted_stats[:self.MAX_ENDPOINT_STATS])
         except Exception:
             return
 
@@ -134,6 +248,8 @@ class AppMonitor:
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "start_time": self.start_time.isoformat(timespec="seconds"),
             "total_api_calls": int(self.total_api_calls or 0),
+            "endpoint_stats": self.api_stats,
+            "error_logs": self._serialize_error_logs(self.error_logs),
             "minute_buckets": self._bucket_dict_to_payload(self.minute_buckets),
             "hour_buckets": self._bucket_dict_to_payload(self.hour_buckets),
         }
@@ -149,6 +265,19 @@ class AppMonitor:
                     os.remove(tmp_path)
             except Exception:
                 pass
+
+    def refresh_from_persisted_state(self, force=False):
+        """Refresh in-memory monitor state from local persisted file with debounce."""
+        path = self._persist_path
+        if not path or not os.path.exists(path):
+            return False
+        now = time.time()
+        with self._lock:
+            if (not force) and ((now - self._last_disk_refresh_ts) < self.REFRESH_FROM_DISK_INTERVAL_SECONDS):
+                return False
+            self._load_persisted_state()
+            self._last_disk_refresh_ts = now
+            return True
 
     def _entry_datetime(self, entry):
         ts_dt = entry.get("timestamp_dt")
@@ -197,8 +326,43 @@ class AppMonitor:
             self._prune_time_buckets(now_dt)
             self._last_bucket_prune = now_ts
 
+    def register_api_call_observer(self, name, callback):
+        if not name or not callable(callback):
+            return False
+        key = str(name).strip()
+        if not key:
+            return False
+        with self._lock:
+            self._api_call_observers[key] = callback
+        return True
+
+    def unregister_api_call_observer(self, name):
+        key = str(name or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            if key in self._api_call_observers:
+                self._api_call_observers.pop(key, None)
+                return True
+        return False
+
+    def _notify_api_call_observers(self, entry):
+        if not isinstance(entry, dict):
+            return
+        observers = {}
+        with self._lock:
+            observers = dict(self._api_call_observers)
+        for observer_fn in observers.values():
+            if not callable(observer_fn):
+                continue
+            try:
+                observer_fn(dict(entry))
+            except Exception:
+                continue
+
     def log_api_call(self, endpoint, method=None, status_code=None, duration_ms=None):
         """Records an API call with timestamp, endpoint path, and optional timing metadata."""
+        observer_entry = None
         with self._lock:
             clean_endpoint = endpoint.split('?')[0] # Remove query params
             # Normalize UUIDs in path to prevent unbounded key growth
@@ -230,6 +394,13 @@ class AppMonitor:
                 "status_code": status_code,
                 "duration_ms": duration_ms
             }
+            observer_entry = {
+                "timestamp": entry["timestamp"],
+                "endpoint": clean_endpoint,
+                "method": method,
+                "status_code": status_code,
+                "duration_ms": duration_ms,
+            }
             self.api_calls_log.append(entry)
             
             # Keep enough history for charts while preventing unbounded growth.
@@ -248,7 +419,10 @@ class AppMonitor:
                     pruned = pruned[-self.MAX_API_CALL_LOG_ENTRIES:]
                 self.api_calls_log = pruned
                 self._last_log_prune = now
+                self._prune_error_logs(now_dt)
             self._persist_state()
+        if observer_entry:
+            self._notify_api_call_observers(observer_entry)
 
     def log_error(self, module, message, details=None):
         """Records an application error."""
@@ -260,11 +434,11 @@ class AppMonitor:
                 "details": str(details) if details else ""
             }
             self.error_logs.append(error_entry)
-            
-            # Keep log manageable (last 100 errors)
-            if len(self.error_logs) > 100:
-                self.error_logs.pop(0)
-            self._persist_state()
+
+            # Keep logs bounded by retention window and max entry count.
+            self._prune_error_logs(datetime.now())
+            # Persist immediately so critical errors survive process restarts.
+            self._persist_state(force=True)
 
     def get_stats(self):
         """Returns current API statistics."""
@@ -276,13 +450,60 @@ class AppMonitor:
                 "error_count": len(self.error_logs)
             }
 
+    def get_daily_stats(self, reference_dt=None):
+        """Returns API/error totals since local midnight."""
+        with self._lock:
+            now_dt = reference_dt if isinstance(reference_dt, datetime) else datetime.now()
+            day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            api_calls_today = 0
+            if self.minute_buckets:
+                for bucket_dt, count in self.minute_buckets.items():
+                    if isinstance(bucket_dt, datetime) and bucket_dt >= day_start:
+                        api_calls_today += int(count or 0)
+            else:
+                for entry in self.api_calls_log:
+                    ts = self._entry_datetime(entry)
+                    if ts and ts >= day_start:
+                        api_calls_today += 1
+
+            errors_today = 0
+            for entry in self.error_logs:
+                ts = entry.get("timestamp")
+                if isinstance(ts, datetime) and ts >= day_start:
+                    errors_today += 1
+                    continue
+                if isinstance(ts, str):
+                    try:
+                        ts_dt = datetime.fromisoformat(ts)
+                    except Exception:
+                        ts_dt = None
+                    if ts_dt and ts_dt >= day_start:
+                        errors_today += 1
+
+            return {
+                "total_calls": int(api_calls_today),
+                "error_count": int(errors_today),
+                "day_start": day_start,
+                "now": now_dt,
+            }
+
     def get_rate_per_minute(self, minutes=1):
         """Returns average API calls per minute over the last N minutes."""
         if minutes <= 0:
             return 0
         with self._lock:
-            cutoff = datetime.now() - timedelta(minutes=minutes)
+            now_minute = datetime.now().replace(second=0, microsecond=0)
+            start_minute = now_minute - timedelta(minutes=minutes - 1)
             count = 0
+            if self.minute_buckets:
+                for i in range(minutes):
+                    curr = start_minute + timedelta(minutes=i)
+                    count += int(self.minute_buckets.get(curr, 0) or 0)
+                return count / minutes
+
+            # Backward-compatible fallback for older runtime state.
+            cutoff = datetime.now() - timedelta(minutes=minutes)
             for entry in self.api_calls_log:
                 ts = self._entry_datetime(entry)
                 if not ts:

@@ -3,6 +3,21 @@ from typing import Any, Dict
 from src.app.context import bind_context
 
 
+def _audit_user_action(action, detail=None, status="info", metadata=None):
+    audit_fn = globals().get("_log_user_action")
+    if callable(audit_fn):
+        try:
+            audit_fn(
+                action=action,
+                detail=detail,
+                status=status,
+                metadata=metadata,
+                source="users-service",
+            )
+        except Exception:
+            pass
+
+
 def render_users_service(context: Dict[str, Any]) -> None:
     """Render users management page using injected app context."""
     bind_context(globals(), context)
@@ -32,10 +47,23 @@ def render_users_service(context: Dict[str, Any]) -> None:
                     org = st.session_state.app_user.get('org_code', 'default')
                     success, msg = auth_manager.add_user(org, new_un, new_pw, new_role, new_mets)
                     if success: 
+                        _audit_user_action(
+                            action="user_create",
+                            detail=f"User '{new_un}' created.",
+                            status="success",
+                            metadata={"target_user": new_un, "role": new_role},
+                        )
                         st.session_state.generated_password = ""  # Clear after use
                         st.success(msg)
                         st.rerun()
-                    else: st.error(msg)
+                    else:
+                        _audit_user_action(
+                            action="user_create",
+                            detail=str(msg or f"User '{new_un}' creation failed."),
+                            status="error",
+                            metadata={"target_user": new_un, "role": new_role},
+                        )
+                        st.error(msg)
                 else: st.warning("Ad ve şifre gereklidir.")
     
     st.write("---")
@@ -55,9 +83,21 @@ def render_users_service(context: Dict[str, Any]) -> None:
                 if st.button("🗑️", key=f"del_user_{uname}", help="Kullanıcıyı Sil"):
                     ok, msg = auth_manager.delete_user(org, uname)
                     if ok:
+                        _audit_user_action(
+                            action="user_delete",
+                            detail=f"User '{uname}' deleted.",
+                            status="success",
+                            metadata={"target_user": uname},
+                        )
                         st.success(msg)
                         st.rerun()
                     else:
+                        _audit_user_action(
+                            action="user_delete",
+                            detail=str(msg or f"User '{uname}' delete failed."),
+                            status="error",
+                            metadata={"target_user": uname},
+                        )
                         st.error(msg)
         
         # Password Reset Section
@@ -67,8 +107,22 @@ def render_users_service(context: Dict[str, Any]) -> None:
                 if st.form_submit_button("Güncelle"):
                     if new_reset_pw:
                         success, msg = auth_manager.reset_password(org, uname, new_reset_pw)
-                        if success: st.success(msg)
-                        else: st.error(msg)
+                        if success:
+                            _audit_user_action(
+                                action="user_password_reset",
+                                detail=f"Password reset for '{uname}'.",
+                                status="success",
+                                metadata={"target_user": uname},
+                            )
+                            st.success(msg)
+                        else:
+                            _audit_user_action(
+                                action="user_password_reset",
+                                detail=str(msg or f"Password reset failed for '{uname}'."),
+                                status="error",
+                                metadata={"target_user": uname},
+                            )
+                            st.error(msg)
                     else:
                         st.warning("Lütfen yeni şifre girin.")
         st.write("---")

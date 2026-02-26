@@ -1,5 +1,8 @@
 import time as pytime
+import json
 from typing import Any, Dict
+
+import plotly.express as px
 
 from src.app.context import bind_context
 
@@ -17,6 +20,78 @@ ADMIN_QUEUE_AUDIT_CACHE_TTL_SECONDS = 1800
 ADMIN_QUEUE_AUDIT_MAX_ATTEMPTS = 40
 ADMIN_QUEUE_AUDIT_MAX_PREVIEW_ROWS = 80
 ADMIN_QUEUE_AUDIT_MAX_ROWS = 5000
+
+
+def _truncate_endpoint_label(endpoint, max_len=46):
+    raw = str(endpoint or "").strip()
+    if len(raw) <= max(8, int(max_len or 8)):
+        return raw
+    keep = max(8, int(max_len or 8)) - 3
+    return raw[:keep] + "..."
+
+
+def _build_endpoint_labels(endpoints, max_len=46):
+    seen = {}
+    labels = []
+    for endpoint in endpoints:
+        base = _truncate_endpoint_label(endpoint, max_len=max_len)
+        idx = seen.get(base, 0) + 1
+        seen[base] = idx
+        if idx == 1:
+            labels.append(base)
+        else:
+            labels.append(f"{base} [{idx}]")
+    return labels
+
+
+def _compact_json_preview(value, max_len=240):
+    try:
+        text = json.dumps(value or {}, ensure_ascii=False)
+    except Exception:
+        text = str(value or "")
+    text = str(text).strip()
+    if len(text) <= max(32, int(max_len or 32)):
+        return text
+    keep = max(32, int(max_len or 32)) - 3
+    return text[:keep] + "..."
+
+
+def _audit_user_action(action, detail=None, status="info", metadata=None):
+    audit_fn = globals().get("_log_user_action")
+    if callable(audit_fn):
+        try:
+            audit_fn(
+                action=action,
+                detail=detail,
+                status=status,
+                metadata=metadata,
+                source="admin-panel-service",
+            )
+        except Exception:
+            pass
+
+
+def _auto_audit_admin_widget_actions():
+    prev_state = st.session_state.get("_admin_widget_bool_prev")
+    if not isinstance(prev_state, dict):
+        prev_state = {}
+    current_state = {}
+    for key in list(st.session_state.keys()):
+        key_text = str(key or "")
+        if not key_text.startswith("admin_"):
+            continue
+        value = st.session_state.get(key)
+        if not isinstance(value, bool):
+            continue
+        current_state[key_text] = value
+        if value and not bool(prev_state.get(key_text)):
+            _audit_user_action(
+                action="admin_widget_action",
+                detail=f"Admin widget interaction: {key_text}",
+                status="info",
+                metadata={"widget_key": key_text},
+            )
+    st.session_state["_admin_widget_bool_prev"] = current_state
 
 
 def _trim_attempts_for_storage(attempts, max_items=ADMIN_QUEUE_AUDIT_MAX_ATTEMPTS, max_filters=8, max_error_len=280):
@@ -198,18 +273,27 @@ def _prune_admin_runtime_caches(session_state, current_org):
 def render_admin_panel_service(context: Dict[str, Any]) -> None:
     """Render admin panel page using injected app context."""
     bind_context(globals(), context)
+    try:
+        monitor.refresh_from_persisted_state(force=False)
+    except Exception:
+        pass
     current_org = str((st.session_state.get("app_user") or {}).get("org_code") or globals().get("org") or "default").strip() or "default"
     _prune_admin_runtime_caches(st.session_state, current_org)
     st.title(f"🛡️ {get_text(lang, 'admin_panel')}")
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama", "🧾 Audit"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([f"📊 {get_text(lang, 'api_usage')}", f"📋 {get_text(lang, 'error_logs')}", "🧪 Diagnostics", f"🔌 {get_text(lang, 'manual_disconnect')}", f"👥 {get_text(lang, 'group_management')}", "🔍 Kullanıcı Arama", "🧾 Audit", "📝 İşlem Logları"])
     
     with tab1:
         stats = monitor.get_stats()
-        st.subheader(get_text(lang, "general_status"))
+        daily_stats = monitor.get_daily_stats()
+        st.subheader("Genel Durum (Günlük)")
+        st.caption(
+            f"Gün başlangıcı: {daily_stats['day_start'].strftime('%Y-%m-%d %H:%M')} | "
+            "Toplam sayaçlar her gün sıfırlanır."
+        )
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric(get_text(lang, "total_api_calls"), stats["total_calls"])
-        c2.metric(get_text(lang, "total_errors"), stats["error_count"])
+        c1.metric(get_text(lang, "total_api_calls"), daily_stats["total_calls"])
+        c2.metric(get_text(lang, "total_errors"), daily_stats["error_count"])
         uptime_hours = stats["uptime_seconds"] / 3600
         c3.metric(get_text(lang, "uptime"), f"{uptime_hours:.1f} sa")
         avg_rate = monitor.get_avg_rate_per_minute()
@@ -222,9 +306,43 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             df_endpoints = pd.DataFrame([
                 {"Endpoint": k, "Adet": v} for k, v in stats["endpoint_stats"].items()
             ]).sort_values("Adet", ascending=False)
-            # Ensure x and y are passed correctly to bar_chart
             df_endpoints = sanitize_numeric_df(df_endpoints)
-            st.bar_chart(df_endpoints.set_index("Endpoint"))
+            if not df_endpoints.empty:
+                max_rows = 5
+                total_rows = int(len(df_endpoints))
+                df_chart = df_endpoints.head(max_rows).copy()
+                df_chart["EndpointFull"] = df_chart["Endpoint"].astype(str)
+                df_chart["EndpointLabel"] = _build_endpoint_labels(df_chart["EndpointFull"].tolist(), max_len=48)
+                df_chart = df_chart.iloc[::-1].reset_index(drop=True)
+                fig_endpoint = px.bar(
+                    df_chart,
+                    x="Adet",
+                    y="EndpointLabel",
+                    orientation="h",
+                    text="Adet",
+                    custom_data=["EndpointFull"],
+                )
+                fig_endpoint.update_traces(
+                    textposition="outside",
+                    cliponaxis=False,
+                    hovertemplate="Endpoint: %{customdata[0]}<br>Adet: %{x}<extra></extra>",
+                    marker_color="#1f77b4",
+                )
+                fig_endpoint.update_layout(
+                    height=max(320, min(980, (len(df_chart) * 30) + 120)),
+                    margin=dict(l=8, r=52, t=10, b=8),
+                    xaxis_title="Adet",
+                    yaxis_title="",
+                    showlegend=False,
+                )
+                st.plotly_chart(
+                    fig_endpoint,
+                    width='stretch',
+                    config={"displayModeBar": False, "responsive": True},
+                    key="admin_endpoint_usage_plotly",
+                )
+                if total_rows > max_rows:
+                    st.caption(f"Grafik en cok ilk {max_rows} endpointi gosterir. Toplam endpoint: {total_rows}.")
         else:
             st.info("Henüz API çağrısı kaydedilmedi.")
         
@@ -292,6 +410,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             app_user = st.session_state.get('app_user', {}) or {}
             admin_user = app_user.get('username', 'unknown')
             admin_org = app_user.get('org_code', 'default')
+            _audit_user_action(
+                action="admin_reboot_request",
+                detail="Admin panelden uygulama reboot talebi.",
+                status="warning",
+                metadata={"organization": admin_org, "username": admin_user},
+            )
             logger.warning(f"[ADMIN REBOOT] Restart requested by {admin_user}")
             reboot_event_writer = globals().get("_append_reboot_event")
             if callable(reboot_event_writer):
@@ -362,6 +486,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 ) or {}
             st.session_state["admin_temp_cleanup_result"] = cleanup_result
             st.session_state["admin_temp_cleanup_ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _audit_user_action(
+                action="admin_temp_cleanup",
+                detail="Admin panelden manuel disk temizliği çalıştırıldı.",
+                status="success",
+                metadata={
+                    "removed_files": int(cleanup_result.get("removed_files", 0) or 0),
+                    "truncated_files": int(cleanup_result.get("truncated_files", 0) or 0),
+                    "removed_dirs": int(cleanup_result.get("removed_dirs", 0) or 0),
+                    "error_count": len(cleanup_result.get("errors", []) or []),
+                },
+            )
 
         last_temp_cleanup = st.session_state.get("admin_temp_cleanup_result")
         if last_temp_cleanup:
@@ -646,6 +781,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                         errors = result.get("errors", [])
                         
                         if disconnected:
+                            _audit_user_action(
+                                action="admin_manual_disconnect",
+                                detail=f"Interaction disconnect başarılı: {disconnect_id_clean}",
+                                status="success",
+                                metadata={
+                                    "interaction_id": disconnect_id_clean,
+                                    "media_type": media_type,
+                                    "disconnected_count": len(disconnected),
+                                    "error_count": len(errors),
+                                },
+                            )
                             st.success(f"✅ {get_text(lang, 'disconnect_success')} (ID: {disconnect_id_clean} | Tip: {media_type})")
                             for d in disconnected:
                                 action = d.get('action', '')
@@ -668,6 +814,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                     st.write(f"  ⏭️ {s['purpose']}: {s['name']} — {reason_txt} ({s['state']})")
                         
                         if errors:
+                            _audit_user_action(
+                                action="admin_manual_disconnect",
+                                detail=f"Interaction disconnect hatalı: {disconnect_id_clean}",
+                                status="error",
+                                metadata={
+                                    "interaction_id": disconnect_id_clean,
+                                    "media_type": media_type,
+                                    "disconnected_count": len(disconnected),
+                                    "error_count": len(errors),
+                                },
+                            )
                             for er in errors:
                                 st.error(f"❌ {er['purpose']}: {er['name']} — {er['error']}")
                             logging.error(f"[ADMIN DISCONNECT] Interaction {disconnect_id_clean} — {len(errors)} error(s) by {admin_user}")
@@ -676,6 +833,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             st.info("Tüm katılımcılar zaten sonlanmış durumda.")
                     except Exception as e:
                         error_msg = str(e)
+                        _audit_user_action(
+                            action="admin_manual_disconnect",
+                            detail=f"Interaction disconnect exception: {disconnect_id_clean} - {error_msg}",
+                            status="error",
+                            metadata={"interaction_id": disconnect_id_clean},
+                        )
                         st.error(f"❌ {get_text(lang, 'disconnect_error')}: {error_msg}")
                         logging.error(f"[ADMIN DISCONNECT] Failed to disconnect {disconnect_id_clean}: {error_msg}")
 
@@ -710,6 +873,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                     _prune_admin_group_member_cache(max_entries=40)
                     # Refresh button
                     if st.button("🔄 Grupları Yenile", key="refresh_groups_btn"):
+                        _audit_user_action(
+                            action="admin_groups_refresh",
+                            detail="Admin panelden grup listesi yenileme istendi.",
+                            status="success",
+                            metadata={"organization": current_org},
+                        )
                         st.session_state.admin_groups_refresh = True
                         st.rerun()
                     
@@ -821,6 +990,21 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                     for g_name, err in failed_groups:
                                         st.caption(f"❌ {g_name}: {err}")
 
+                                _audit_user_action(
+                                    action="admin_group_bulk_add_users",
+                                    detail=(
+                                        f"Toplu grup üyeliği eklendi: {len(selected_multi_user_ids)} kullanıcı, "
+                                        f"{len(selected_multi_group_ids)} grup."
+                                    ),
+                                    status=("success" if not failed_groups else ("warning" if total_added > 0 else "error")),
+                                    metadata={
+                                        "selected_user_count": len(selected_multi_user_ids),
+                                        "selected_group_count": len(selected_multi_group_ids),
+                                        "total_added": int(total_added),
+                                        "total_skipped_existing": int(total_skipped_existing),
+                                        "failed_group_count": len(failed_groups),
+                                    },
+                                )
                                 st.session_state.admin_groups_refresh = True
                                 if not failed_groups:
                                     st.rerun()
@@ -861,6 +1045,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             ):
                                 with st.spinner("Wrap-up süreleri getiriliyor..."):
                                     st.session_state[wrapup_snapshot_key] = api.get_queues_wrapup_timeouts(selected_wrapup_queue_ids)
+                                _audit_user_action(
+                                    action="admin_queue_wrapup_fetch",
+                                    detail=f"Seçili kuyrukların wrap-up süreleri getirildi ({len(selected_wrapup_queue_ids)} kuyruk).",
+                                    status="success",
+                                    metadata={"queue_count": len(selected_wrapup_queue_ids)},
+                                )
 
                             wrapup_snapshot = st.session_state.get(wrapup_snapshot_key, {}) or {}
                             wrapup_rows = []
@@ -929,6 +1119,25 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                     st.session_state[wrapup_snapshot_key] = merged_snapshot
                                 except Exception:
                                     pass
+                                success_count = sum(
+                                    1 for item in (update_results or {}).values()
+                                    if isinstance(item, dict) and item.get("success")
+                                )
+                                fail_count = max(0, len(update_results or {}) - success_count)
+                                _audit_user_action(
+                                    action="admin_queue_wrapup_update",
+                                    detail=(
+                                        f"Wrap-up süresi güncelleme çalıştırıldı ({len(update_target_queue_ids)} kuyruk, "
+                                        f"başarılı: {success_count}, hatalı: {fail_count})."
+                                    ),
+                                    status=("success" if fail_count == 0 else ("warning" if success_count > 0 else "error")),
+                                    metadata={
+                                        "target_queue_count": len(update_target_queue_ids),
+                                        "target_wrapup_seconds": int(target_wrapup_seconds),
+                                        "success_count": int(success_count),
+                                        "fail_count": int(fail_count),
+                                    },
+                                )
 
                             wrapup_update_results = st.session_state.get(wrapup_update_result_key, {}) or {}
                             if wrapup_update_results:
@@ -1043,17 +1252,34 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                     if sort_cols:
                                         inventory_df = inventory_df.sort_values(sort_cols).reset_index(drop=True)
                                 st.session_state.admin_user_workgroup_inventory_df = inventory_df
+                                _audit_user_action(
+                                    action="admin_inventory_build",
+                                    detail="Kullanıcı/Workgroup envanteri hazırlandı.",
+                                    status="success",
+                                    metadata={
+                                        "group_filter_count": len(selected_export_group_ids or []),
+                                        "include_unassigned": bool(include_users_without_group),
+                                        "row_count": int(len(inventory_df) if isinstance(inventory_df, pd.DataFrame) else 0),
+                                    },
+                                )
 
                         inventory_df = st.session_state.get("admin_user_workgroup_inventory_df")
                         if isinstance(inventory_df, pd.DataFrame) and not inventory_df.empty:
                             st.dataframe(inventory_df, width='stretch', hide_index=True)
-                            st.download_button(
+                            inventory_download_clicked = st.download_button(
                                 "📥 Kullanıcı-Workgroup Excel İndir",
                                 data=to_excel(inventory_df),
                                 file_name=f"user_workgroup_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 key="admin_inventory_download_btn"
                             )
+                            if inventory_download_clicked:
+                                _audit_user_action(
+                                    action="admin_inventory_download",
+                                    detail="Kullanıcı/Workgroup envanteri Excel olarak indirildi.",
+                                    status="success",
+                                    metadata={"row_count": int(len(inventory_df))},
+                                )
                         elif isinstance(inventory_df, pd.DataFrame):
                             st.info("Seçilen filtrelerle envanter sonucu bulunamadı.")
 
@@ -1169,6 +1395,22 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             )
                                         else:
                                             st.caption(f"❌ {qname}: {result.get('error', '')}")
+                                    _audit_user_action(
+                                        action="admin_queue_bulk_add_users",
+                                        detail=(
+                                            f"Toplu kuyruk ataması çalıştırıldı ({len(effective_bulk_user_ids)} kullanıcı, "
+                                            f"{len(selected_bulk_queue_ids)} kuyruk)."
+                                        ),
+                                        status=("success" if fail_count == 0 else ("warning" if success_count > 0 else "error")),
+                                        metadata={
+                                            "user_count": len(effective_bulk_user_ids),
+                                            "queue_count": len(selected_bulk_queue_ids),
+                                            "success_queue_count": int(success_count),
+                                            "failed_queue_count": int(fail_count),
+                                            "added_memberships": int(total_added),
+                                            "skipped_existing": int(total_skipped),
+                                        },
+                                    )
 
                         with col_bulk_remove:
                             if effective_bulk_user_ids and selected_bulk_queue_ids and st.button(
@@ -1205,6 +1447,22 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             )
                                         else:
                                             st.caption(f"❌ {qname}: {result.get('error', '')}")
+                                    _audit_user_action(
+                                        action="admin_queue_bulk_remove_users",
+                                        detail=(
+                                            f"Toplu kuyruk üyelik çıkarma çalıştırıldı ({len(effective_bulk_user_ids)} kullanıcı, "
+                                            f"{len(selected_bulk_queue_ids)} kuyruk)."
+                                        ),
+                                        status=("success" if fail_count == 0 else ("warning" if success_count > 0 else "error")),
+                                        metadata={
+                                            "user_count": len(effective_bulk_user_ids),
+                                            "queue_count": len(selected_bulk_queue_ids),
+                                            "success_queue_count": int(success_count),
+                                            "failed_queue_count": int(fail_count),
+                                            "removed_memberships": int(total_removed),
+                                            "skipped_missing": int(total_skipped),
+                                        },
+                                    )
 
                         # --- Assign Group to Queues (moved to bottom, collapsed by default) ---
                         st.divider()
@@ -1272,6 +1530,20 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                                 f"[ADMIN GROUP] Added group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' "
                                                 f"to {success_count}/{len(selected_queue_ids)} queues"
                                             )
+                                            _audit_user_action(
+                                                action="admin_group_add_to_queues",
+                                                detail=(
+                                                    f"Grup kuyruklara eklendi: {selected_group_for_queue.get('name', selected_group_for_queue_id)} "
+                                                    f"({len(selected_queue_ids)} kuyruk)."
+                                                ),
+                                                status=("success" if fail_count == 0 else ("warning" if success_count > 0 else "error")),
+                                                metadata={
+                                                    "group_id": selected_group_for_queue_id,
+                                                    "queue_count": len(selected_queue_ids),
+                                                    "success_count": int(success_count),
+                                                    "fail_count": int(fail_count),
+                                                },
+                                            )
 
                                 with col_remove_q:
                                     if selected_queue_ids and st.button(
@@ -1304,9 +1576,28 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                                 f"[ADMIN GROUP] Removed group '{selected_group_for_queue.get('name', selected_group_for_queue_id)}' "
                                                 f"from {success_count}/{len(selected_queue_ids)} queues"
                                             )
+                                            _audit_user_action(
+                                                action="admin_group_remove_from_queues",
+                                                detail=(
+                                                    f"Grup kuyruklardan çıkarıldı: {selected_group_for_queue.get('name', selected_group_for_queue_id)} "
+                                                    f"({len(selected_queue_ids)} kuyruk)."
+                                                ),
+                                                status=("success" if fail_count == 0 else ("warning" if success_count > 0 else "error")),
+                                                metadata={
+                                                    "group_id": selected_group_for_queue_id,
+                                                    "queue_count": len(selected_queue_ids),
+                                                    "success_count": int(success_count),
+                                                    "fail_count": int(fail_count),
+                                                },
+                                            )
                             else:
                                 st.warning("Kuyruk bulunamadı.")
             except Exception as e:
+                _audit_user_action(
+                    action="admin_group_management_error",
+                    detail=f"Grup yönetimi sekmesinde hata: {e}",
+                    status="error",
+                )
                 st.error(f"❌ {get_text(lang, 'group_fetch_error')}: {e}")
 
     with tab6:
@@ -1364,6 +1655,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             if search_clicked:
                 st.session_state.admin_user_search_triggered = True
                 st.session_state.admin_user_search_last_id = (user_id_input or "").strip()
+                _audit_user_action(
+                    action="admin_user_search",
+                    detail=f"Kullanıcı arama tetiklendi: {(user_id_input or '').strip()}",
+                    status="info",
+                    metadata={"user_id": (user_id_input or "").strip()},
+                )
 
             hist_cfg_col1, hist_cfg_col2 = st.columns(2)
             with hist_cfg_col1:
@@ -1395,9 +1692,20 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 
                 if not user_id_clean:
                     st.session_state.admin_user_search_triggered = False
+                    _audit_user_action(
+                        action="admin_user_search",
+                        detail="Kullanıcı arama başarısız: boş kullanıcı ID.",
+                        status="warning",
+                    )
                     st.error("Lütfen bir kullanıcı ID girin.")
                 elif not _uuid_pattern_user.match(user_id_clean):
                     st.session_state.admin_user_search_triggered = False
+                    _audit_user_action(
+                        action="admin_user_search",
+                        detail=f"Kullanıcı arama başarısız: geçersiz UUID ({user_id_clean}).",
+                        status="warning",
+                        metadata={"user_id": user_id_clean},
+                    )
                     st.error("Geçersiz UUID formatı. Örnek: 24331d74-80bf-4069-a67c-51bc851fdc3e")
                 else:
                     try:
@@ -1408,8 +1716,14 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 user_id_clean, 
                                 expand=['presence', 'routingStatus', 'groups', 'skills', 'languages']
                             )
-                        
+
                         if user_data:
+                            _audit_user_action(
+                                action="admin_user_search",
+                                detail=f"Kullanıcı bulundu: {user_id_clean}",
+                                status="success",
+                                metadata={"user_id": user_id_clean, "user_name": user_data.get("name")},
+                            )
                             st.success(f"✅ Kullanıcı bulundu: **{user_data.get('name', 'N/A')}**")
                             
                             # Basic Info
@@ -1548,6 +1862,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             st.warning(f"{len(failed)} grup için ekleme başarısız.")
                                             for gname, err in failed:
                                                 st.caption(f"❌ {gname}: {err}")
+                                        _audit_user_action(
+                                            action="admin_user_add_to_groups",
+                                            detail=f"Kullanıcı gruplara eklendi: {user_id_clean}",
+                                            status=("success" if not failed else ("warning" if added > 0 else "error")),
+                                            metadata={
+                                                "user_id": user_id_clean,
+                                                "selected_group_count": len(add_selection),
+                                                "added_count": int(added),
+                                                "failed_count": len(failed),
+                                            },
+                                        )
                                         if added:
                                             st.rerun()
 
@@ -1581,6 +1906,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             st.warning(f"{len(failed)} grup için çıkarma başarısız.")
                                             for gname, err in failed:
                                                 st.caption(f"❌ {gname}: {err}")
+                                        _audit_user_action(
+                                            action="admin_user_remove_from_groups",
+                                            detail=f"Kullanıcı gruplardan çıkarıldı: {user_id_clean}",
+                                            status=("success" if not failed else ("warning" if removed > 0 else "error")),
+                                            metadata={
+                                                "user_id": user_id_clean,
+                                                "selected_group_count": len(remove_selection),
+                                                "removed_count": int(removed),
+                                                "failed_count": len(failed),
+                                            },
+                                        )
                                         if removed:
                                             st.rerun()
                             
@@ -1598,6 +1934,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 use_container_width=True,
                             ):
                                 st.session_state[queue_memberships_refresh_key] = True
+                                _audit_user_action(
+                                    action="admin_user_queue_memberships_refresh",
+                                    detail=f"Kullanıcı kuyruk üyelikleri yenileme istendi: {user_id_clean}",
+                                    status="info",
+                                    metadata={"user_id": user_id_clean},
+                                )
 
                             should_refresh_queue_memberships = bool(st.session_state.get(queue_memberships_refresh_key))
                             if queue_memberships_cache_key not in st.session_state:
@@ -1721,6 +2063,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             st.warning(f"{len(failed_rows)} kuyruk için aktif etme başarısız oldu.")
                                             for qid, err in failed_rows[:10]:
                                                 st.caption(f"❌ {selectable_queue_options.get(qid, qid)}: {err}")
+                                        _audit_user_action(
+                                            action="admin_user_queue_activate",
+                                            detail=f"Kullanıcı kuyruk üyelikleri aktif yapıldı: {user_id_clean}",
+                                            status=("success" if not failed_rows else ("warning" if success_ids else "error")),
+                                            metadata={
+                                                "user_id": user_id_clean,
+                                                "selected_queue_count": len(selected_queue_ids_for_toggle),
+                                                "success_count": len(success_ids),
+                                                "failed_count": len(failed_rows),
+                                            },
+                                        )
                                         if success_ids:
                                             st.rerun()
 
@@ -1750,6 +2103,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                             st.warning(f"{len(failed_rows)} kuyruk için pasif etme başarısız oldu.")
                                             for qid, err in failed_rows[:10]:
                                                 st.caption(f"❌ {selectable_queue_options.get(qid, qid)}: {err}")
+                                        _audit_user_action(
+                                            action="admin_user_queue_deactivate",
+                                            detail=f"Kullanıcı kuyruk üyelikleri pasif yapıldı: {user_id_clean}",
+                                            status=("success" if not failed_rows else ("warning" if success_ids else "error")),
+                                            metadata={
+                                                "user_id": user_id_clean,
+                                                "selected_queue_count": len(selected_queue_ids_for_toggle),
+                                                "success_count": len(success_ids),
+                                                "failed_count": len(failed_rows),
+                                            },
+                                        )
                                         if success_ids:
                                             st.rerun()
                             else:
@@ -1775,8 +2139,20 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 st.write(", ".join(lang_info) if lang_info else "Dil yok")
                             
                         else:
+                            _audit_user_action(
+                                action="admin_user_search",
+                                detail=f"Kullanıcı bulunamadı: {user_id_clean}",
+                                status="warning",
+                                metadata={"user_id": user_id_clean},
+                            )
                             st.warning(f"⚠️ Kullanıcı bulunamadı: `{user_id_clean}`")
                     except Exception as e:
+                        _audit_user_action(
+                            action="admin_user_search",
+                            detail=f"Kullanıcı arama hatası: {e}",
+                            status="error",
+                            metadata={"user_id": user_id_clean},
+                        )
                         st.error(f"❌ Hata: {e}")
 
     with tab7:
@@ -1923,6 +2299,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 )
 
             if clear_status_results_clicked:
+                _audit_user_action(
+                    action="admin_status_audit_clear",
+                    detail="Agent statü audit sonuçları temizlendi.",
+                    status="info",
+                    metadata={"organization": org},
+                )
                 st.session_state.pop(status_rows_key, None)
                 st.session_state.pop(status_meta_key, None)
                 st.rerun()
@@ -2052,6 +2434,21 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
                             "_cached_at_ts": pytime.time(),
                         }
+                        _audit_user_action(
+                            action="admin_status_audit_query",
+                            detail="Agent statü audit sorgusu çalıştırıldı.",
+                            status=("success" if not status_query_error else "warning"),
+                            metadata={
+                                "organization": org,
+                                "start_date": status_start_date.isoformat(),
+                                "end_date": status_end_date.isoformat(),
+                                "result_count": len(status_rows),
+                                "raw_entity_count": len(status_entities),
+                                "max_pages": int(status_max_pages),
+                                "target_user": status_selected_target_user or "",
+                                "actor_user": status_selected_actor_user or "",
+                            },
+                        )
                     except Exception as se:
                         st.session_state[status_rows_key] = []
                         st.session_state[status_meta_key] = {
@@ -2061,6 +2458,17 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
                             "_cached_at_ts": pytime.time(),
                         }
+                        _audit_user_action(
+                            action="admin_status_audit_query",
+                            detail=f"Agent statü audit sorgusu hatası: {se}",
+                            status="error",
+                            metadata={
+                                "organization": org,
+                                "start_date": status_start_date.isoformat(),
+                                "end_date": status_end_date.isoformat(),
+                                "max_pages": int(status_max_pages),
+                            },
+                        )
 
             status_rows_all = st.session_state.get(status_rows_key) or []
             status_meta = st.session_state.get(status_meta_key) or {}
@@ -2173,13 +2581,20 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                         f"| Aralık: `{status_meta.get('range_text', '-')}`"
                     )
                     st.dataframe(df_status_history, width='stretch')
-                    st.download_button(
+                    status_download_clicked = st.download_button(
                         "📥 Agent Statü Geçmişini CSV İndir",
                         data=df_status_history.to_csv(index=False).encode("utf-8"),
                         file_name=f"agent_status_history_{org}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv",
                         key=f"{status_prefix}_download_csv",
                     )
+                    if status_download_clicked:
+                        _audit_user_action(
+                            action="admin_status_audit_download",
+                            detail="Agent statü audit CSV indirildi.",
+                            status="success",
+                            metadata={"organization": org, "row_count": int(len(df_status_history))},
+                        )
 
             # ────────────────────────────────────────────
             # 2) KUYRUK ÜYELİK DEĞİŞİMLERİ
@@ -2287,6 +2702,12 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 )
 
             if clear_results_clicked:
+                _audit_user_action(
+                    action="admin_queue_audit_clear",
+                    detail="Kuyruk üyelik audit sonuçları temizlendi.",
+                    status="info",
+                    metadata={"organization": org},
+                )
                 st.session_state.pop(rows_key, None)
                 st.session_state.pop(meta_key, None)
                 st.rerun()
@@ -2454,6 +2875,22 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
                             "_cached_at_ts": pytime.time(),
                         }
+                        _audit_user_action(
+                            action="admin_queue_audit_query",
+                            detail="Kuyruk üyelik audit sorgusu çalıştırıldı.",
+                            status=("success" if not query_error else "warning"),
+                            metadata={
+                                "organization": org,
+                                "start_date": queue_start_date.isoformat(),
+                                "end_date": queue_end_date.isoformat(),
+                                "result_count": len(rows),
+                                "raw_entity_count": len(entities),
+                                "max_pages": int(queue_max_pages),
+                                "target_user": selected_target_user or "",
+                                "actor_user": selected_actor_user or "",
+                                "queue_search": queue_search_input or "",
+                            },
+                        )
                     except Exception as qe:
                         st.session_state[rows_key] = []
                         st.session_state[meta_key] = {
@@ -2463,6 +2900,18 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             "ran_at": datetime.now(tz_local).strftime("%Y-%m-%d %H:%M:%S"),
                             "_cached_at_ts": pytime.time(),
                         }
+                        _audit_user_action(
+                            action="admin_queue_audit_query",
+                            detail=f"Kuyruk üyelik audit sorgusu hatası: {qe}",
+                            status="error",
+                            metadata={
+                                "organization": org,
+                                "start_date": queue_start_date.isoformat(),
+                                "end_date": queue_end_date.isoformat(),
+                                "max_pages": int(queue_max_pages),
+                                "queue_search": queue_search_input or "",
+                            },
+                        )
 
             rows_all = st.session_state.get(rows_key) or []
             meta = st.session_state.get(meta_key) or {}
@@ -2586,13 +3035,194 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                         f"| Aralık: `{meta.get('range_text', '-')}`"
                     )
                     st.dataframe(df_queue_history, width='stretch')
-                    st.download_button(
+                    queue_download_clicked = st.download_button(
                         "📥 Kuyruk Üyelik Geçmişini CSV İndir",
                         data=df_queue_history.to_csv(index=False).encode("utf-8"),
                         file_name=f"queue_history_{org}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv",
                         key=f"{state_prefix}_download_csv",
                     )
+                    if queue_download_clicked:
+                        _audit_user_action(
+                            action="admin_queue_audit_download",
+                            detail="Kuyruk üyelik audit CSV indirildi.",
+                            status="success",
+                            metadata={"organization": org, "row_count": int(len(df_queue_history))},
+                        )
+
+    with tab8:
+        st.subheader("Kullanıcı İşlem Logları")
+        st.caption("Sistemdeki kullanıcı aksiyonlarını filtreleyebilir ve CSV/JSON olarak indirebilirsiniz.")
+
+        c1, c2, c3, c4 = st.columns(4)
+        limit_label = c1.selectbox("Kayıt Limiti", ["50", "100", "250", "500", "1000", "Tümü"], index=2, key="admin_action_log_limit")
+        limit = None if limit_label == "Tümü" else int(limit_label)
+        range_opt = c2.selectbox("Zaman Aralığı", ["24 saat", "3 gün", "7 gün", "30 gün", "Tümü"], index=2, key="admin_action_log_range")
+        username_filter = c3.text_input("Kullanıcı", key="admin_action_log_username_filter")
+        action_filter = c4.text_input("İşlem", key="admin_action_log_action_filter")
+
+        c5, c6, c7, c8 = st.columns(4)
+        all_orgs = c5.checkbox("Tüm Organizasyonlar", value=False, key="admin_action_log_all_orgs")
+        org_filter = c5.text_input(
+            "Organizasyon",
+            value="" if all_orgs else current_org,
+            key="admin_action_log_org_filter",
+            disabled=all_orgs,
+        )
+        status_filter_ui = c6.selectbox("Durum", ["Hepsi", "success", "info", "warning", "error"], index=0, key="admin_action_log_status_filter")
+        include_api_requests = c8.checkbox(
+            "API Sorguları",
+            value=False,
+            key="admin_action_log_include_api",
+            help="Kapalıyken 'api_request' kayıtları listede gizlenir.",
+        )
+        search_text = st.text_input(
+            "Detay/Metadata Arama",
+            key="admin_action_log_search",
+            placeholder="Örn: queue, user_create, report_fetch",
+        )
+
+        range_hours_map = {
+            "24 saat": 24,
+            "3 gün": 72,
+            "7 gün": 168,
+            "30 gün": 720,
+            "Tümü": None,
+        }
+        since_hours = range_hours_map.get(range_opt, 168)
+        status_filter = None if status_filter_ui == "Hepsi" else status_filter_ui
+
+        events_reader = globals().get("_get_user_action_events")
+        source_filter = None
+        source_options = ["Hepsi"]
+
+        if callable(events_reader):
+            try:
+                source_probe = events_reader(
+                    limit=5000,
+                    org_code=None if all_orgs else (org_filter or current_org),
+                    username=username_filter or None,
+                    action=action_filter or None,
+                    status=status_filter,
+                    source=None,
+                    since_hours=since_hours,
+                ) or []
+                source_values = sorted(
+                    {
+                        str(item.get("source") or "").strip()
+                        for item in source_probe
+                        if isinstance(item, dict) and str(item.get("source") or "").strip()
+                    }
+                )
+                if source_values:
+                    source_options.extend(source_values)
+            except Exception:
+                pass
+
+        selected_source = c7.selectbox(
+            "Kaynak",
+            source_options,
+            index=0,
+            key="admin_action_log_source_select",
+        )
+        if selected_source != "Hepsi":
+            source_filter = selected_source
+
+        events = []
+        if callable(events_reader):
+            try:
+                fetch_limit = limit
+                if (not include_api_requests) and (limit is not None):
+                    fetch_limit = max(int(limit) * 5, 1000)
+                events = events_reader(
+                    limit=fetch_limit,
+                    org_code=None if all_orgs else (org_filter or current_org),
+                    username=username_filter or None,
+                    action=action_filter or None,
+                    status=status_filter,
+                    source=source_filter or None,
+                    since_hours=since_hours,
+                ) or []
+            except Exception as e:
+                st.warning(f"İşlem logları okunamadı: {e}")
+                events = []
+        else:
+            st.warning("İşlem logu okuyucu mevcut değil.")
+
+        force_show_api = bool(
+            (source_filter and str(source_filter).strip().lower() == "api-monitor")
+            or ("api_request" in str(action_filter or "").strip().lower())
+        )
+        if not include_api_requests and not force_show_api:
+            events = [
+                item for item in events
+                if isinstance(item, dict) and str(item.get("action") or "").strip() != "api_request"
+            ]
+            st.caption("API sorguları varsayılan olarak gizleniyor. Göstermek için 'API Sorguları' seçeneğini açın.")
+            if limit is not None:
+                events = events[: int(limit)]
+
+        token = str(search_text or "").strip().lower()
+        if token:
+            filtered = []
+            for item in events:
+                if not isinstance(item, dict):
+                    continue
+                haystack = " ".join(
+                    [
+                        str(item.get("detail") or ""),
+                        str(item.get("action") or ""),
+                        str(item.get("username") or ""),
+                        str(item.get("org_code") or ""),
+                        str(item.get("source") or ""),
+                        json.dumps(item.get("metadata") or {}, ensure_ascii=False),
+                    ]
+                ).lower()
+                if token in haystack:
+                    filtered.append(item)
+            events = filtered
+
+        if not events:
+            st.info("Filtrelere uygun işlem logu bulunamadı.")
+        else:
+            rows = []
+            for item in events:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    {
+                        "Tarih/Saat": str(item.get("timestamp") or "-"),
+                        "Kullanıcı": str(item.get("username") or "-"),
+                        "Rol": str(item.get("role") or "-"),
+                        "Organizasyon": str(item.get("org_code") or "-"),
+                        "Sayfa": str(item.get("page") or "-"),
+                        "İşlem": str(item.get("action") or "-"),
+                        "Durum": str(item.get("status") or "info"),
+                        "Kaynak": str(item.get("source") or "-"),
+                        "Detay": str(item.get("detail") or ""),
+                        "Metadata": _compact_json_preview(item.get("metadata"), max_len=280),
+                    }
+                )
+            df_actions = pd.DataFrame(rows)
+            st.success(f"{len(df_actions)} kayıt listeleniyor.")
+            st.dataframe(df_actions, width='stretch', hide_index=True)
+
+            export_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            org_slug = "all" if all_orgs else str((org_filter or current_org) or "default")
+            st.download_button(
+                "📥 İşlem Loglarını CSV İndir",
+                data=df_actions.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"user_actions_{org_slug}_{export_ts}.csv",
+                mime="text/csv",
+                key="admin_action_log_download_csv",
+            )
+            st.download_button(
+                "📥 İşlem Loglarını JSON İndir",
+                data=json.dumps(events, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"user_actions_{org_slug}_{export_ts}.json",
+                mime="application/json",
+                key="admin_action_log_download_json",
+            )
 
     # Logout moved to Organization Settings
     
