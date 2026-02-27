@@ -118,7 +118,16 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
             action="dashboard_card_create",
             detail=f"Dashboard kartı oluşturuldu (card_id={new_card_id}).",
             status="success",
-            metadata={"card_id": new_card_id, "layout": st.session_state.dashboard_layout},
+            metadata={
+                "card_id": new_card_id,
+                "layout": st.session_state.dashboard_layout,
+                "queues": "",
+                "live_metrics": "Waiting, Interacting, On Queue",
+                "daily_metrics": "Offered, Answered, Abandoned, Answer Rate",
+                "visual_metrics": "Service Level",
+                "media_types": "",
+                "size": "medium",
+            },
         )
         save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
         refresh_data_manager_queues()
@@ -227,6 +236,8 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
     grid = main_c.columns(st.session_state.dashboard_layout)
     cards_total_t0 = pytime.perf_counter()
     to_del = []
+    # Snapshot card states before rendering widgets so we can detect all changes at the end
+    _cards_snapshot = {card['id']: dict(card) for card in st.session_state.dashboard_cards}
     for idx, card in enumerate(st.session_state.dashboard_cards):
         card_total_t0 = pytime.perf_counter()
         try:
@@ -302,21 +313,6 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         if st.button("Delete", key=f"d_{card['id']}"):
                             to_del.append(idx)
                         if card != prev_card:
-                            changed_fields = [
-                                field_name
-                                for field_name in ["title", "size", "queues", "media_types", "live_metrics", "daily_metrics", "visual_metrics"]
-                                if prev_card.get(field_name) != card.get(field_name)
-                            ]
-                            _audit_user_action(
-                                action="dashboard_card_update",
-                                detail=f"Dashboard kartı güncellendi (card_id={card.get('id')}).",
-                                status="success",
-                                metadata={
-                                    "card_id": card.get("id"),
-                                    "card_title": card.get("title") or f"Grup #{card.get('id', 0) + 1}",
-                                    "changed_fields": changed_fields,
-                                },
-                            )
                             save_dashboard_config(org, st.session_state.dashboard_layout, st.session_state.dashboard_cards)
                             if prev_card.get("queues") != card.get("queues"):
                                 refresh_data_manager_queues()
@@ -842,10 +838,14 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
             try:
                 if 0 <= int(i) < len(st.session_state.dashboard_cards):
                     card_obj = st.session_state.dashboard_cards[int(i)] or {}
+                    snap = _cards_snapshot.get(card_obj.get("id"), {})
                     removed_cards.append(
                         {
                             "card_id": card_obj.get("id"),
                             "card_title": card_obj.get("title") or f"Grup #{int(card_obj.get('id', 0)) + 1}",
+                            "queues": ", ".join(snap.get("queues") or []),
+                            "live_metrics": ", ".join(snap.get("live_metrics") or []),
+                            "daily_metrics": ", ".join(snap.get("daily_metrics") or []),
                         }
                     )
             except Exception:
@@ -862,6 +862,32 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
         refresh_data_manager_queues()
         st.session_state._dashboard_dm_sig = _dashboard_dm_signature(org)
         _dashboard_rerun()
+
+    # Consolidated audit: log once per card that changed (compared to snapshot at start of render)
+    _tracked_fields = ["title", "size", "queues", "media_types", "live_metrics", "daily_metrics", "visual_metrics"]
+    for card in st.session_state.dashboard_cards:
+        snap = _cards_snapshot.get(card.get("id"))
+        if snap is None:
+            continue
+        changed_fields = [f for f in _tracked_fields if snap.get(f) != card.get(f)]
+        if not changed_fields:
+            continue
+        _audit_user_action(
+            action="dashboard_card_update",
+            detail=f"Dashboard kartı güncellendi (card_id={card.get('id')}).",
+            status="success",
+            metadata={
+                "card_id": card.get("id"),
+                "card_title": card.get("title") or f"Grup #{card.get('id', 0) + 1}",
+                "changed_fields": ", ".join(changed_fields),
+                "queues": ", ".join(card.get("queues") or []),
+                "live_metrics": ", ".join(card.get("live_metrics") or []),
+                "daily_metrics": ", ".join(card.get("daily_metrics") or []),
+                "visual_metrics": ", ".join(card.get("visual_metrics") or []),
+                "media_types": ", ".join(card.get("media_types") or []),
+                "size": card.get("size", "medium"),
+            },
+        )
 
     # --- SIDE PANEL LOGIC ---
     if st.session_state.get('show_agent_panel', False) and agent_c:

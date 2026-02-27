@@ -380,12 +380,13 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             "report_type": str(r_type or ""),
             "selected_entities": len(sel_names or []),
             "selected_metrics": len(sel_mets or []),
+            "metrics": ", ".join(sel_mets or []),
             "start_date": str(sd),
             "end_date": str(ed),
             "start_time": str(st_),
             "end_time": str(et),
             "granularity": str(gran_opt.get(sel_gran) if isinstance(gran_opt, dict) else sel_gran),
-            "media_types": list(sel_media_types or []),
+            "media_types": ", ".join(sel_media_types or []),
         }
         if rows is not None:
             try:

@@ -44,7 +44,7 @@ def _build_endpoint_labels(endpoints, max_len=46):
     return labels
 
 
-def _compact_json_preview(value, max_len=240):
+def _compact_json_preview(value, max_len=600):
     try:
         text = json.dumps(value or {}, ensure_ascii=False)
     except Exception:
@@ -3200,7 +3200,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                         "Durum": str(item.get("status") or "info"),
                         "Kaynak": str(item.get("source") or "-"),
                         "Detay": str(item.get("detail") or ""),
-                        "Metadata": _compact_json_preview(item.get("metadata"), max_len=280),
+                        "Metadata": _compact_json_preview(item.get("metadata"), max_len=600),
                     }
                 )
             df_actions = pd.DataFrame(rows)
