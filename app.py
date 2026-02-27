@@ -246,9 +246,7 @@ LOGIN_WINDOW_SECONDS = int(os.environ.get("GENESYS_LOGIN_WINDOW_SECONDS", "900")
 LOGIN_LOCK_SECONDS = int(os.environ.get("GENESYS_LOGIN_LOCK_SECONDS", "900"))
 LOGIN_MAX_FAILURES = int(os.environ.get("GENESYS_LOGIN_MAX_FAILURES", "5"))
 LOGIN_ATTEMPT_MAX_ENTRIES = int(os.environ.get("GENESYS_LOGIN_ATTEMPT_MAX_ENTRIES", "5000"))
-COOKIE_BOOT_AUTOREFRESH_MS = int(os.environ.get("GENESYS_COOKIE_BOOT_AUTOREFRESH_MS", "700"))
-COOKIE_BOOT_HARD_RESET_EVERY = int(os.environ.get("GENESYS_COOKIE_BOOT_HARD_RESET_EVERY", "3"))
-COOKIE_BOOT_MAX_HARD_RESETS = int(os.environ.get("GENESYS_COOKIE_BOOT_MAX_HARD_RESETS", "2"))
+
 DATA_MANAGER_IMPL_VERSION = 2
 
 def _rm_debug(msg, *args):
@@ -848,29 +846,10 @@ def _get_cipher():
 
 _cookie_manager = None
 
-def _reset_cookie_manager(reason="manual"):
-    global _cookie_manager
-    _cookie_manager = None
-    _rm_debug("cookie manager reset requested (%s)", reason)
-
-def _enable_cookie_degraded_mode(reason=None):
-    reason_text = str(reason or "unknown").strip() or "unknown"
-    already_enabled = bool(st.session_state.get("_cookie_degraded_mode"))
-    st.session_state["_cookie_degraded_mode"] = True
-    st.session_state["_cookie_degraded_reason"] = reason_text
-    st.session_state.remember_me_enabled = False
-    st.session_state.pop("_remember_me_pending_payload", None)
-    st.session_state["_remember_me_pending_retries"] = 0
-    st.session_state["_remember_me_pending_delete"] = False
-    st.session_state["_remember_me_pending_delete_retries"] = 0
-    if not already_enabled:
-        logger.warning("Cookie degraded mode enabled (reason=%s)", reason_text)
-        _rm_debug("cookie degraded mode enabled (reason=%s)", reason_text)
-
 def _get_cookie_manager():
+    """Get or create the cookie manager. Returns None if not ready yet."""
     global _cookie_manager
     if not Runtime.exists():
-        _rm_debug("runtime not ready; cookie manager unavailable")
         return None
     if _cookie_manager is None:
         key = _get_or_create_key()
@@ -881,31 +860,15 @@ def _get_cookie_manager():
         try:
             from streamlit_cookies_manager import EncryptedCookieManager
             _cookie_manager = EncryptedCookieManager(prefix="genesys", password=key_str)
-            _rm_debug("cookie manager created")
-        except RuntimeError:
-            _rm_debug("cookie manager creation failed: runtime error")
-            return None
         except Exception as e:
             _rm_debug("cookie manager creation failed: %s", e)
             return None
     try:
         if not _cookie_manager.ready():
-            _rm_debug("cookie manager not ready yet")
             return None
-    except Exception as e:
-        _rm_debug("cookie manager ready check failed: %s", e)
-        return None
-    _rm_debug("cookie manager ready")
-    return _cookie_manager
-
-def _cookie_manager_initializing():
-    global _cookie_manager
-    if _cookie_manager is None:
-        return False
-    try:
-        return not _cookie_manager.ready()
     except Exception:
-        return False
+        return None
+    return _cookie_manager
 
 def load_credentials(org_code):
     org_path = _org_dir(org_code)
@@ -956,46 +919,31 @@ def generate_password(length=12):
 
 # --- APP SESSION MANAGEMENT (REMEMBER ME) ---
 def load_app_session():
+    """Load saved session from cookie. Returns user data dict or None."""
     try:
         _cleanup_legacy_app_session_file()
-        cookie_status, session_data = _read_app_session_cookie(with_status=True)
-        if cookie_status == "invalid":
-            _rm_debug("load session: invalid cookie payload, deleting")
+        cookies = _get_cookie_manager()
+        if cookies is None:
+            return None
+        raw = cookies.get(APP_SESSION_COOKIE)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            _rm_debug("load session: invalid cookie, deleting")
             delete_app_session()
             return None
-        if not session_data:
-            return None
-        timestamp = session_data.get("timestamp", 0)
+        timestamp = data.get("timestamp", 0)
         if pytime.time() - timestamp > APP_SESSION_TTL:
             _rm_debug("load session: cookie expired")
             delete_app_session()
             return None
-        _rm_debug(
-            "load session: valid for user=%s org=%s",
-            session_data.get("username"),
-            session_data.get("org_code"),
-        )
-        return session_data
+        _rm_debug("load session: valid for user=%s org=%s", data.get("username"), data.get("org_code"))
+        return data
     except Exception as e:
         _rm_debug("load session failed: %s", e)
         return None
-
-def _read_app_session_cookie(with_status=False):
-    cookies = _get_cookie_manager()
-    if cookies is None:
-        _rm_debug("read cookie skipped: cookie manager missing")
-        return ("manager_missing", None) if with_status else None
-    raw = cookies.get(APP_SESSION_COOKIE)
-    if not raw:
-        _rm_debug("read cookie: not found")
-        return ("not_found", None) if with_status else None
-    _rm_debug("read cookie: found (%s chars)", len(str(raw)))
-    try:
-        data = json.loads(raw)
-        return ("found", data) if with_status else data
-    except Exception as e:
-        _rm_debug("read cookie parse failed: %s", e)
-        return ("invalid", None) if with_status else None
 
 def _hydrate_app_user_from_saved_session(session_data):
     try:
@@ -1023,22 +971,16 @@ def _hydrate_app_user_from_saved_session(session_data):
         return None
 
 def save_app_session(user_data):
+    """Save user session to cookie. Returns True on success."""
     try:
         _cleanup_legacy_app_session_file()
         cookies = _get_cookie_manager()
         if cookies is None:
-            _rm_debug(
-                "save session failed: cookie manager missing for user=%s org=%s",
-                user_data.get("username"),
-                user_data.get("org_code"),
-            )
+            _rm_debug("save session failed: cookie manager not ready for user=%s", user_data.get("username"))
             return False
         payload = {**user_data, "timestamp": pytime.time()}
-        payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        _rm_debug("save session payload bytes=%s", len(payload_json.encode("utf-8")))
-        cookies[APP_SESSION_COOKIE] = payload_json
-        save_result = cookies.save()
-        _rm_debug("cookie save() returned: %s", save_result)
+        cookies[APP_SESSION_COOKIE] = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        cookies.save()
         _rm_debug("save session success for user=%s org=%s", user_data.get("username"), user_data.get("org_code"))
         return True
     except Exception as e:
@@ -1046,19 +988,11 @@ def save_app_session(user_data):
         return False
 
 def delete_app_session():
+    """Delete session cookie."""
     _cleanup_legacy_app_session_file()
     try:
-        st.session_state.pop("_remember_me_pending_payload", None)
-        st.session_state.pop("_remember_me_pending_retries", None)
-    except Exception:
-        pass
-    
-    # Delete cookie
-    try:
         cookies = _get_cookie_manager()
         if cookies is not None:
-            # streamlit_cookies_manager can fail to remove reliably with only `del`;
-            # write an empty tombstone value as fallback.
             try:
                 if APP_SESSION_COOKIE in cookies:
                     del cookies[APP_SESSION_COOKIE]
@@ -1066,191 +1000,30 @@ def delete_app_session():
                 pass
             cookies[APP_SESSION_COOKIE] = ""
             cookies.save()
-            _rm_debug("delete session cookie removal requested")
-        else:
-            _rm_debug("delete session cookie skipped: cookie missing")
+            _rm_debug("delete session: cookie cleared")
     except Exception as e:
         _rm_debug("delete session failed: %s", e)
-        pass
 
-def _flush_pending_remember_me_delete(block_ui=True, max_retries=20):
-    if bool(st.session_state.get("_cookie_degraded_mode")):
-        st.session_state["_remember_me_pending_delete"] = False
-        st.session_state["_remember_me_pending_delete_retries"] = 0
-        return True
-    if not st.session_state.get("_remember_me_pending_delete"):
-        return True
-    retries = int(st.session_state.get("_remember_me_pending_delete_retries", 0))
-    cookie_status, _ = _read_app_session_cookie(with_status=True)
-    if cookie_status == "manager_missing":
-        retries += 1
-        st.session_state["_remember_me_pending_delete_retries"] = retries
-        _rm_debug("pending remember-me delete waiting for cookie manager retry=%s", retries)
-        if block_ui and retries <= max_retries:
-            _safe_autorefresh(interval=700, key=f"remember_delete_retry_{retries}")
-            st.info("Oturum çıkışı doğrulanıyor, lütfen bekleyin...")
-            st.stop()
-        if retries > max_retries:
-            _rm_debug("pending remember-me delete exceeded retries=%s while waiting manager", retries)
-            if not block_ui:
-                st.session_state["_remember_me_pending_delete"] = False
-                st.session_state["_remember_me_pending_delete_retries"] = 0
-            return False
-        return True
-    if cookie_status == "not_found":
-        st.session_state["_remember_me_pending_delete"] = False
-        st.session_state["_remember_me_pending_delete_retries"] = 0
-        _rm_debug("pending remember-me delete verified")
-        return True
-    try:
-        cookies = _get_cookie_manager()
-        if cookies is not None:
-            try:
-                if APP_SESSION_COOKIE in cookies:
-                    del cookies[APP_SESSION_COOKIE]
-            except Exception:
-                pass
-            cookies[APP_SESSION_COOKIE] = ""
-            cookies.save()
-            _rm_debug("pending remember-me delete attempt=%s save issued", retries + 1)
-    except Exception as e:
-        _rm_debug("pending remember-me delete failed: %s", e)
-    retries += 1
-    st.session_state["_remember_me_pending_delete_retries"] = retries
-    if block_ui and retries <= max_retries:
-        _safe_autorefresh(interval=700, key=f"remember_delete_retry_{retries}")
-        st.info("Oturum çıkışı doğrulanıyor, lütfen bekleyin...")
-        st.stop()
-    if retries > max_retries:
-        _rm_debug("pending remember-me delete exceeded retries=%s", retries)
-        if not block_ui:
-            st.session_state["_remember_me_pending_delete"] = False
-            st.session_state["_remember_me_pending_delete_retries"] = 0
-        return False
-    return True
-
-def _flush_pending_remember_me(block_ui=True, max_retries=20):
-    if bool(st.session_state.get("_cookie_degraded_mode")):
-        st.session_state.pop("_remember_me_pending_payload", None)
-        st.session_state["_remember_me_pending_retries"] = 0
-        st.session_state.remember_me_enabled = False
-        return True
-    payload = st.session_state.get("_remember_me_pending_payload")
+def _try_flush_pending_remember_me():
+    """Try to save a pending remember-me payload (one attempt per rerun)."""
+    payload = st.session_state.get("_pending_remember_save")
     if not payload:
-        return True
-    username = str(payload.get("username") or "").strip()
-    try:
-        org_code = _safe_org_code(payload.get("org_code", "default"))
-    except ValueError:
-        _rm_debug("pending remember-me dropped: invalid org_code in payload")
-        st.session_state.pop("_remember_me_pending_payload", None)
-        st.session_state.pop("_remember_me_pending_retries", None)
-        st.session_state.remember_me_enabled = False
-        st.session_state["_remember_me_pending_delete"] = True
-        st.session_state["_remember_me_pending_delete_retries"] = 0
-        return True
+        return
+    if save_app_session(payload):
+        st.session_state.pop("_pending_remember_save", None)
+        _rm_debug("pending remember-me flushed for user=%s", payload.get("username"))
+    else:
+        _rm_debug("pending remember-me still waiting for cookie manager")
 
-    if username:
-        try:
-            org_users = auth_manager.get_all_users(org_code) or {}
-            db_user = org_users.get(username) or {}
-            if db_user.get("must_change_password"):
-                _rm_debug(
-                    "pending remember-me dropped for user=%s org=%s due to must_change_password",
-                    username,
-                    org_code,
-                )
-                st.session_state.pop("_remember_me_pending_payload", None)
-                st.session_state.pop("_remember_me_pending_retries", None)
-                st.session_state.remember_me_enabled = False
-                st.session_state["_remember_me_pending_delete"] = True
-                st.session_state["_remember_me_pending_delete_retries"] = 0
-                return True
-        except Exception as e:
-            _rm_debug("pending remember-me user lookup failed: %s", e)
-    _rm_debug(
-        "pending remember-me flush: retry=%s user=%s org=%s",
-        st.session_state.get("_remember_me_pending_retries", 0),
-        payload.get("username"),
-        payload.get("org_code"),
-    )
-    existing = _read_app_session_cookie()
-    if (
-        existing
-        and existing.get("username") == payload.get("username")
-        and existing.get("org_code", "default") == payload.get("org_code", "default")
-    ):
-        st.session_state.pop("_remember_me_pending_payload", None)
-        st.session_state.pop("_remember_me_pending_retries", None)
-        _rm_debug("pending remember-me flush verified")
-        return True
-    retries = int(st.session_state.get("_remember_me_pending_retries", 0)) + 1
-    st.session_state["_remember_me_pending_retries"] = retries
-    save_ok = save_app_session(payload)
-    _rm_debug("pending remember-me flush attempt=%s save_ok=%s", retries, save_ok)
-    # Give cookie component time to initialize and persist.
-    if block_ui and retries <= max_retries:
-        _safe_autorefresh(interval=700, key=f"remember_flush_retry_{retries}")
-        st.info("Beni Hatırla kaydı doğrulanıyor, lütfen bekleyin...")
-        st.stop()
-    if retries > max_retries:
-        _rm_debug("pending remember-me flush failed after retries=%s", retries)
-        if not block_ui:
-            st.session_state.pop("_remember_me_pending_payload", None)
-            st.session_state.pop("_remember_me_pending_retries", None)
-            st.session_state.remember_me_enabled = False
-            return True
-        return False
-    return True
-
-def _ensure_cookie_component_ready(max_retries=8, block_ui=True):
-    retries = int(st.session_state.get("_cookie_boot_retries", 0))
-    cm = _get_cookie_manager()
-    if cm is not None:
-        st.session_state["_cookie_boot_retries"] = 0
-        st.session_state["_cookie_boot_resets"] = 0
-        st.session_state["_cookie_degraded_mode"] = False
-        st.session_state["_cookie_degraded_reason"] = ""
-        _rm_debug("cookie component ready at retry=%s", retries)
-        return True
-
-    retries += 1
-    st.session_state["_cookie_boot_retries"] = retries
-    _rm_debug("cookie component boot retry=%s/%s", retries, max_retries)
-
-    # Self-heal: recreate cookie manager instance before giving up.
-    reset_every = max(1, int(COOKIE_BOOT_HARD_RESET_EVERY or 1))
-    reset_cap = max(0, int(COOKIE_BOOT_MAX_HARD_RESETS or 0))
-    reset_count = int(st.session_state.get("_cookie_boot_resets", 0) or 0)
-    if (retries % reset_every) == 0 and reset_count < reset_cap:
-        _reset_cookie_manager(reason=f"boot-retry-{retries}")
-        st.session_state["_cookie_boot_resets"] = reset_count + 1
-        _rm_debug(
-            "cookie component hard reset applied count=%s/%s",
-            st.session_state.get("_cookie_boot_resets"),
-            reset_cap,
-        )
-
-    if block_ui and retries <= max_retries:
-        _safe_autorefresh(interval=max(300, int(COOKIE_BOOT_AUTOREFRESH_MS or 700)), key=f"cookie_boot_retry_{retries}")
-        st.info("Oturum bileşeni hazırlanıyor, lütfen bekleyin...")
-        st.stop()
-
-    if retries > max_retries:
-        _enable_cookie_degraded_mode(reason="cookie-manager-unavailable")
-        last_notice_ts = float(st.session_state.get("_cookie_boot_notice_ts", 0) or 0)
-        now_ts = pytime.time()
-        if (now_ts - last_notice_ts) > 10:
-            st.session_state["_cookie_boot_notice_ts"] = now_ts
-            st.warning(
-                "Oturum bileşeni başlatılamadı. Uygulama devam ediyor ancak `Beni Hatırla` geçici olarak devre dışı."
-            )
-    elif not block_ui:
-        # Non-blocking path: keep UI responsive while component boots.
-        if retries == 1:
-            st.info("Oturum bileşeni hazırlanıyor. Giriş ekranı kullanılabilir, `Beni Hatırla` gecikebilir.")
-
-    return False
+def _try_flush_pending_remember_me_delete():
+    """Try to delete cookie if a pending delete is queued."""
+    if not st.session_state.get("_pending_remember_delete"):
+        return
+    cookies = _get_cookie_manager()
+    if cookies is not None:
+        delete_app_session()
+        st.session_state["_pending_remember_delete"] = False
+        _rm_debug("pending remember-me delete flushed")
 
 
 @st.cache_resource(show_spinner=False)
@@ -3497,16 +3270,10 @@ def init_session_state():
     if 'use_agent_notifications' not in st.session_state: st.session_state.use_agent_notifications = True
     if 'logged_in' not in st.session_state: st.session_state.logged_in = False
     if 'last_console_log_count' not in st.session_state: st.session_state.last_console_log_count = 0 # Track logged errors
-    if '_remember_me_pending_payload' not in st.session_state: st.session_state._remember_me_pending_payload = None
-    if '_remember_me_pending_retries' not in st.session_state: st.session_state._remember_me_pending_retries = 0
-    if '_remember_me_pending_delete' not in st.session_state: st.session_state._remember_me_pending_delete = False
-    if '_remember_me_pending_delete_retries' not in st.session_state: st.session_state._remember_me_pending_delete_retries = 0
-    if '_cookie_boot_retries' not in st.session_state: st.session_state._cookie_boot_retries = 0
-    if '_cookie_boot_resets' not in st.session_state: st.session_state._cookie_boot_resets = 0
-    if '_cookie_boot_notice_ts' not in st.session_state: st.session_state._cookie_boot_notice_ts = 0.0
-    if '_cookie_degraded_mode' not in st.session_state: st.session_state._cookie_degraded_mode = False
-    if '_cookie_degraded_reason' not in st.session_state: st.session_state._cookie_degraded_reason = ""
     if 'remember_me_enabled' not in st.session_state: st.session_state.remember_me_enabled = False
+    if '_pending_remember_save' not in st.session_state: st.session_state._pending_remember_save = None
+    if '_pending_remember_delete' not in st.session_state: st.session_state._pending_remember_delete = False
+    if '_cookie_checked' not in st.session_state: st.session_state._cookie_checked = False
     if 'rep_auto_row_limit' not in st.session_state: st.session_state.rep_auto_row_limit = 50000
 
 def log_to_console(message, level='error'):
@@ -3526,9 +3293,8 @@ init_session_state()
 _inject_reboot_path_bridge_script()
 _start_periodic_reboot_scheduler()
 _maybe_periodic_temp_cleanup()
-_cookie_flow_blocking = bool(st.session_state.get("app_user")) and (not bool(st.session_state.get("_cookie_degraded_mode")))
-_flush_pending_remember_me_delete(block_ui=_cookie_flow_blocking)
-_flush_pending_remember_me(block_ui=_cookie_flow_blocking)
+_try_flush_pending_remember_me()
+_try_flush_pending_remember_me_delete()
 
 # Ensure shared DataManager is available after login
 if st.session_state.app_user and 'data_manager' not in st.session_state:
@@ -3612,20 +3378,34 @@ if not st.session_state.app_user:
                             st.error(msg)
         st.stop()
 
-    _ensure_cookie_component_ready(max_retries=8, block_ui=False)
-    # Try Auto-Login from Encrypted Session File
+    # Try auto-login from remember-me cookie
+    cm = _get_cookie_manager()  # Trigger cookie component render
+    if cm is None and not st.session_state.get("_cookie_checked"):
+        # Cookie manager not ready yet (first render) - show loading instead of login
+        st.markdown(
+            """
+            <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;">
+                <div style="border:4px solid #f3f3f3;border-top:4px solid #3498db;border-radius:50%;width:48px;height:48px;animation:spin 0.8s linear infinite;"></div>
+                <p style="margin-top:18px;color:#888;font-size:1.1em;">Oturum kontrol ediliyor...</p>
+            </div>
+            <style>@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.session_state._cookie_checked = True
+        st.stop()
+    st.session_state._cookie_checked = True
     saved_session = load_app_session()
     if saved_session:
         hydrated_user = _hydrate_app_user_from_saved_session(saved_session)
         if not hydrated_user:
             _rm_debug("auto-login rejected: saved session could not be hydrated, deleting cookie")
             delete_app_session()
+        elif hydrated_user.get("must_change_password"):
+            _rm_debug("auto-login rejected: user must change password")
+            delete_app_session()
         else:
-            _rm_debug(
-                "auto-login success from cookie for user=%s org=%s",
-                hydrated_user.get("username"),
-                hydrated_user.get("org_code"),
-            )
+            _rm_debug("auto-login success from cookie for user=%s org=%s", hydrated_user.get("username"), hydrated_user.get("org_code"))
             _log_user_action(
                 action="app_auto_login_cookie",
                 detail="Auto login from remember-me cookie.",
@@ -3649,15 +3429,10 @@ if not st.session_state.app_user:
         u_org = st.text_input(get_text(st.session_state.language, "org_code"), value="default")
         u_name = st.text_input(get_text(st.session_state.language, "username"))
         u_pass = st.text_input(get_text(st.session_state.language, "password"), type="password")
-        remember_me_disabled = bool(st.session_state.get("_cookie_degraded_mode"))
-        remember_me_help = "Bu cihazda oturumu hatirla."
-        if remember_me_disabled:
-            remember_me_help = "Oturum bileşeni hazır olmadığından Beni Hatırla geçici devre dışı."
         remember_me = st.checkbox(
             get_text(st.session_state.language, "remember_me"),
             value=False,
-            help=remember_me_help,
-            disabled=remember_me_disabled,
+            help="Bu cihazda oturumu hatırla.",
         )
 
         # Keep login flow resilient across Streamlit builds that can mis-handle form submit state.
@@ -3714,10 +3489,6 @@ if not st.session_state.app_user:
                                 u_org_safe,
                             )
                             st.session_state.remember_me_enabled = False
-                            st.session_state._remember_me_pending_payload = None
-                            st.session_state._remember_me_pending_retries = 0
-                            st.session_state._remember_me_pending_delete = True
-                            st.session_state._remember_me_pending_delete_retries = 0
                             delete_app_session()
                         elif remember_me:
                             _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name_clean, u_org_safe)
@@ -3726,14 +3497,12 @@ if not st.session_state.app_user:
                                 "org_code": full_user.get("org_code", u_org_safe),
                             }
                             st.session_state.remember_me_enabled = True
-                            st.session_state._remember_me_pending_payload = remember_payload
-                            st.session_state._remember_me_pending_retries = 0
-                            _rm_debug("remember-me queued for verified write")
+                            if not save_app_session(remember_payload):
+                                st.session_state._pending_remember_save = remember_payload
+                                _rm_debug("remember-me queued for next rerun")
                         else:
                             _rm_debug("login submit with remember-me OFF for user=%s org=%s", u_name_clean, u_org_safe)
                             st.session_state.remember_me_enabled = False
-                            st.session_state._remember_me_pending_delete = True
-                            st.session_state._remember_me_pending_delete_retries = 0
                             delete_app_session()
 
                         _log_user_action(
@@ -3902,10 +3671,10 @@ with st.sidebar:
             _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
         except Exception:
             pass
-        # Clear session file and cookie FIRST
-        st.session_state._remember_me_pending_delete = True
-        st.session_state._remember_me_pending_delete_retries = 0
+        # Clear session cookie
         delete_app_session()
+        st.session_state._pending_remember_delete = True
+        st.session_state._pending_remember_save = None
         st.session_state.remember_me_enabled = False
         # Clear all session state
         st.session_state.app_user = None
