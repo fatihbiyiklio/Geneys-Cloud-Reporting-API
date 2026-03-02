@@ -56,6 +56,24 @@ except Exception:
     pass
 
 from streamlit.runtime import Runtime
+import base64
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+def _patched_key_from_parameters(salt: bytes, iterations: int, password: str):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=iterations,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
+
+try:
+    import streamlit_cookies_manager.encrypted_cookie_manager as ecm
+    ecm.key_from_parameters = _patched_key_from_parameters
+except Exception:
+    pass
 
 def _load_fernet_class():
     """Reuse Fernet across Streamlit reruns to avoid reinitializing PyO3 modules."""
