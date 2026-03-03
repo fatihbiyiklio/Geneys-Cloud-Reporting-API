@@ -401,65 +401,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
 
     with tab3:
         _start_memory_monitor(sample_interval=10, max_samples=720)
-        st.subheader("Uygulama Kontrol")
-        st.warning("Bu işlem uygulamayı yeniden başlatır. Aktif kullanıcı oturumları kısa süreli kesilir.")
-        st.caption("URL tetikleme: `/rebootme` veya `/?rebootme=1` (aktif oturum gerektirmez).")
-        st.caption("Not: URL tetiklemesi doğrudan reboot başlatır.")
-        reboot_confirm = st.checkbox("Uygulamayı yeniden başlatmayı onaylıyorum", key="admin_reboot_confirm")
-        if st.button("🔄 Uygulamayı Reboot Et", type="primary", key="admin_reboot_btn", disabled=not reboot_confirm):
-            app_user = st.session_state.get('app_user', {}) or {}
-            admin_user = app_user.get('username', 'unknown')
-            admin_org = app_user.get('org_code', 'default')
-            _audit_user_action(
-                action="admin_reboot_request",
-                detail="Admin panelden uygulama reboot talebi.",
-                status="warning",
-                metadata={"organization": admin_org, "username": admin_user},
-            )
-            logger.warning(f"[ADMIN REBOOT] Restart requested by {admin_user}")
-            reboot_event_writer = globals().get("_append_reboot_event")
-            if callable(reboot_event_writer):
-                try:
-                    reboot_event_writer(
-                        source="admin-panel",
-                        username=admin_user,
-                        org_code=admin_org,
-                        note="Admin Panel reboot button.",
-                    )
-                except Exception:
-                    pass
-            st.success("Reboot isteği alındı. Uygulama yeniden başlatılıyor...")
-            _soft_memory_cleanup()
-            _silent_restart(reason="admin-panel-button")
 
-        reboot_event_reader = globals().get("_get_reboot_events")
-        reboot_events = []
-        if callable(reboot_event_reader):
-            try:
-                reboot_events = reboot_event_reader(limit=50) or []
-            except Exception:
-                reboot_events = []
-        st.markdown("### 🗒️ Reboot Notları")
-        if reboot_events:
-            rows = []
-            for item in reboot_events:
-                if not isinstance(item, dict):
-                    continue
-                rows.append({
-                    "Tarih/Saat": item.get("timestamp") or "-",
-                    "Kaynak": item.get("source") or "-",
-                    "Kullanıcı": item.get("username") or "-",
-                    "Org": item.get("org_code") or "-",
-                    "Not": item.get("note") or "-",
-                })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), width='stretch')
-            else:
-                st.info("Henüz reboot kaydı yok.")
-        else:
-            st.info("Henüz reboot kaydı yok.")
-
-        st.divider()
         st.subheader("Sistem Durumu")
         proc = psutil.Process(os.getpid())
         try:
@@ -475,6 +417,35 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
         c1.metric("RSS Bellek (MB)", f"{rss_mb:.1f}")
         c2.metric("CPU %", f"{cpu_pct:.1f}")
         c3.metric("Thread", thread_count)
+
+        # --- Manual Reboot ---
+        st.divider()
+        st.subheader(get_text(lang, "admin_reboot_title"))
+        st.caption(get_text(lang, "admin_reboot_caption"))
+        reboot_confirm = st.checkbox(
+            get_text(lang, "admin_reboot_confirm"),
+            value=False,
+            key="admin_reboot_confirm_cb",
+        )
+        if st.button(
+            "🔄 " + get_text(lang, "admin_reboot_button"),
+            key="admin_reboot_btn",
+            disabled=not reboot_confirm,
+            type="primary" if reboot_confirm else "secondary",
+        ):
+            _audit_user_action(
+                action="admin_manual_reboot",
+                detail="Admin panelden manuel uygulama yeniden başlatması tetiklendi.",
+                status="warning",
+            )
+            st.warning(get_text(lang, "admin_reboot_triggered"))
+            import time as _t
+            _t.sleep(0.5)
+            _restart_fn = globals().get("_silent_restart")
+            if callable(_restart_fn):
+                _restart_fn()
+            else:
+                st.error(get_text(lang, "admin_reboot_unavailable"))
 
         st.divider()
         st.subheader("Disk Bakımı")

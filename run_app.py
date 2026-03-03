@@ -455,13 +455,9 @@ if __name__ == "__main__":
             return "0.0.0.0"
         return "localhost"
 
-    # Launch Streamlit in a loop for auto-restart
+    # Launch Streamlit
     print("[START] Starting Genesys Reporting App...")
     
-    restart_count = 0
-    last_restart = time.time()
-    restart_exit_code = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
-    restart_exit_codes = {1, restart_exit_code}
     final_exit_code = 0
 
     def run_streamlit():
@@ -479,53 +475,37 @@ if __name__ == "__main__":
         proc = subprocess.Popen(argv)
         return proc.wait()
 
-    while True:
-        try:
-            # Force Kill: Ensure 8501 is free before starting
-            kill_proc_on_port(8501)
-            if _is_port_busy(8501):
-                msg = "Port 8501 is in use by a non-app process. Refusing to terminate unrelated process."
-                print(f"[ERROR] {msg}")
-                if not force_port_cleanup:
-                    print("Set GENESYS_FORCE_PORT_CLEANUP=1 only if you want to force-terminate any process on this port.")
-                log(msg)
-                final_exit_code = 1
-                break
-            
+    RESTART_EXIT_CODE = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
+
+    try:
+        # Force Kill: Ensure 8501 is free before starting
+        kill_proc_on_port(8501)
+        if _is_port_busy(8501):
+            msg = "Port 8501 is in use by a non-app process. Refusing to terminate unrelated process."
+            print(f"[ERROR] {msg}")
+            if not force_port_cleanup:
+                print("Set GENESYS_FORCE_PORT_CLEANUP=1 only if you want to force-terminate any process on this port.")
+            log(msg)
+            final_exit_code = 1
+        else:
             log(f"Starting streamlit: {app_path}")
-            exit_code = run_streamlit()
-            
-            if exit_code == 0:
-                print("[STOP] Application stopped gracefully (Exit Code 0).")
-                log("Exit code 0. Wrapper stopping.")
-                final_exit_code = 0
+            while True:
+                final_exit_code = run_streamlit()
+                if final_exit_code == RESTART_EXIT_CODE:
+                    print(f"[REBOOT] Application requested restart (exit code {RESTART_EXIT_CODE}). Restarting...")
+                    log(f"Restart requested (exit code {RESTART_EXIT_CODE}). Relaunching...")
+                    kill_proc_on_port(8501)
+                    time.sleep(1)
+                    continue
+                print(f"[STOP] Application stopped (Exit Code {final_exit_code}).")
+                log(f"Exit code {final_exit_code}. Wrapper stopping.")
                 break
-
-            restart_count += 1
-            now = time.time()
-            if now - last_restart > 60:
-                restart_count = 1
-            last_restart = now
-            log(f"Exit code {exit_code}. Restart count: {restart_count}")
-            if restart_count >= 8:
-                print("[ERROR] Too many restarts. Exiting.")
-                log("Too many restarts. Exiting.")
-                final_exit_code = exit_code if exit_code not in restart_exit_codes else 1
-                break
-
-            if exit_code in restart_exit_codes:
-                print(f"[RESTART] Restart requested (Exit Code {exit_code}). Restarting in 2 seconds...")
-                time.sleep(2)
-            else:
-                print(f"[WARN] Unexpected exit code {exit_code}. Restarting in 5 seconds...")
-                time.sleep(5)
-        except KeyboardInterrupt:
-            print("\n[INFO] Manual interruption. Exiting...")
-            final_exit_code = 130
-            break
-        except Exception as e:
-            print(f"[ERROR] Fatal Error in wrapper: {e}")
-            log(f"Fatal Error in wrapper: {e}")
-            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\n[INFO] Manual interruption. Exiting...")
+        final_exit_code = 130
+    except Exception as e:
+        print(f"[ERROR] Fatal Error in wrapper: {e}")
+        log(f"Fatal Error in wrapper: {e}")
+        final_exit_code = 1
             
     sys.exit(final_exit_code)

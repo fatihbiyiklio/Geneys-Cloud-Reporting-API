@@ -6,7 +6,6 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     STREAMLIT_SERVER_USAGE_STATS=false \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    GENESYS_DEBUG_REMEMBER_ME=0 \
     GENESYS_ENABLE_DASHBOARD_PROFILING=0 \
     GENESYS_MEMORY_LIMIT_MB=800 \
     GENESYS_MEMORY_HARD_LIMIT_MB=1024 \
@@ -49,5 +48,5 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl --fail http://localhost:8501/_stcore/health || exit 1
 
-# Run with Python wrapper (auto-restart)
+# Run with Python wrapper
 ENTRYPOINT ["python", "/app/run_app.py"]

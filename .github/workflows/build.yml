@@ -137,7 +137,6 @@ jobs:
           pyinstaller --clean --noconfirm --onefile --name "GenesysReporting-linux" \
             --collect-all streamlit \
             --collect-all streamlit_autorefresh \
-            --collect-all streamlit_cookies_manager \
             --collect-all cryptography \
             --collect-all pyarrow \
             --collect-all reportlab \
@@ -234,7 +233,6 @@ jobs:
           pyinstaller --clean --noconfirm --onedir --noconsole --name "GenesysReporting" `
             --collect-all streamlit `
             --collect-all streamlit_autorefresh `
-            --collect-all streamlit_cookies_manager `
             --collect-all cryptography `
             --collect-all pyarrow `
             --collect-all reportlab `

@@ -23,58 +23,6 @@ import re
 import html
 import builtins
 
-# Suppress st.cache deprecation warning from streamlit_cookies_manager
-warnings.filterwarnings("ignore", message=r".*st\.cache.*deprecated.*")
-
-class _SuppressStCacheDeprecationFilter(logging.Filter):
-    def filter(self, record):
-        msg = str(record.getMessage())
-        return "`st.cache` is deprecated" not in msg
-
-for _logger_name in (
-    "streamlit",
-    "streamlit.runtime",
-    "streamlit.runtime.caching",
-    "streamlit.deprecation_util",
-):
-    logging.getLogger(_logger_name).addFilter(_SuppressStCacheDeprecationFilter())
-
-try:
-    import streamlit.deprecation_util as _st_deprecation_util
-    _orig_show_deprecation_warning = _st_deprecation_util.show_deprecation_warning
-
-    def _patched_show_deprecation_warning(message, show_in_browser=True, show_once=False):
-        # streamlit_cookies_manager still imports @st.cache; skip only this known warning.
-        if "`st.cache` is deprecated" in str(message):
-            return
-        return _orig_show_deprecation_warning(
-            message, show_in_browser=show_in_browser, show_once=show_once
-        )
-
-    _st_deprecation_util.show_deprecation_warning = _patched_show_deprecation_warning
-except Exception:
-    pass
-
-from streamlit.runtime import Runtime
-import base64
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-def _patched_key_from_parameters(salt: bytes, iterations: int, password: str):
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=iterations,
-    )
-    return base64.urlsafe_b64encode(kdf.derive(password.encode('utf-8')))
-
-try:
-    import streamlit_cookies_manager.encrypted_cookie_manager as ecm
-    ecm.key_from_parameters = _patched_key_from_parameters
-except Exception:
-    pass
-
 def _load_fernet_class():
     """Reuse Fernet across Streamlit reruns to avoid reinitializing PyO3 modules."""
     cached = getattr(builtins, "_GENESYS_FERNET_CLASS", None)
@@ -95,12 +43,13 @@ auth_manager = AuthManager()
 # --- BACKGROUND MONITOR ---
 # Disabled: do not auto-exit when sessions drop to zero.
 
+# --- RESTART ---
+RESTART_EXIT_CODE = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
+
 # --- LOGGING ---
 MEMORY_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_LIMIT_MB", "512"))  # Soft limit - trigger cleanup
 MEMORY_CLEANUP_COOLDOWN_SEC = int(os.environ.get("GENESYS_MEMORY_CLEANUP_COOLDOWN_SEC", "60"))  # Reduced from 120
-MEMORY_HARD_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_HARD_LIMIT_MB", "768"))  # Hard limit - trigger restart
-RESTART_EXIT_CODE = int(os.environ.get("GENESYS_RESTART_EXIT_CODE", "42"))
-REBOOT_HISTORY_MAX_ENTRIES = int(os.environ.get("GENESYS_REBOOT_HISTORY_MAX_ENTRIES", "200"))
+MEMORY_HARD_LIMIT_MB = int(os.environ.get("GENESYS_MEMORY_HARD_LIMIT_MB", "768"))  # Hard limit for logging
 TEMP_CLEANUP_INTERVAL_SEC = int(os.environ.get("GENESYS_TEMP_CLEANUP_INTERVAL_SEC", "900"))
 TEMP_FILE_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MAX_AGE_HOURS", "6"))
 TEMP_FILE_MANUAL_MAX_AGE_HOURS = float(os.environ.get("GENESYS_TEMP_FILE_MANUAL_MAX_AGE_HOURS", "0"))
@@ -110,35 +59,6 @@ USER_ACTION_LOG_RETENTION_DAYS = int(os.environ.get("GENESYS_USER_ACTION_LOG_RET
 USER_ACTION_LOG_MAX_ENTRIES = int(os.environ.get("GENESYS_USER_ACTION_LOG_MAX_ENTRIES", "100000"))
 USER_ACTION_LOG_PRUNE_INTERVAL_SECONDS = int(os.environ.get("GENESYS_USER_ACTION_LOG_PRUNE_INTERVAL_SECONDS", "900"))
 
-
-def _resolve_periodic_reboot_interval_seconds():
-    raw_seconds = str(os.environ.get("GENESYS_PERIODIC_REBOOT_INTERVAL_SECONDS", "") or "").strip()
-    if raw_seconds:
-        try:
-            return max(0, int(float(raw_seconds)))
-        except Exception:
-            pass
-    raw_hours = str(os.environ.get("GENESYS_PERIODIC_REBOOT_HOURS", "12") or "").strip()
-    try:
-        hours = float(raw_hours)
-    except Exception:
-        hours = 12.0
-    if hours <= 0:
-        return 0
-    return max(0, int(hours * 3600))
-
-
-def _resolve_periodic_reboot_check_seconds():
-    raw = str(os.environ.get("GENESYS_PERIODIC_REBOOT_CHECK_SECONDS", "15") or "").strip()
-    try:
-        value = int(float(raw))
-    except Exception:
-        value = 15
-    return max(5, min(60, value))
-
-
-PERIODIC_REBOOT_INTERVAL_SECONDS = _resolve_periodic_reboot_interval_seconds()
-PERIODIC_REBOOT_CHECK_SECONDS = _resolve_periodic_reboot_check_seconds()
 
 def _setup_logging():
     logger = logging.getLogger("genesys_app")
@@ -173,7 +93,6 @@ def _is_expected_system_exit(exc_type, exc_value):
     except Exception:
         return False
     code = getattr(exc_value, "code", None)
-    # sys.exit(1) is used intentionally for app reboot flow.
     return code in (None, 0, 1)
 
 def _sys_excepthook(exc_type, exc_value, exc_tb):
@@ -257,7 +176,6 @@ from src.app.utils import (
 # --- CONFIGURATION ---
 
 SESSION_TTL_SECONDS = 120
-DEBUG_REMEMBER_ME = os.environ.get("GENESYS_DEBUG_REMEMBER_ME", "0").strip().lower() in ("1", "true", "yes", "on")
 ENABLE_DASHBOARD_PROFILING = os.environ.get("GENESYS_ENABLE_DASHBOARD_PROFILING", "0").strip().lower() in ("1", "true", "yes", "on")
 ORG_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{2,49}$")
 LOGIN_WINDOW_SECONDS = int(os.environ.get("GENESYS_LOGIN_WINDOW_SECONDS", "900"))
@@ -266,10 +184,6 @@ LOGIN_MAX_FAILURES = int(os.environ.get("GENESYS_LOGIN_MAX_FAILURES", "5"))
 LOGIN_ATTEMPT_MAX_ENTRIES = int(os.environ.get("GENESYS_LOGIN_ATTEMPT_MAX_ENTRIES", "5000"))
 
 DATA_MANAGER_IMPL_VERSION = 2
-
-def _rm_debug(msg, *args):
-    if DEBUG_REMEMBER_ME:
-        logger.info("[remember-me] " + msg, *args)
 
 def _iter_conversation_pages(
     api,
@@ -807,22 +721,6 @@ except Exception:
 
 # --- GLOBAL HELPERS (DEFINED FIRST) ---
 
-APP_SESSION_COOKIE = "app_session"
-APP_SESSION_TTL = 7 * 24 * 3600
-_legacy_app_session_cleaned = False
-
-def _cleanup_legacy_app_session_file():
-    global _legacy_app_session_cleaned
-    if _legacy_app_session_cleaned:
-        return
-    try:
-        legacy_path = ".session.enc"
-        if os.path.exists(legacy_path):
-            os.remove(legacy_path)
-    except Exception:
-        pass
-    _legacy_app_session_cleaned = True
-
 def _get_secret_key_path():
     base_dir = os.environ.get("GENESYS_STATE_DIR") or ORG_BASE_DIR
     try:
@@ -862,31 +760,85 @@ def _get_or_create_key():
 def _get_cipher():
     return Fernet(_get_or_create_key())
 
-_cookie_manager = None
+# --- APP SESSION MANAGEMENT (REMEMBER ME - DISK) ---
+APP_SESSION_TTL = 7 * 24 * 3600  # 7 days
 
-def _get_cookie_manager():
-    """Get or create the cookie manager. Returns None if not ready yet."""
-    global _cookie_manager
-    if not Runtime.exists():
-        return None
-    if _cookie_manager is None:
-        key = _get_or_create_key()
-        try:
-            key_str = key.decode("utf-8")
-        except Exception:
-            key_str = str(key)
-        try:
-            from streamlit_cookies_manager import EncryptedCookieManager
-            _cookie_manager = EncryptedCookieManager(prefix="genesys", password=key_str)
-        except Exception as e:
-            _rm_debug("cookie manager creation failed: %s", e)
-            return None
+def _session_file_path():
+    """Return the path to the encrypted session file."""
+    base_dir = os.environ.get("GENESYS_STATE_DIR") or ORG_BASE_DIR
     try:
-        if not _cookie_manager.ready():
+        os.makedirs(base_dir, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(base_dir, ".session.enc")
+
+def load_app_session():
+    """Load saved session from encrypted disk file. Returns user data dict or None."""
+    path = _session_file_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        cipher = _get_cipher()
+        with open(path, "rb") as f:
+            data = cipher.decrypt(f.read()).decode("utf-8")
+        session = json.loads(data)
+        timestamp = session.get("timestamp", 0)
+        if pytime.time() - timestamp > APP_SESSION_TTL:
+            delete_app_session()
             return None
+        return session
+    except Exception:
+        # Corrupted or invalid file – remove silently
+        delete_app_session()
+        return None
+
+def save_app_session(user_data):
+    """Save user session to encrypted disk file."""
+    path = _session_file_path()
+    try:
+        cipher = _get_cipher()
+        payload = {**user_data, "timestamp": pytime.time()}
+        encrypted = cipher.encrypt(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+        with open(path, "wb") as f:
+            f.write(encrypted)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+def delete_app_session():
+    """Delete session file from disk."""
+    path = _session_file_path()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+def _hydrate_app_user_from_saved_session(session_data):
+    """Validate saved session against current users DB and return hydrated user dict."""
+    try:
+        username = (session_data or {}).get("username")
+        org_code = _safe_org_code((session_data or {}).get("org_code", "default"))
+        if not username:
+            return None
+        org_users = auth_manager.get_all_users(org_code) or {}
+        db_user = org_users.get(username)
+        if not db_user:
+            return None
+        return {
+            "username": username,
+            "org_code": org_code,
+            "role": db_user.get("role", session_data.get("role", "Reports User")),
+            "metrics": db_user.get("metrics", session_data.get("metrics", [])),
+            "must_change_password": bool(db_user.get("must_change_password")),
+        }
     except Exception:
         return None
-    return _cookie_manager
+
 
 def load_credentials(org_code):
     org_path = _org_dir(org_code)
@@ -934,114 +886,6 @@ def generate_password(length=12):
     import string
     alphabet = string.ascii_letters + string.digits + "!@#$%"
     return ''.join(secrets.choice(alphabet) for _ in range(length))
-
-# --- APP SESSION MANAGEMENT (REMEMBER ME) ---
-def load_app_session():
-    """Load saved session from cookie. Returns user data dict or None."""
-    try:
-        _cleanup_legacy_app_session_file()
-        cookies = _get_cookie_manager()
-        if cookies is None:
-            return None
-        raw = cookies.get(APP_SESSION_COOKIE)
-        if not raw:
-            return None
-        try:
-            data = json.loads(raw)
-        except Exception:
-            _rm_debug("load session: invalid cookie, deleting")
-            delete_app_session()
-            return None
-        timestamp = data.get("timestamp", 0)
-        if pytime.time() - timestamp > APP_SESSION_TTL:
-            _rm_debug("load session: cookie expired")
-            delete_app_session()
-            return None
-        _rm_debug("load session: valid for user=%s org=%s", data.get("username"), data.get("org_code"))
-        return data
-    except Exception as e:
-        _rm_debug("load session failed: %s", e)
-        return None
-
-def _hydrate_app_user_from_saved_session(session_data):
-    try:
-        username = (session_data or {}).get("username")
-        org_code = _safe_org_code((session_data or {}).get("org_code", "default"))
-        if not username:
-            _rm_debug("hydrate failed: missing username in saved session")
-            return None
-        org_users = auth_manager.get_all_users(org_code) or {}
-        db_user = org_users.get(username)
-        if not db_user:
-            _rm_debug("hydrate failed: user not found in users file user=%s org=%s", username, org_code)
-            return None
-        hydrated = {
-            "username": username,
-            "org_code": org_code,
-            "role": db_user.get("role", session_data.get("role", "Reports User")),
-            "metrics": db_user.get("metrics", session_data.get("metrics", [])),
-            "must_change_password": bool(db_user.get("must_change_password")),
-        }
-        _rm_debug("hydrate success for user=%s org=%s", username, org_code)
-        return hydrated
-    except Exception as e:
-        _rm_debug("hydrate failed: %s", e)
-        return None
-
-def save_app_session(user_data):
-    """Save user session to cookie. Returns True on success."""
-    try:
-        _cleanup_legacy_app_session_file()
-        cookies = _get_cookie_manager()
-        if cookies is None:
-            _rm_debug("save session failed: cookie manager not ready for user=%s", user_data.get("username"))
-            return False
-        payload = {**user_data, "timestamp": pytime.time()}
-        cookies[APP_SESSION_COOKIE] = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-        cookies.save()
-        _rm_debug("save session success for user=%s org=%s", user_data.get("username"), user_data.get("org_code"))
-        return True
-    except Exception as e:
-        _rm_debug("save session failed: %s", e)
-        return False
-
-def delete_app_session():
-    """Delete session cookie."""
-    _cleanup_legacy_app_session_file()
-    try:
-        cookies = _get_cookie_manager()
-        if cookies is not None:
-            try:
-                if APP_SESSION_COOKIE in cookies:
-                    del cookies[APP_SESSION_COOKIE]
-            except Exception:
-                pass
-            cookies[APP_SESSION_COOKIE] = ""
-            cookies.save()
-            _rm_debug("delete session: cookie cleared")
-    except Exception as e:
-        _rm_debug("delete session failed: %s", e)
-
-def _try_flush_pending_remember_me():
-    """Try to save a pending remember-me payload (one attempt per rerun)."""
-    payload = st.session_state.get("_pending_remember_save")
-    if not payload:
-        return
-    if save_app_session(payload):
-        st.session_state.pop("_pending_remember_save", None)
-        _rm_debug("pending remember-me flushed for user=%s", payload.get("username"))
-    else:
-        _rm_debug("pending remember-me still waiting for cookie manager")
-
-def _try_flush_pending_remember_me_delete():
-    """Try to delete cookie if a pending delete is queued."""
-    if not st.session_state.get("_pending_remember_delete"):
-        return
-    cookies = _get_cookie_manager()
-    if cookies is not None:
-        delete_app_session()
-        st.session_state["_pending_remember_delete"] = False
-        _rm_debug("pending remember-me delete flushed")
 
 
 @st.cache_resource(show_spinner=False)
@@ -1440,24 +1284,7 @@ def _shared_memory_store():
         "stop_event": threading.Event(),
         "last_cleanup_ts": 0,
         "last_temp_cleanup_ts": 0,
-        "restart_in_progress": False,
     }
-
-@st.cache_resource(show_spinner=False)
-def _shared_periodic_reboot_store():
-    return {
-        "lock": threading.Lock(),
-        "thread": None,
-        "stop_event": threading.Event(),
-        "interval_seconds": 0,
-        "started_at_ts": 0.0,
-        "next_reboot_ts": 0.0,
-        "restart_in_progress": False,
-    }
-
-@st.cache_resource(show_spinner=False)
-def _shared_reboot_event_store():
-    return {"lock": threading.Lock()}
 
 
 @st.cache_resource(show_spinner=False)
@@ -1768,145 +1595,6 @@ except Exception:
     pass
 
 
-def _reboot_events_file_path():
-    try:
-        monitor_dir = os.path.join(ORG_BASE_DIR, "_monitor")
-        os.makedirs(monitor_dir, exist_ok=True)
-        return os.path.join(monitor_dir, "reboot_events.json")
-    except Exception:
-        return None
-
-
-def _read_reboot_events():
-    path = _reboot_events_file_path()
-    if not path or (not os.path.exists(path)):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        if not isinstance(payload, list):
-            return []
-        out = []
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            out.append({
-                "timestamp": str(item.get("timestamp") or "").strip(),
-                "source": str(item.get("source") or "-").strip() or "-",
-                "username": str(item.get("username") or "-").strip() or "-",
-                "org_code": str(item.get("org_code") or "-").strip() or "-",
-                "note": str(item.get("note") or "").strip(),
-            })
-        return out
-    except Exception:
-        return []
-
-
-def _write_reboot_events(events):
-    path = _reboot_events_file_path()
-    if not path:
-        return False
-    tmp_path = f"{path}.tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(events or [], f, ensure_ascii=False)
-        os.replace(tmp_path, path)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        return False
-
-
-def _append_reboot_event(source, username=None, org_code=None, note=None):
-    event = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": str(source or "-").strip() or "-",
-        "username": str(username or "-").strip() or "-",
-        "org_code": str(org_code or "-").strip() or "-",
-        "note": str(note or "").strip(),
-    }
-    store = _shared_reboot_event_store()
-    with store["lock"]:
-        events = _read_reboot_events()
-        events.append(event)
-        max_entries = max(20, int(REBOOT_HISTORY_MAX_ENTRIES or 200))
-        if len(events) > max_entries:
-            events = events[-max_entries:]
-        _write_reboot_events(events)
-    return event
-
-
-def _get_reboot_events(limit=50):
-    store = _shared_reboot_event_store()
-    with store["lock"]:
-        events = _read_reboot_events()
-    if limit is None:
-        return list(reversed(events))
-    try:
-        lim = max(1, int(limit))
-    except Exception:
-        lim = 50
-    return list(reversed(events[-lim:]))
-
-
-def _parse_reboot_event_timestamp(raw_value):
-    raw = str(raw_value or "").strip()
-    if not raw:
-        return None
-    try:
-        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        pass
-    try:
-        return datetime.fromisoformat(raw)
-    except Exception:
-        return None
-
-
-def _is_recent_reboot_link_event(username, org_code, max_age_seconds=30):
-    now = datetime.now()
-    target_user = str(username or "unknown")
-    target_org = str(org_code or "default")
-    for event in reversed(_read_reboot_events()):
-        source = str(event.get("source") or "").strip().lower()
-        if source not in {"url-path", "url-query"}:
-            continue
-        if str(event.get("username") or "unknown") != target_user:
-            continue
-        if str(event.get("org_code") or "default") != target_org:
-            continue
-        ts = _parse_reboot_event_timestamp(event.get("timestamp"))
-        if ts is None:
-            continue
-        age_seconds = (now - ts).total_seconds()
-        return 0 <= age_seconds <= max_age_seconds
-    return False
-
-
-def _silent_restart(reason=None):
-    """Perform a silent restart of the Streamlit app via wrapper exit code."""
-    reason_text = str(reason or "manual").strip() or "manual"
-    logger.warning("Silent restart initiated (reason=%s)", reason_text)
-    
-    # Full cleanup before restart
-    _soft_memory_cleanup()
-    
-    try:
-        import gc
-        gc.collect()
-        gc.collect()  # Double collect for thorough cleanup
-    except Exception:
-        pass
-    
-    # Forcefully terminate process so wrapper can start a fresh Python process.
-    # Use a dedicated non-zero code for intentional restart requests.
-    os._exit(RESTART_EXIT_CODE)
-
-
 def _get_query_params_dict():
     """Read query params in a Streamlit-version-compatible way."""
     out = {}
@@ -2009,108 +1697,6 @@ def _inject_query_param_cleanup_script(keys_to_remove):
         pass
 
 
-def _clear_reboot_query_flags():
-    params = _get_query_params_dict()
-    if not params:
-        return False
-    keys_to_remove = (
-        "rebootme",
-        "reboot",
-        "reboot_from_path",
-        "reboot_token",
-        "token",
-    )
-    changed = False
-    remaining = {}
-    for key, value in params.items():
-        if key in keys_to_remove:
-            changed = True
-            continue
-        remaining[key] = value
-    if changed:
-        _set_query_params_dict(remaining)
-        _inject_query_param_cleanup_script(keys_to_remove)
-    return changed
-
-
-def _inject_reboot_path_bridge_script():
-    """Convert /rebootme path requests to ?rebootme=1 query format."""
-    try:
-        import streamlit.components.v1 as components
-        components.html(
-            """
-            <script>
-            (function() {
-                try {
-                    const path = String(window.location.pathname || "");
-                    const match = path.match(/^(.*)\\/rebootme\\/?$/i);
-                    if (!match) return;
-                    const base = (match[1] && match[1].length > 0) ? match[1] : "/";
-                    const url = new URL(window.location.href);
-                    url.pathname = base.endsWith("/") ? base : (base + "/");
-                    url.searchParams.set("rebootme", "1");
-                    url.searchParams.set("reboot_from_path", "1");
-                    if (window.location.href !== url.toString()) {
-                        window.location.replace(url.toString());
-                    }
-                } catch (e) {}
-            })();
-            </script>
-            """,
-            height=0,
-            width=0,
-        )
-    except Exception:
-        pass
-
-
-def _maybe_handle_reboot_link_request():
-    """
-    Allow reboot via URL:
-    - /rebootme (bridged to query by JS)
-    - ?rebootme=1 or ?reboot=true
-    """
-    params = _get_query_params_dict()
-    if not params:
-        return False
-
-    reboot_requested = _is_truthy_query_value(params.get("rebootme")) or _is_truthy_query_value(params.get("reboot"))
-    if not reboot_requested:
-        return False
-
-    user = st.session_state.get("app_user") or {}
-    username = str(user.get("username") or "unknown")
-    org_code = str(user.get("org_code") or "default")
-    from_path = _is_truthy_query_value(params.get("reboot_from_path"))
-
-    if _is_recent_reboot_link_event(username, org_code, max_age_seconds=30):
-        logger.warning("[REBOOT LINK] duplicate suppressed user=%s org=%s", username, org_code)
-        _clear_reboot_query_flags()
-        st.info("Reboot link zaten işlendi; URL parametresi temizlendi.")
-        return False
-
-    logger.warning(
-        "[REBOOT LINK] requested by user=%s org=%s source=%s",
-        username,
-        org_code,
-        "path" if from_path else "query",
-    )
-    _append_reboot_event(
-        source="url-path" if from_path else "url-query",
-        username=username,
-        org_code=org_code,
-        note="Reboot link triggered from browser URL.",
-    )
-    _clear_reboot_query_flags()
-    st.success("Reboot link tetiklendi. Uygulama yeniden başlatılıyor...")
-    try:
-        pytime.sleep(0.6)
-    except Exception:
-        pass
-    _soft_memory_cleanup()
-    _silent_restart(reason="reboot-link")
-    return True
-
 def _soft_memory_cleanup():
     """Best-effort cleanup to reduce memory without visible user impact."""
     import gc
@@ -2191,6 +1777,33 @@ def _soft_memory_cleanup():
         gc.collect()
     except Exception:
         pass
+
+
+def _silent_restart():
+    """Flush caches and terminate the process with RESTART_EXIT_CODE.
+
+    The outer launcher (run_app.py / start.sh) is expected to re-launch
+    the application when it sees exit code ``RESTART_EXIT_CODE``.
+    """
+    import gc
+    try:
+        _soft_memory_cleanup()
+    except Exception:
+        pass
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    try:
+        gc.collect()
+        gc.collect()
+    except Exception:
+        pass
+    os._exit(RESTART_EXIT_CODE)
 
 
 def _periodic_memory_cleanup():
@@ -2374,22 +1987,9 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
                         pass
                     full_cleanup_counter = 0
                 
-                # Check if memory exceeds hard limit - trigger silent restart
+                # Log warning if memory exceeds hard limit
                 if rss_mb >= MEMORY_HARD_LIMIT_MB:
-                    restart_in_progress = False
-                    with store["lock"]:
-                        restart_in_progress = store.get("restart_in_progress", False)
-                        if not restart_in_progress:
-                            store["restart_in_progress"] = True
-                    if not restart_in_progress:
-                        logger.warning(f"RSS memory {rss_mb:.1f}MB exceeds hard limit {MEMORY_HARD_LIMIT_MB}MB, triggering silent restart")
-                        _append_reboot_event(
-                            source="auto-memory",
-                            username="system",
-                            org_code="system",
-                            note=f"RSS {rss_mb:.1f}MB >= hard limit {MEMORY_HARD_LIMIT_MB}MB",
-                        )
-                        _silent_restart(reason="memory-hard-limit")
+                    logger.warning(f"RSS memory {rss_mb:.1f}MB exceeds hard limit {MEMORY_HARD_LIMIT_MB}MB")
                 
                 # Soft cleanup at lower threshold
                 if rss_mb >= MEMORY_LIMIT_MB and (pytime.time() - last_cleanup) > MEMORY_CLEANUP_COOLDOWN_SEC:
@@ -2404,79 +2004,6 @@ def _start_memory_monitor(sample_interval=10, max_samples=720):
         t = threading.Thread(target=run, daemon=True)
         store["thread"] = t
         t.start()
-    return store
-
-
-def _start_periodic_reboot_scheduler():
-    """Start a single background scheduler that triggers silent reboot periodically."""
-    interval_s = max(0, int(PERIODIC_REBOOT_INTERVAL_SECONDS or 0))
-    if interval_s <= 0:
-        return None
-
-    store = _shared_periodic_reboot_store()
-    with store["lock"]:
-        existing = store.get("thread")
-        if existing and existing.is_alive():
-            # Keep runtime-configurable interval in sync if env changed.
-            old_interval = int(store.get("interval_seconds") or 0)
-            if old_interval != interval_s:
-                store["interval_seconds"] = interval_s
-                store["next_reboot_ts"] = pytime.time() + interval_s
-            return store
-
-        store["stop_event"].clear()
-        now_ts = pytime.time()
-        store["interval_seconds"] = interval_s
-        store["started_at_ts"] = now_ts
-        store["next_reboot_ts"] = now_ts + interval_s
-        store["restart_in_progress"] = False
-
-        def run():
-            check_s = max(5, int(PERIODIC_REBOOT_CHECK_SECONDS or 15))
-            while not store["stop_event"].is_set():
-                now_inner = pytime.time()
-                with store["lock"]:
-                    next_ts = float(store.get("next_reboot_ts", 0) or 0)
-                    current_interval = max(1, int(store.get("interval_seconds") or interval_s))
-                    in_progress = bool(store.get("restart_in_progress"))
-
-                if (not in_progress) and next_ts and now_inner >= next_ts:
-                    acquired = False
-                    with store["lock"]:
-                        if not store.get("restart_in_progress"):
-                            store["restart_in_progress"] = True
-                            acquired = True
-
-                    if acquired:
-                        interval_hours = current_interval / 3600.0
-                        logger.warning(
-                            "Periodic reboot interval reached (%.2fh / %ss). Triggering restart.",
-                            interval_hours,
-                            current_interval,
-                        )
-                        try:
-                            _append_reboot_event(
-                                source="auto-periodic",
-                                username="system",
-                                org_code="system",
-                                note=f"Periodic reboot triggered after {interval_hours:.2f}h interval.",
-                            )
-                        except Exception:
-                            pass
-                        _silent_restart(reason="auto-periodic")
-                        # Safety fallback if process did not exit for any reason.
-                        with store["lock"]:
-                            store["next_reboot_ts"] = pytime.time() + current_interval
-                            store["restart_in_progress"] = False
-
-                for _ in range(max(1, check_s * 5)):
-                    if store["stop_event"].is_set():
-                        break
-                    pytime.sleep(0.2)
-
-        thread = threading.Thread(target=run, daemon=True, name="periodic-reboot-scheduler")
-        store["thread"] = thread
-        thread.start()
     return store
 
 
@@ -3289,9 +2816,6 @@ def init_session_state():
     if 'logged_in' not in st.session_state: st.session_state.logged_in = False
     if 'last_console_log_count' not in st.session_state: st.session_state.last_console_log_count = 0 # Track logged errors
     if 'remember_me_enabled' not in st.session_state: st.session_state.remember_me_enabled = False
-    if '_pending_remember_save' not in st.session_state: st.session_state._pending_remember_save = None
-    if '_pending_remember_delete' not in st.session_state: st.session_state._pending_remember_delete = False
-    if '_cookie_checked' not in st.session_state: st.session_state._cookie_checked = False
     if 'rep_auto_row_limit' not in st.session_state: st.session_state.rep_auto_row_limit = 50000
 
 def log_to_console(message, level='error'):
@@ -3308,11 +2832,7 @@ def log_to_console(message, level='error'):
     st.markdown(js_code, unsafe_allow_html=True)
 
 init_session_state()
-_inject_reboot_path_bridge_script()
-_start_periodic_reboot_scheduler()
 _maybe_periodic_temp_cleanup()
-_try_flush_pending_remember_me()
-_try_flush_pending_remember_me_delete()
 
 # Ensure shared DataManager is available after login
 if st.session_state.app_user and 'data_manager' not in st.session_state:
@@ -3396,37 +2916,14 @@ if not st.session_state.app_user:
                             st.error(msg)
         st.stop()
 
-    # Try auto-login from remember-me cookie
-    cm = _get_cookie_manager()  # Trigger cookie component render
-    if cm is None and not st.session_state.get("_cookie_checked"):
-        # Cookie manager not ready yet (first render) - show loading instead of login
-        st.markdown(
-            """
-            <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;">
-                <div style="border:4px solid #f3f3f3;border-top:4px solid #3498db;border-radius:50%;width:48px;height:48px;animation:spin 0.8s linear infinite;"></div>
-                <p style="margin-top:18px;color:#888;font-size:1.1em;">Oturum kontrol ediliyor...</p>
-            </div>
-            <style>@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.session_state._cookie_checked = True
-        st.stop()
-    st.session_state._cookie_checked = True
+    # Try auto-login from saved session file
     saved_session = load_app_session()
     if saved_session:
         hydrated_user = _hydrate_app_user_from_saved_session(saved_session)
-        if not hydrated_user:
-            _rm_debug("auto-login rejected: saved session could not be hydrated, deleting cookie")
-            delete_app_session()
-        elif hydrated_user.get("must_change_password"):
-            _rm_debug("auto-login rejected: user must change password")
-            delete_app_session()
-        else:
-            _rm_debug("auto-login success from cookie for user=%s org=%s", hydrated_user.get("username"), hydrated_user.get("org_code"))
+        if hydrated_user and not hydrated_user.get("must_change_password"):
             _log_user_action(
-                action="app_auto_login_cookie",
-                detail="Auto login from remember-me cookie.",
+                action="app_auto_login_file",
+                detail="Auto login from saved session file.",
                 status="success",
                 source="auth",
                 username=hydrated_user.get("username"),
@@ -3438,7 +2935,9 @@ if not st.session_state.app_user:
             st.session_state.remember_me_enabled = True
             ensure_data_manager()
             st.rerun()
-    _rm_debug("auto-login did not find valid cookie session")
+        else:
+            # Session invalid or user must change password
+            delete_app_session()
 
     st.markdown("<h1 style='text-align: center;'>Genesys Reporting API</h1>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 2, 1])
@@ -3500,28 +2999,15 @@ if not st.session_state.app_user:
                         full_user = {"username": u_name_clean, **safe_user_data}
                         
                         # Handle Remember Me
-                        if remember_me and full_user.get("must_change_password"):
-                            _rm_debug(
-                                "remember-me skipped on login for user=%s org=%s due to must_change_password",
-                                u_name_clean,
-                                u_org_safe,
-                            )
-                            st.session_state.remember_me_enabled = False
-                            delete_app_session()
-                        elif remember_me:
-                            _rm_debug("login submit with remember-me checked for user=%s org=%s", u_name_clean, u_org_safe)
-                            remember_payload = {
+                        if remember_me and not full_user.get("must_change_password"):
+                            save_app_session({
                                 "username": u_name_clean,
                                 "org_code": full_user.get("org_code", u_org_safe),
-                            }
+                            })
                             st.session_state.remember_me_enabled = True
-                            if not save_app_session(remember_payload):
-                                st.session_state._pending_remember_save = remember_payload
-                                _rm_debug("remember-me queued for next rerun")
                         else:
-                            _rm_debug("login submit with remember-me OFF for user=%s org=%s", u_name_clean, u_org_safe)
-                            st.session_state.remember_me_enabled = False
                             delete_app_session()
+                            st.session_state.remember_me_enabled = False
 
                         _log_user_action(
                             action="app_login",
@@ -3634,9 +3120,6 @@ if st.session_state.get("app_user") and st.session_state.app_user.get("must_chan
                     st.error(msg)
     st.stop()
 
-# --- URL-TRIGGERED REBOOT (ADMIN ONLY) ---
-_maybe_handle_reboot_link_request()
-
 # --- AUTO-LOGIN GENESYS ---
 if st.session_state.app_user:
     org = st.session_state.app_user.get('org_code', 'default')
@@ -3689,10 +3172,8 @@ with st.sidebar:
             _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
         except Exception:
             pass
-        # Clear session cookie
+        # Clear saved session file
         delete_app_session()
-        st.session_state._pending_remember_delete = True
-        st.session_state._pending_remember_save = None
         st.session_state.remember_me_enabled = False
         # Clear all session state
         st.session_state.app_user = None
