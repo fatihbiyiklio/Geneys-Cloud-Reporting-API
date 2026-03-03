@@ -939,7 +939,7 @@ class GlobalConversationNotificationManager:
     """Notifications for org-wide conversations (calls/chats/messages/etc)."""
     ACTIVE_CALL_TTL_SECONDS = 3600  # Keep active conversations longer to avoid transient drops.
     CLEANUP_INTERVAL_SECONDS = 30  # Reduced from 45
-    MAX_ACTIVE_CONVERSATIONS = 300 # Reduced from 500
+    MAX_ACTIVE_CONVERSATIONS = 800 # Increased from 300 to support orgs with 300+ concurrent conversations
 
     def __init__(self):
         self.api = None

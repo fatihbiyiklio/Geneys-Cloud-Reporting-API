@@ -262,6 +262,10 @@ class DataManager:
             with self._lock:
                 self.obs_data_cache = {}
 
+        # Small delay between API calls to reduce rate limit pressure
+        if q_ids:
+            time.sleep(0.5)
+
         # 1.5 Routing activity - direct overwrite, no grace/fallback retention
         if q_ids:
             try:
@@ -314,6 +318,10 @@ class DataManager:
         else:
             with self._lock:
                 self.routing_activity_cache = {}
+
+        # Small delay before daily stats to spread API load
+        if q_ids:
+            time.sleep(0.5)
 
         # 2. Daily Stats
         # Keep daily metrics in sync with live refresh cadence (minimum 10s).

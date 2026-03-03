@@ -2058,7 +2058,7 @@ def _reserve_call_seed(org_code, now_ts, min_interval=10):
         org["call_seed_ts"] = now_ts
         return True
 
-def _update_call_seed(org_code, seed_calls, now_ts, max_items=300):
+def _update_call_seed(org_code, seed_calls, now_ts, max_items=800):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)
@@ -2079,7 +2079,7 @@ def _get_shared_call_meta(org_code, max_age_seconds=600):
             meta.pop(cid, None)
         return dict(meta)
 
-def _update_call_meta(org_code, calls, now_ts, max_items=300):
+def _update_call_meta(org_code, calls, now_ts, max_items=800):
     store = _shared_seed_store()
     with store["lock"]:
         org = _ensure_seed_org(store, org_code)

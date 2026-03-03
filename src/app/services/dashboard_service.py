@@ -1437,12 +1437,12 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                         end_dt = datetime.now(timezone.utc)
                         start_dt = end_dt - timedelta(hours=4)
 
-                        # Pull up to ~300 records while covering both newest and oldest active tails.
+                        # Pull up to ~500 records while covering both newest and oldest active tails.
                         convs_desc = api.get_conversation_details_recent(
-                            start_dt, end_dt, page_size=100, max_pages=2, order="desc"
+                            start_dt, end_dt, page_size=100, max_pages=3, order="desc"
                         )
                         convs_asc = api.get_conversation_details_recent(
-                            start_dt, end_dt, page_size=100, max_pages=1, order="asc"
+                            start_dt, end_dt, page_size=100, max_pages=2, order="asc"
                         )
                         convs_by_id = {}
                         for conv in (convs_desc or []) + (convs_asc or []):
@@ -1468,7 +1468,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             if not c.get("media_type"):
                                 c["media_type"] = _extract_media_type(c)
                         global_notif.seed_conversations(snapshot_calls)
-                        _update_call_seed(org, snapshot_calls, now_update, max_items=300)
+                        _update_call_seed(org, snapshot_calls, now_update, max_items=800)
                         st.session_state["_call_panel_reconcile_ts"] = now_update
                     except Exception:
                         # Retry immediately on next rerun if snapshot fails.
@@ -1587,7 +1587,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                 if not waiting_calls:
                     st.info(get_text(lang, "no_waiting_calls"))
                 else:
-                    max_display = 200
+                    max_display = 500
                     render_calls = waiting_calls[:max_display]
                     extra_count = max(0, len(waiting_calls) - max_display)
                     call_cards_html = []
