@@ -3726,7 +3726,7 @@ class GenesysAPI:
                 elif m == "nWrapup": new_mets.append("tAcw") 
                 elif m == "nHandled": new_mets.append("tHandle")
                 elif m == "nOutbound": new_mets.extend(["nOutbound", "tTalk"])
-                elif m == "tOutbound": new_mets.extend(["nOutbound", "tTalk"])
+                elif m == "tOutbound": new_mets.extend(["nOutbound", "tTalk", "tContacting", "tDialing", "tConnected"])
                 elif m == "nNotResponding": new_mets.append("tNotResponding")
                 elif m == "nAlert": new_mets.append("tAlert")
                 elif m == "nConsultTransferred": new_mets.append("nConsultTransferred")
@@ -3939,11 +3939,15 @@ class GenesysAPI:
             return {"results": all_results}
         return None
 
-    def get_queue_daily_stats(self, queue_ids, interval=None):
+    def get_queue_daily_stats(self, queue_ids, interval=None, utc_offset=3):
         if not interval:
-            now_utc = datetime.now(timezone.utc)
-            start_of_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-            interval = f"{start_of_day.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{now_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+            # Use the organization's UTC offset to calculate the correct local "start of day"
+            org_tz = timezone(timedelta(hours=utc_offset))
+            now_local = datetime.now(org_tz)
+            start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_utc = start_local.astimezone(timezone.utc)
+            now_utc = now_local.astimezone(timezone.utc)
+            interval = f"{start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{now_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
 
         CHUNK_SIZE = 50
         all_results = []

@@ -144,7 +144,9 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
         st.session_state.dashboard_mode = sc2.radio(get_text(lang, "mode"), m_opts, format_func=lambda x: get_text(lang, f"mode_{x.lower()}"), index=m_opts.index(st.session_state.dashboard_mode), horizontal=True, label_visibility="collapsed")
 
     if c_c3:
-        if st.session_state.dashboard_mode == "Date": st.session_state.dashboard_date = st.date_input(get_text(lang, "mode_date"), datetime.today(), label_visibility="collapsed")
+        if st.session_state.dashboard_mode == "Date":
+            _local_today = (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date()
+            st.session_state.dashboard_date = st.date_input(get_text(lang, "mode_date"), _local_today, label_visibility="collapsed")
         elif st.session_state.dashboard_mode == "Live": 
             c_auto, c_time, c_agent, c_call = st.columns([1, 1, 1, 1])
             auto_ref = c_auto.toggle(
@@ -349,7 +351,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                             start_dt, end_dt = _dashboard_interval_utc(
                                 "Date",
                                 saved_creds,
-                                selected_date=st.session_state.get("dashboard_date", datetime.today()),
+                                selected_date=st.session_state.get("dashboard_date", (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date()),
                             )
                         
                         # Fetch aggregate data for selected queues

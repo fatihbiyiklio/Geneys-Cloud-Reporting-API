@@ -30,7 +30,7 @@ Bu doküman, uygulamadaki rapor metriklerinin **ne anlama geldiğini** ve uygula
 | `nWrapup` | `tAcw` | Sayı olarak `tAcw.count` kullanılır |
 | `nHandled` | `tHandle` | Sayı olarak `tHandle.count` kullanılır |
 | `nOutbound` | `nOutbound` + `tTalk` | Süre alias’ı için `tTalk` da çağrılır |
-| `tOutbound` | `nOutbound` + `tTalk` | `nOutbound > 0` olan satırlarda `tTalk` süresi outbound süre olarak yazılır |
+| `tOutbound` | `nOutbound` + `tContacting` + `tDialing` + `tConnected` (fallback: `tTalk`) | Öncelikle outbound-only metrikler kullanılır; yoksa `nOutbound > 0` olan satırlarda `tTalk` fallback |
 | `nNotResponding` | `tNotResponding` | Sayı olarak `tNotResponding.count` |
 | `nAlert` | `tAlert` | Sayı olarak `tAlert.count` |
 | `nConsultTransferred` | `nConsultTransferred` | Doğrudan |
@@ -279,7 +279,7 @@ Uygulama çıktısı:
 | `tBreak` | Mola süresi (`tAway + tMeal + tMeeting + tTraining`). |
 | `col_login` | Seçili periyottaki ilk login zamanı. |
 | `col_logout` | Seçili periyottaki son logout zamanı. |
-| `col_staffed_time` | Staffed time (kullanıcı aggregate’dan türetilen süre). |
+| `col_staffed_time` | Staffed time (**yalnızca** `tOrganizationPresence` üzerinden hesaplanır, offline hariç; `tSystemPresence` çift sayımı önlemek için dahil edilmez). |
 | `AvgHandle` | Ortalama handle süresi (`tHandle / CountHandle`). |
 
 ### 8.6 Seçimden kaldırılan metrikler (bilgi)

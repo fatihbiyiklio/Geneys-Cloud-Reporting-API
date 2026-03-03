@@ -224,8 +224,8 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 if m_name == "tAlert": row["nAlert"] = stats.get('count', 0)
                 if m_name == "tHandle": row["nHandled"] = stats.get('count', 0)
                 
-                # Aliases for missing metrics that map to tTalk in aggregate view
-                if m_name == "tTalk":
+                # tTalkComplete: Only use tTalk as fallback if tTalkComplete wasn't directly returned by API
+                if m_name == "tTalk" and "tTalkComplete" not in row:
                     row["tTalkComplete"] = val
             data.append(row)
 
@@ -276,12 +276,24 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
         if "tTalk" in df.columns:
             # Alias to support chat-focused reports when media filter is chat/message.
             df["tChatTalk"] = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0).round(2)
-        if "tTalk" in df.columns and "nOutbound" in df.columns:
-            talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
+        if "nOutbound" in df.columns:
+            # tOutbound: Use outbound-specific duration metrics (tContacting + tDialing + tConnected)
+            # when available. These only count for outbound interactions.
+            # Fallback: if only tTalk is available AND nOutbound > 0, use tTalk as approximation
+            # (note: this may include inbound talk time if both directions exist in same row).
             outbound_count = pd.to_numeric(df["nOutbound"], errors="coerce").fillna(0)
-            df["tOutbound"] = talk_sum.where(outbound_count > 0, 0).round(2)
+            contacting = pd.to_numeric(df.get("tContacting", 0), errors="coerce").fillna(0)
+            dialing = pd.to_numeric(df.get("tDialing", 0), errors="coerce").fillna(0)
+            connected = pd.to_numeric(df.get("tConnected", 0), errors="coerce").fillna(0)
+            outbound_duration = contacting + dialing + connected
+            # If outbound-specific metrics are available, use them; otherwise fallback to tTalk
+            if outbound_duration.gt(0).any():
+                df["tOutbound"] = outbound_duration.where(outbound_count > 0, 0).round(2)
+            elif "tTalk" in df.columns:
+                talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
+                df["tOutbound"] = talk_sum.where(outbound_count > 0, 0).round(2)
 
-        helper_cols = ["ntTalk", "ntAnswered", "ntAbandon", "ntHandle", "ntWait", "ntAcd", "ntAcw", "ntHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
+        helper_cols = ["nTalk", "nAnswered", "nAbandon", "nHandle", "nWait", "nAcd", "nAcw", "nHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 
@@ -487,10 +499,21 @@ def process_user_aggregates(resp, presence_map=None):
                 else:
                     mapped = qualifier.lower()
                 
-                # Map to our columns
+                # Use only tOrganizationPresence for presence duration metrics to avoid
+                # double counting. tSystemPresence and tOrganizationPresence cover overlapping
+                # time ranges; summing both would inflate all presence durations.
+                # tOrganizationPresence is more granular (custom presence definitions).
+                if m_name == "tSystemPresence":
+                    # Only use tOnQueue from system presence since it's a routing metric
+                    # not typically available in organization presence.
+                    if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped:
+                        user_data["tOnQueue"] += duration
+                    continue
+                
+                # Map to our columns (tOrganizationPresence only)
                 # Handle English, Turkish, and System Enum formats
                 
-                # On Queue matching (often system presence "ON_QUEUE")
+                # On Queue matching
                 if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped: 
                     user_data["tOnQueue"] += duration
                 
@@ -521,13 +544,12 @@ def process_user_aggregates(resp, presence_map=None):
                 if m_name == "tNotResponding":
                     user_data["nNotResponding"] += stats.get('count', 0)
 
-                # Staffed time is generally sum of all except Offline.
-                # In User Aggregates, presence metrics represent active presence.
-                if m_name in ["tSystemPresence", "tOrganizationPresence"] and "offline" not in mapped:
+                # Staffed time: Use only tOrganizationPresence to avoid double counting.
+                # tSystemPresence and tOrganizationPresence cover overlapping time ranges;
+                # summing both would inflate StaffedTime (and derived metrics like oEfficiency, tBreak).
+                if m_name == "tOrganizationPresence" and "offline" not in mapped:
                     user_data["StaffedTime"] += duration
         
-        # Avoid double counting if both system and org presence are returned
-        # Usually tOrganizationPresence is more specific.
         results[user_id] = user_data
     return results
 

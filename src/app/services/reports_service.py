@@ -205,10 +205,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
         sel_ids = [(st.session_state.users_map if is_agent else st.session_state.queues_map)[n] for n in sel_names]
 
     # Date & Time Selection (One Row)
+    # Use UTC offset to determine "today" in the organization's local timezone
+    _local_today = (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date()
     c_d1, c_d2, c_d3, c_d4 = st.columns(4)
-    sd = c_d1.date_input("Start Date", datetime.today())
+    sd = c_d1.date_input("Start Date", _local_today)
     st_ = c_d2.time_input(get_text(lang, "start_time"), time(0, 0))
-    ed = c_d3.date_input("End Date", datetime.today())
+    ed = c_d3.date_input("End Date", _local_today)
     et = c_d4.time_input(get_text(lang, "end_time"), time(23, 59))
     interaction_agent_names = []
     interaction_agent_ids = []
