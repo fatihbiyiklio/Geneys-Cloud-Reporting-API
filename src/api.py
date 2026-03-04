@@ -831,27 +831,49 @@ class GenesysAPI:
             return self.get_conversation(conversation_id)
 
     def get_users(self, page_size=100, max_pages=50):
-        """Fetches all users from Genesys Cloud."""
+        """Fetches users from Genesys Cloud (active + inactive + deleted where supported)."""
         return self._get_users_page_scan(page_size=page_size, max_pages=max_pages)
 
-    def get_queues(self):
-        """Fetches all queues using direct API with paging."""
-        queues = []
-        try:
+    def get_queues(self, page_size=100, max_pages=50):
+        """Fetches queues using direct API with paging (active + inactive + deleted where supported)."""
+        queues_by_id = {}
+
+        def _scan(extra_params=None):
             page_number = 1
-            while True:
-                data = self._get("/api/v2/routing/queues", params={"pageNumber": page_number, "pageSize": 100})
-                if 'entities' in data:
-                    for queue in data['entities']:
-                        queues.append({'id': queue['id'], 'name': queue['name']})
-                    if not data.get('nextUri'):
-                        break
-                    page_number += 1
-                else:
+            while page_number <= max_pages:
+                params = {"pageNumber": page_number, "pageSize": page_size}
+                if isinstance(extra_params, dict) and extra_params:
+                    params.update(extra_params)
+                data = self._get("/api/v2/routing/queues", params=params)
+                entities = data.get('entities') if isinstance(data, dict) else None
+                if not entities:
                     break
+                for queue in entities:
+                    qid = queue.get('id')
+                    if not qid:
+                        continue
+                    queues_by_id[qid] = {
+                        'id': qid,
+                        'name': queue.get('name', ''),
+                        'state': queue.get('state', '')
+                    }
+                if not data.get('nextUri'):
+                    break
+                page_number += 1
+
+        try:
+            _scan()
         except Exception:
             monitor.log_error("API_GET", "Error: Could not fetch queues from Genesys Cloud.")
-        return queues
+            return list(queues_by_id.values())
+
+        for queue_state in ("active", "inactive", "deleted"):
+            try:
+                _scan({"state": queue_state})
+            except Exception:
+                continue
+
+        return list(queues_by_id.values())
 
     def get_queue_wrapup_timeout(self, queue_id):
         """Fetch wrap-up timeout (seconds) for a single queue."""
@@ -3674,29 +3696,47 @@ class GenesysAPI:
         }
 
     def _get_users_page_scan(self, page_size=100, max_pages=50):
-        """Fetches all users from Genesys Cloud."""
-        users = []
-        try:
+        """Fetches users from Genesys Cloud (active + inactive + deleted where supported)."""
+        users_by_id = {}
+
+        def _scan(extra_params=None):
             page_number = 1
             while page_number <= max_pages:
-                data = self._get("/api/v2/users", params={"pageNumber": page_number, "pageSize": page_size, "sortOrder": "ASC"})
-                if 'entities' in data:
-                    for u in data['entities']:
-                        users.append({
-                            'id': u['id'],
-                            'name': u.get('name', ''),
-                            'username': u.get('username', ''),
-                            'email': u.get('email', ''),
-                            'state': u.get('state', '')
-                        })
-                    if not data.get('nextUri'):
-                        break
-                    page_number += 1
-                else:
+                params = {"pageNumber": page_number, "pageSize": page_size, "sortOrder": "ASC"}
+                if isinstance(extra_params, dict) and extra_params:
+                    params.update(extra_params)
+                data = self._get("/api/v2/users", params=params)
+                entities = data.get('entities') if isinstance(data, dict) else None
+                if not entities:
                     break
+                for u in entities:
+                    uid = u.get('id')
+                    if not uid:
+                        continue
+                    users_by_id[uid] = {
+                        'id': uid,
+                        'name': u.get('name', ''),
+                        'username': u.get('username', ''),
+                        'email': u.get('email', ''),
+                        'state': u.get('state', '')
+                    }
+                if not data.get('nextUri'):
+                    break
+                page_number += 1
+
+        try:
+            _scan()
         except Exception as e:
             monitor.log_error("API_GET", f"Error fetching users: {e}")
-        return users
+            return list(users_by_id.values())
+
+        for user_state in ("active", "inactive", "deleted"):
+            try:
+                _scan({"state": user_state})
+            except Exception:
+                continue
+
+        return list(users_by_id.values())
 
     def get_analytics_conversations_aggregate(self, start_date, end_date, granularity="P1D", group_by=None, filter_type=None, filter_ids=None, metrics=None, media_types=None):
         dimension = "userId" if filter_type == 'user' else "queueId"

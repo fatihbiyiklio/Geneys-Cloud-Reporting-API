@@ -2679,15 +2679,60 @@ def _fetch_org_maps(api):
     queues = api.get_queues()
     wrapup = api.get_wrapup_codes()
     presence = api.get_presence_definitions()
-    users_map = {u['name']: u['id'] for u in users}
+
+    def _decorate_name(raw_name, entity_id, state):
+        base = str(raw_name or entity_id or "").strip() or str(entity_id or "")
+        state_norm = str(state or "").strip().lower()
+        if state_norm and state_norm not in {"active", "enabled"}:
+            return f"{base} ({entity_id})"
+        return base
+
+    def _safe_insert_label(label_map, label, entity_id):
+        normalized_id = str(entity_id or "").strip()
+        if not normalized_id:
+            return
+        candidate = str(label or normalized_id).strip() or normalized_id
+        if label_map.get(candidate) == normalized_id:
+            return
+        if candidate not in label_map:
+            label_map[candidate] = normalized_id
+            return
+        suffix = 2
+        while True:
+            alternative = f"{candidate} ({suffix})"
+            if alternative not in label_map:
+                label_map[alternative] = normalized_id
+                return
+            if label_map.get(alternative) == normalized_id:
+                return
+            suffix += 1
+
+    users_map = {}
+    for u in users:
+        uid = u.get('id')
+        if not uid:
+            continue
+        decorated_name = _decorate_name(u.get('name', ''), uid, u.get('state', ''))
+        _safe_insert_label(users_map, decorated_name, uid)
+
     users_info = {
         u['id']: {
-            'name': u.get('name', ''),
+            'name': _decorate_name(u.get('name', ''), u.get('id'), u.get('state', '')),
             'username': u.get('username', ''),
-            'email': u.get('email', '')
+            'email': u.get('email', ''),
+            'state': u.get('state', ''),
         } for u in users
+        if u.get('id')
     }
-    queues_map = {q['name']: q['id'] for q in queues}
+
+    queues_map = {}
+    for q in queues:
+        qid = q.get('id')
+        if not qid:
+            continue
+        decorated_name = _decorate_name(q.get('name', ''), qid, q.get('state', ''))
+        _safe_insert_label(queues_map, decorated_name, qid)
+
     return {
         "users": users,
         "queues": queues,

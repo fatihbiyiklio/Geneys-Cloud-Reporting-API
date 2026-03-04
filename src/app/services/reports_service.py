@@ -36,6 +36,65 @@ def render_reports_service(context: Dict[str, Any]) -> None:
             "_sort_dir",
         )
         return not any(state_key.endswith(sfx) for sfx in widget_suffixes)
+
+    def _decorate_entity_label(raw_name, entity_id, state):
+        base_label = str(raw_name or entity_id or "").strip() or str(entity_id or "")
+        state_norm = str(state or "").strip().lower()
+        if state_norm and state_norm not in {"active", "enabled"}:
+            return f"{base_label} ({entity_id})"
+        return base_label
+
+    def _safe_insert_labeled_id(label_map, preferred_label, entity_id):
+        normalized_id = str(entity_id or "").strip()
+        if not normalized_id:
+            return
+        candidate = str(preferred_label or normalized_id).strip() or normalized_id
+        if label_map.get(candidate) == normalized_id:
+            return
+        if candidate not in label_map:
+            label_map[candidate] = normalized_id
+            return
+        suffix = 2
+        while True:
+            alt = f"{candidate} ({suffix})"
+            if alt not in label_map:
+                label_map[alt] = normalized_id
+                return
+            if label_map.get(alt) == normalized_id:
+                return
+            suffix += 1
+
+    def _build_users_map_from_api_list(users):
+        out = {}
+        for user_obj in (users or []):
+            if not isinstance(user_obj, dict):
+                continue
+            user_id = user_obj.get("id")
+            if not user_id:
+                continue
+            user_label = _decorate_entity_label(
+                user_obj.get("name") or user_obj.get("username") or user_obj.get("id"),
+                user_id,
+                user_obj.get("state"),
+            )
+            _safe_insert_labeled_id(out, user_label, user_id)
+        return out
+
+    def _build_queues_map_from_api_list(queues):
+        out = {}
+        for queue_obj in (queues or []):
+            if not isinstance(queue_obj, dict):
+                continue
+            queue_id = queue_obj.get("id")
+            if not queue_id:
+                continue
+            queue_label = _decorate_entity_label(
+                queue_obj.get("name") or queue_obj.get("id"),
+                queue_id,
+                queue_obj.get("state"),
+            )
+            _safe_insert_labeled_id(out, queue_label, queue_id)
+        return out
     # --- SAVED VIEWS (Compact) ---
     with st.expander(f"📂 {get_text(lang, 'saved_views')}", expanded=False):
         presets = load_presets(org)
@@ -179,10 +238,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     api = GenesysAPI(st.session_state.api_client)
                     users = api.get_users()
                     if isinstance(users, list) and users:
-                        st.session_state.users_map = {
-                            str(u.get("name") or u.get("username") or u.get("id")): u.get("id")
-                            for u in users if isinstance(u, dict) and u.get("id")
-                        }
+                        st.session_state.users_map = _build_users_map_from_api_list(users)
                 except Exception:
                     pass
         if (not is_agent) and (not st.session_state.get("queues_map")):
@@ -192,10 +248,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     api = GenesysAPI(st.session_state.api_client)
                     queues = api.get_queues()
                     if isinstance(queues, list) and queues:
-                        st.session_state.queues_map = {
-                            str(q.get("name") or q.get("id")): q.get("id")
-                            for q in queues if isinstance(q, dict) and q.get("id")
-                        }
+                        st.session_state.queues_map = _build_queues_map_from_api_list(queues)
                 except Exception:
                     pass
         opts = list(st.session_state.users_map.keys()) if is_agent else list(st.session_state.queues_map.keys())
@@ -263,10 +316,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         api = GenesysAPI(st.session_state.api_client)
                         users = api.get_users()
                         if isinstance(users, list) and users:
-                            st.session_state.users_map = {
-                                str(u.get("name") or u.get("username") or u.get("id")): u.get("id")
-                                for u in users if isinstance(u, dict) and u.get("id")
-                            }
+                            st.session_state.users_map = _build_users_map_from_api_list(users)
                     except Exception:
                         pass
             interaction_agent_opts = list((st.session_state.get("users_map") or {}).keys())
