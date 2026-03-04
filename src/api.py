@@ -4113,6 +4113,12 @@ class GenesysAPI:
         
         BATCH_SIZE = 100
         combined_results = []
+        _warnings = []
+        
+        # Metrics to request — tRoutingStatus may not be available on all orgs
+        base_metrics = ["tSystemPresence", "tOrganizationPresence", "tNotResponding"]
+        extra_metrics = ["tRoutingStatus"]
+        use_extra = True  # Will be disabled if API returns 400
         
         # Chunk by 14 days to be safe (Aggregates can handle more but reliable is better)
         chunk_days = 14
@@ -4127,24 +4133,37 @@ class GenesysAPI:
                     {"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid}
                     for uid in batch
                 ]
+                metrics_to_use = base_metrics + (extra_metrics if use_extra else [])
                 query = {
                     "interval": interval,
                     "groupBy": ["userId"],
                     "filter": {"type": "or", "predicates": predicates},
-                    "metrics": ["tSystemPresence", "tOrganizationPresence", "tRoutingStatus"]
+                    "metrics": metrics_to_use
                 }
                 try:
-                    data = self._post("/api/v2/analytics/users/aggregates/query", query)
+                    data = self._post("/api/v2/analytics/users/aggregates/query", query, timeout=30, retries=1, retry_sleep=2)
                 except Exception as e:
-                    monitor.log_error("API_POST", f"Error fetching user aggregates batch {i} for {interval}: {e}")
-                    data = {}
+                    # If tRoutingStatus causes 400, retry without it
+                    if use_extra and self._is_http_status(e, 400):
+                        use_extra = False
+                        query["metrics"] = base_metrics
+                        try:
+                            data = self._post("/api/v2/analytics/users/aggregates/query", query, timeout=30, retries=1, retry_sleep=2)
+                        except Exception as e2:
+                            monitor.log_error("API_POST", f"Error fetching user aggregates batch {i} for {interval} (retry without tRoutingStatus): {e2}")
+                            _warnings.append(f"User aggregates batch {i} failed: {e2}")
+                            data = {}
+                    else:
+                        monitor.log_error("API_POST", f"Error fetching user aggregates batch {i} for {interval}: {e}")
+                        _warnings.append(f"User aggregates batch {i} failed: {e}")
+                        data = {}
 
                 if data and 'results' in data:
                     combined_results.extend(data['results'])
             
             curr = curr_end
             
-        return {"results": combined_results}
+        return {"results": combined_results, "_warnings": _warnings}
 
     def get_user_status_details(self, start_date, end_date, user_ids):
         """Fetches historical user status details for login/logout calculation, batching requests if needed."""
@@ -4152,6 +4171,7 @@ class GenesysAPI:
         
         BATCH_SIZE = 50 
         combined_details = []
+        _warnings = []
         
         # Chunk by 7 days for Details queries
         chunk_days = 7
@@ -4174,7 +4194,7 @@ class GenesysAPI:
                             "paging": {"pageSize": 100, "pageNumber": page}
                         }
                         
-                        data = self._post("/api/v2/analytics/users/details/query", query)
+                        data = self._post("/api/v2/analytics/users/details/query", query, timeout=30, retries=1, retry_sleep=2)
                         
                         if data and 'userDetails' in data:
                             combined_details.extend(data['userDetails'])
@@ -4185,10 +4205,11 @@ class GenesysAPI:
                             break
                 except Exception as e:
                     monitor.log_error("API_POST", f"Error details batch {i} interval {interval}: {e}")
+                    _warnings.append(f"User details batch {i} failed: {e}")
             
             curr = curr_end
             
-        return {"userDetails": combined_details}
+        return {"userDetails": combined_details, "_warnings": _warnings}
 
     def get_queue_members(self, queue_id):
         """Fetches members of a queue with their presence and routing status."""

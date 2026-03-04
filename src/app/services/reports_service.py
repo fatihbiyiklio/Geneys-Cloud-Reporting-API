@@ -1721,8 +1721,13 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining",
                         "tOnQueue", "tBreak", "oEfficiency", "oOccupancy", "col_staffed_time", "nNotResponding",
                     ]
-                    if any(m in sel_mets_effective for m in p_keys) and is_agent:
-                        p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
+                    _is_user_report = r_kind in ("Agent", "Detailed")
+                    if any(m in (sel_mets or []) for m in p_keys) and _is_user_report:
+                        _agg_resp = api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys()))
+                        _agg_warnings = _agg_resp.get("_warnings") if isinstance(_agg_resp, dict) else None
+                        if _agg_warnings:
+                            st.warning(f"Kullanıcı durum verileri alınırken {len(_agg_warnings)} hata oluştu. Presence/Staff metrikleri eksik olabilir.")
+                        p_map = process_user_aggregates(_agg_resp, st.session_state.get('presence_map'))
                         for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime", "nNotResponding"]:
                             target_col = pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")
                             fallback_series = df["Id"].apply(
@@ -1735,9 +1740,13 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                                 keep_existing = existing_numeric.notna() & (existing_numeric != 0)
                                 df[target_col] = existing_numeric.where(keep_existing, fallback_series)
                     
-                    if any(m in sel_mets_effective for m in ["col_login", "col_logout", "col_staffed_time", "oEfficiency", "oOccupancy", "tBreak"]) and is_agent:
+                    if any(m in (sel_mets or []) for m in ["col_login", "col_logout", "col_staffed_time", "oEfficiency", "oOccupancy", "tBreak"]) and _is_user_report:
                         u_offset = utc_offset_hours
-                        d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), utc_offset=u_offset, query_end=e_dt)
+                        _det_resp = api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys()))
+                        _det_warnings = _det_resp.get("_warnings") if isinstance(_det_resp, dict) else None
+                        if _det_warnings:
+                            st.warning(f"Login/Logout verileri alınırken {len(_det_warnings)} hata oluştu. Login/Logout bilgileri eksik olabilir.")
+                        d_map = process_user_details(_det_resp, utc_offset=u_offset, query_end=e_dt)
                         if "col_login" in sel_mets: df["col_login"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
                         if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
                         # Only use login-to-logout StaffedTime as fallback if aggregate StaffedTime (tOnQueue+tOffQueue) is not available
