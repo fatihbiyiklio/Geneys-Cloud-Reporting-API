@@ -554,7 +554,7 @@ def process_user_aggregates(resp, presence_map=None):
     return results
 
 def process_user_details(resp, utc_offset=3):
-    """Processes user details to find first login and last logout of the period."""
+    """Processes user details to find first login, last logout and staffed duration."""
     results = {}
     if not resp or 'userDetails' not in resp:
         return results
@@ -573,7 +573,23 @@ def process_user_details(resp, utc_offset=3):
             first_login_utc = active_presences[0].get('startTime')
             last_logout_utc = active_presences[-1].get('endTime')
             
-            # Format and adjust to UTC+3
+            # Calculate StaffedTime as Login-to-Logout duration in seconds
+            staffed_seconds = 0
+            try:
+                if first_login_utc and last_logout_utc:
+                    login_dt = datetime.fromisoformat(first_login_utc.replace('Z', '+00:00'))
+                    logout_dt = datetime.fromisoformat(last_logout_utc.replace('Z', '+00:00'))
+                    staffed_seconds = max(0, (logout_dt - login_dt).total_seconds())
+                elif first_login_utc:
+                    # Still logged in — use current time as end
+                    login_dt = datetime.fromisoformat(first_login_utc.replace('Z', '+00:00'))
+                    from datetime import timezone as tz
+                    now_utc = datetime.now(tz.utc)
+                    staffed_seconds = max(0, (now_utc - login_dt).total_seconds())
+            except Exception:
+                staffed_seconds = 0
+
+            # Format and adjust to UTC+offset
             from datetime import timedelta
             def format_utc_to_local(utc_str):
                 if not utc_str: return "N/A"
@@ -586,10 +602,11 @@ def process_user_details(resp, utc_offset=3):
             
             results[user_id] = {
                 "Login": format_utc_to_local(first_login_utc),
-                "Logout": format_utc_to_local(last_logout_utc)
+                "Logout": format_utc_to_local(last_logout_utc),
+                "StaffedTime": staffed_seconds,
             }
         else:
-            results[user_id] = {"Login": "N/A", "Logout": "N/A"}
+            results[user_id] = {"Login": "N/A", "Logout": "N/A", "StaffedTime": 0}
             
     return results
 
