@@ -1723,7 +1723,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                     ]
                     if any(m in sel_mets_effective for m in p_keys) and is_agent:
                         p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
-                        for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime", "nNotResponding"]:
+                        for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tBreak", "tOnQueue", "StaffedTime", "nNotResponding"]:
                             target_col = pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")
                             fallback_series = df["Id"].apply(
                                 lambda x: p_map.get(x.split('|')[0] if '|' in x else x, {}).get(pk, 0)
@@ -1773,13 +1773,19 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                             safe_count = talk_count.where(talk_count > 0, talk_sum.gt(0).astype("float64"))
                             df["tAverageTalk"] = talk_sum.divide(safe_count.where(safe_count > 0), fill_value=0).fillna(0).round(2)
                     if "tBreak" in selected_metric_set:
-                        break_parts = [
-                            _metric_series_or_zero("tAway"),
-                            _metric_series_or_zero("tMeal"),
-                            _metric_series_or_zero("tMeeting"),
-                            _metric_series_or_zero("tTraining"),
-                        ]
-                        df["tBreak"] = sum(break_parts).round(2)
+                        # tBreak already populated from user aggregates (p_map) above.
+                        # Fall back to sum of away/meal/meeting/training only if all zeros.
+                        existing_break = _metric_series_or_zero("tBreak")
+                        if existing_break.sum() == 0:
+                            break_parts = [
+                                _metric_series_or_zero("tAway"),
+                                _metric_series_or_zero("tMeal"),
+                                _metric_series_or_zero("tMeeting"),
+                                _metric_series_or_zero("tTraining"),
+                            ]
+                            df["tBreak"] = sum(break_parts).round(2)
+                        else:
+                            df["tBreak"] = existing_break.round(2)
                     if "oEfficiency" in selected_metric_set:
                         handle_sum = _metric_series_or_zero("tHandle")
                         staffed_sum = (

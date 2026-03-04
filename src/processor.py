@@ -293,7 +293,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
                 df["tOutbound"] = talk_sum.where(outbound_count > 0, 0).round(2)
 
-        helper_cols = ["nTalk", "nAnswered", "nAbandon", "nHandle", "nWait", "nAcd", "nAcw", "nHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
+        helper_cols = ["CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 
@@ -477,9 +477,9 @@ def process_user_aggregates(resp, presence_map=None):
     for result in resp['results']:
         user_id = result.get('group', {}).get('userId')
         user_data = {
-            "tMeal": 0, "tMeeting": 0, "tAvailable": 0, "tBusy": 0, 
-            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "StaffedTime": 0,
-            "nNotResponding": 0
+            "tMeal": 0, "tMeeting": 0, "tAvailable": 0, "tBusy": 0,
+            "tAway": 0, "tTraining": 0, "tBreak": 0, "tOnQueue": 0, "tOffQueue": 0,
+            "StaffedTime": 0, "nNotResponding": 0
         }
         
         data_list = result.get('data', [])
@@ -498,58 +498,58 @@ def process_user_aggregates(resp, presence_map=None):
                     mapped = (p_info['label'] if isinstance(p_info, dict) else p_info).lower()
                 else:
                     mapped = qualifier.lower()
+
+                _is_offline = "offline" in mapped or "çevrimdışı" in mapped
+                _is_on_queue = (
+                    "on_queue" in mapped or "on queue" in mapped
+                    or "onqueue" in mapped or "kuyrukta" in mapped
+                )
                 
-                # Use only tOrganizationPresence for presence duration metrics to avoid
-                # double counting. tSystemPresence and tOrganizationPresence cover overlapping
-                # time ranges; summing both would inflate all presence durations.
-                # tOrganizationPresence is more granular (custom presence definitions).
-                if m_name == "tSystemPresence":
-                    # Only use tOnQueue from system presence since it's a routing metric
-                    # not typically available in organization presence.
-                    if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped:
-                        user_data["tOnQueue"] += duration
+                if m_name == "tAgentRoutingStatus":
                     continue
-                
-                # Map to our columns (tOrganizationPresence only)
-                # Handle English, Turkish, and System Enum formats
-                
-                # On Queue matching
-                if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped: 
-                    user_data["tOnQueue"] += duration
-                
-                # Meal matching
-                elif "meal" in mapped or "yemek" in mapped: 
-                    user_data["tMeal"] += duration
-                
-                # Meeting matching
-                elif "meeting" in mapped or "toplantı" in mapped: 
-                    user_data["tMeeting"] += duration
-                
-                # Training matching
-                elif "training" in mapped or "eğitim" in mapped: 
-                    user_data["tTraining"] += duration
-                
-                # Available/Ready matching
-                elif "available" in mapped or "hazır" in mapped: 
-                    user_data["tAvailable"] += duration
-                
-                # Busy matching
-                elif "busy" in mapped or "meşgul" in mapped: 
-                    user_data["tBusy"] += duration
-                
-                # Away matching
-                elif "away" in mapped or "uzakta" in mapped: 
-                    user_data["tAway"] += duration
-                
+
                 if m_name == "tNotResponding":
                     user_data["nNotResponding"] += stats.get('count', 0)
+                    continue
 
-                # Staffed time: Use only tOrganizationPresence to avoid double counting.
-                # tSystemPresence and tOrganizationPresence cover overlapping time ranges;
-                # summing both would inflate StaffedTime (and derived metrics like oEfficiency, tBreak).
-                if m_name == "tOrganizationPresence" and "offline" not in mapped:
-                    user_data["StaffedTime"] += duration
-        
+                # tSystemPresence: ON_QUEUE qualifier → tOnQueue
+                if m_name == "tSystemPresence":
+                    if _is_on_queue:
+                        user_data["tOnQueue"] += duration
+                    continue
+
+                if m_name != "tOrganizationPresence":
+                    continue
+
+                # Map to our columns (tOrganizationPresence only)
+                # Handle English, Turkish, and System Enum formats
+                if "meal" in mapped or "yemek" in mapped:
+                    user_data["tMeal"] += duration
+                elif "meeting" in mapped or "toplantı" in mapped:
+                    user_data["tMeeting"] += duration
+                elif "training" in mapped or "eğitim" in mapped:
+                    user_data["tTraining"] += duration
+                elif "available" in mapped or "hazır" in mapped:
+                    user_data["tAvailable"] += duration
+                elif "busy" in mapped or "meşgul" in mapped:
+                    user_data["tBusy"] += duration
+                elif "away" in mapped or "uzakta" in mapped:
+                    user_data["tAway"] += duration
+                elif "break" in mapped or "mola" in mapped:
+                    user_data["tBreak"] += duration
+
+            user_data["tOffQueue"] = (
+                user_data["tAvailable"]
+                + user_data["tBusy"]
+                + user_data["tAway"]
+                + user_data["tBreak"]
+                + user_data["tMeal"]
+                + user_data["tMeeting"]
+                + user_data["tTraining"]
+            )
+
+            # StaffedTime = On Queue + Off Queue
+        user_data["StaffedTime"] = user_data["tOnQueue"] + user_data["tOffQueue"]
         results[user_id] = user_data
     return results
 

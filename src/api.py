@@ -221,7 +221,14 @@ class GenesysAPI:
                         "API_POST",
                         f"HTTP 429 retry budget exceeded on {path} (attempt {retry_429_count}, total_wait={projected_wait:.2f}s)",
                     )
-                monitor.log_error("API_POST", f"HTTP {status_code} on {path}", str(e))
+                detail = None
+                try:
+                    detail = response.text
+                    if detail and len(detail) > 2000:
+                        detail = detail[:2000] + "...(truncated)"
+                except Exception:
+                    detail = None
+                monitor.log_error("API_POST", f"HTTP {status_code} on {path}", detail or str(e))
                 if status_code == 401:
                     monitor.log_error("API_POST", "Token expired (401) on POST.")
                 raise e
@@ -4110,15 +4117,129 @@ class GenesysAPI:
     def get_user_aggregates(self, start_date, end_date, user_ids):
         """Fetches user status aggregates (durations) for a list of users, batching requests if needed."""
         if not user_ids: return {"results": []}
-        
-        BATCH_SIZE = 100
+
+        def _is_uuid_like(value):
+            txt = str(value or "").strip()
+            if len(txt) != 36:
+                return False
+            parts = txt.split("-")
+            if len(parts) != 5:
+                return False
+            expected = (8, 4, 4, 4, 12)
+            hex_chars = "0123456789abcdefABCDEF"
+            for part, size in zip(parts, expected):
+                if len(part) != size:
+                    return False
+                if any(ch not in hex_chars for ch in part):
+                    return False
+            return True
+
+        cleaned_ids = []
+        seen = set()
+        invalid_count = 0
+        for uid in (user_ids or []):
+            raw_uid = str(uid or "").strip()
+            if not raw_uid:
+                continue
+            if not _is_uuid_like(raw_uid):
+                invalid_count += 1
+                continue
+            if raw_uid in seen:
+                continue
+            seen.add(raw_uid)
+            cleaned_ids.append(raw_uid)
+
+        if not cleaned_ids:
+            warnings = []
+            if invalid_count > 0:
+                warnings.append(f"User aggregates skipped: {invalid_count} invalid userId")
+            return {"results": [], "_warnings": warnings}
+
+        BATCH_SIZE = 25
         combined_results = []
         _warnings = []
-        
-        # Metrics to request — tRoutingStatus may not be available on all orgs
-        base_metrics = ["tSystemPresence", "tOrganizationPresence", "tNotResponding"]
-        extra_metrics = ["tRoutingStatus"]
-        use_extra = True  # Will be disabled if API returns 400
+        if invalid_count > 0:
+            _warnings.append(f"User aggregates skipped: {invalid_count} invalid userId")
+
+        # Only 3 metrics are valid for UserAggregateMetric (per Genesys API spec):
+        # tAgentRoutingStatus, tOrganizationPresence, tSystemPresence
+        metric_profiles = [
+            ["tAgentRoutingStatus", "tOrganizationPresence", "tSystemPresence"],
+            ["tAgentRoutingStatus", "tOrganizationPresence"],
+            ["tAgentRoutingStatus"],
+        ]
+
+        def _build_predicates(batch_ids):
+            return [
+                {"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid}
+                for uid in (batch_ids or [])
+            ]
+
+        def _try_query_variants(interval_value, batch_ids, metrics_to_use):
+            predicates = _build_predicates(batch_ids)
+            if not predicates:
+                return {"results": []}, None
+
+            # Correct structure: filter.type = "or"|"and", predicates[].type = "dimension"|"property"|"metric"
+            # "or"/"and" are NOT valid for individual predicate type (QueryPredicateType).
+            payload_variants = [
+                {
+                    "interval": interval_value,
+                    "groupBy": ["userId"],
+                    "filter": {"type": "or", "predicates": predicates},
+                    "metrics": metrics_to_use,
+                },
+                {
+                    "interval": interval_value,
+                    "groupBy": ["userId"],
+                    "filter": {
+                        "type": "and",
+                        "clauses": [{"type": "or", "predicates": predicates}],
+                    },
+                    "metrics": metrics_to_use,
+                },
+            ]
+
+            last_err = None
+            for payload in payload_variants:
+                try:
+                    data = self._post("/api/v2/analytics/users/aggregates/query", payload, timeout=30, retries=1, retry_sleep=2)
+                    return data, None
+                except Exception as ex:
+                    last_err = ex
+                    if not self._is_http_status(ex, 400):
+                        break
+            return None, last_err
+
+        def _fetch_batch(interval_value, batch_ids, depth=0):
+            if not batch_ids:
+                return
+
+            last_error = None
+            for metrics in metric_profiles:
+                data, err = _try_query_variants(interval_value, batch_ids, metrics)
+                if data is not None:
+                    if isinstance(data, dict) and 'results' in data:
+                        combined_results.extend(data.get('results') or [])
+                    return
+                last_error = err
+
+            # If batch-level request fails with 400, split recursively to isolate problematic payload/user sizes.
+            if len(batch_ids) > 1 and last_error is not None and self._is_http_status(last_error, 400) and depth < 8:
+                mid = len(batch_ids) // 2
+                _fetch_batch(interval_value, batch_ids[:mid], depth + 1)
+                _fetch_batch(interval_value, batch_ids[mid:], depth + 1)
+                return
+
+            # Final fallback: warn and continue.
+            _warnings.append(
+                f"User aggregates batch failed ({len(batch_ids)} users): {last_error}"
+            )
+            monitor.log_error(
+                "API_POST",
+                f"User aggregates failed for batch size={len(batch_ids)} interval={interval_value}",
+                str(last_error),
+            )
         
         # Chunk by 14 days to be safe (Aggregates can handle more but reliable is better)
         chunk_days = 14
@@ -4127,39 +4248,9 @@ class GenesysAPI:
             curr_end = min(curr + timedelta(days=chunk_days), end_date)
             interval = f"{curr.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{curr_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
             
-            for i in range(0, len(user_ids), BATCH_SIZE):
-                batch = user_ids[i:i + BATCH_SIZE]
-                predicates = [
-                    {"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid}
-                    for uid in batch
-                ]
-                metrics_to_use = base_metrics + (extra_metrics if use_extra else [])
-                query = {
-                    "interval": interval,
-                    "groupBy": ["userId"],
-                    "filter": {"type": "or", "predicates": predicates},
-                    "metrics": metrics_to_use
-                }
-                try:
-                    data = self._post("/api/v2/analytics/users/aggregates/query", query, timeout=30, retries=1, retry_sleep=2)
-                except Exception as e:
-                    # If tRoutingStatus causes 400, retry without it
-                    if use_extra and self._is_http_status(e, 400):
-                        use_extra = False
-                        query["metrics"] = base_metrics
-                        try:
-                            data = self._post("/api/v2/analytics/users/aggregates/query", query, timeout=30, retries=1, retry_sleep=2)
-                        except Exception as e2:
-                            monitor.log_error("API_POST", f"Error fetching user aggregates batch {i} for {interval} (retry without tRoutingStatus): {e2}")
-                            _warnings.append(f"User aggregates batch {i} failed: {e2}")
-                            data = {}
-                    else:
-                        monitor.log_error("API_POST", f"Error fetching user aggregates batch {i} for {interval}: {e}")
-                        _warnings.append(f"User aggregates batch {i} failed: {e}")
-                        data = {}
-
-                if data and 'results' in data:
-                    combined_results.extend(data['results'])
+            for i in range(0, len(cleaned_ids), BATCH_SIZE):
+                batch = cleaned_ids[i:i + BATCH_SIZE]
+                _fetch_batch(interval, batch, depth=0)
             
             curr = curr_end
             
@@ -4168,10 +4259,49 @@ class GenesysAPI:
     def get_user_status_details(self, start_date, end_date, user_ids):
         """Fetches historical user status details for login/logout calculation, batching requests if needed."""
         if not user_ids: return {}
-        
-        BATCH_SIZE = 50 
+
+        def _is_uuid_like(value):
+            txt = str(value or "").strip()
+            if len(txt) != 36:
+                return False
+            parts = txt.split("-")
+            if len(parts) != 5:
+                return False
+            expected = (8, 4, 4, 4, 12)
+            hex_chars = "0123456789abcdefABCDEF"
+            for part, size in zip(parts, expected):
+                if len(part) != size:
+                    return False
+                if any(ch not in hex_chars for ch in part):
+                    return False
+            return True
+
+        cleaned_ids = []
+        seen = set()
+        invalid_count = 0
+        for uid in (user_ids or []):
+            raw_uid = str(uid or "").strip()
+            if not raw_uid:
+                continue
+            if not _is_uuid_like(raw_uid):
+                invalid_count += 1
+                continue
+            if raw_uid in seen:
+                continue
+            seen.add(raw_uid)
+            cleaned_ids.append(raw_uid)
+
+        if not cleaned_ids:
+            warnings = []
+            if invalid_count > 0:
+                warnings.append(f"User details skipped: {invalid_count} invalid userId")
+            return {"userDetails": [], "_warnings": warnings}
+
+        BATCH_SIZE = 25
         combined_details = []
         _warnings = []
+        if invalid_count > 0:
+            _warnings.append(f"User details skipped: {invalid_count} invalid userId")
         
         # Chunk by 7 days for Details queries
         chunk_days = 7
@@ -4180,8 +4310,8 @@ class GenesysAPI:
             curr_end = min(curr + timedelta(days=chunk_days), end_date)
             interval = f"{curr.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{curr_end.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
             
-            for i in range(0, len(user_ids), BATCH_SIZE):
-                batch = user_ids[i:i + BATCH_SIZE]
+            for i in range(0, len(cleaned_ids), BATCH_SIZE):
+                batch = cleaned_ids[i:i + BATCH_SIZE]
                 
                 try:
                     page = 1
