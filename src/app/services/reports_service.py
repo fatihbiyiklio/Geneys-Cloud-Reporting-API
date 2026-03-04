@@ -1481,7 +1481,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 # Queue aggregate endpoint does not return agent presence/login-style metrics.
                 queue_incompatible_metrics = {
                     "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue",
-                    "tBreak", "oEfficiency", "oOccupancy",
+                    "tBreak", "oEfficiency",
                     "col_staffed_time", "col_login", "col_logout",
                 }
                 dropped_queue_metrics = [m for m in sel_mets_effective if m in queue_incompatible_metrics]
@@ -1719,15 +1719,10 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 if not df.empty:
                     p_keys = [
                         "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining",
-                        "tOnQueue", "tBreak", "oEfficiency", "oOccupancy", "col_staffed_time", "nNotResponding",
+                        "tOnQueue", "tBreak", "oEfficiency", "col_staffed_time", "nNotResponding",
                     ]
-                    _is_user_report = r_kind in ("Agent", "Detailed")
-                    if any(m in (sel_mets or []) for m in p_keys) and _is_user_report:
-                        _agg_resp = api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys()))
-                        _agg_warnings = _agg_resp.get("_warnings") if isinstance(_agg_resp, dict) else None
-                        if _agg_warnings:
-                            st.warning(f"Kullanıcı durum verileri alınırken {len(_agg_warnings)} hata oluştu. Presence/Staff metrikleri eksik olabilir.")
-                        p_map = process_user_aggregates(_agg_resp, st.session_state.get('presence_map'))
+                    if any(m in sel_mets_effective for m in p_keys) and is_agent:
+                        p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
                         for pk in ["tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue", "StaffedTime", "nNotResponding"]:
                             target_col = pk if pk != "StaffedTime" and pk != "nNotResponding" else ("col_staffed_time" if pk == "StaffedTime" else "nNotResponding")
                             fallback_series = df["Id"].apply(
@@ -1740,21 +1735,11 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                                 keep_existing = existing_numeric.notna() & (existing_numeric != 0)
                                 df[target_col] = existing_numeric.where(keep_existing, fallback_series)
                     
-                    if any(m in (sel_mets or []) for m in ["col_login", "col_logout", "col_staffed_time", "oEfficiency", "oOccupancy", "tBreak"]) and _is_user_report:
+                    if any(m in sel_mets_effective for m in ["col_login", "col_logout"]) and is_agent:
                         u_offset = utc_offset_hours
-                        _det_resp = api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys()))
-                        _det_warnings = _det_resp.get("_warnings") if isinstance(_det_resp, dict) else None
-                        if _det_warnings:
-                            st.warning(f"Login/Logout verileri alınırken {len(_det_warnings)} hata oluştu. Login/Logout bilgileri eksik olabilir.")
-                        d_map = process_user_details(_det_resp, utc_offset=u_offset, query_end=e_dt)
+                        d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), utc_offset=u_offset)
                         if "col_login" in sel_mets: df["col_login"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
                         if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
-                        # Only use login-to-logout StaffedTime as fallback if aggregate StaffedTime (tOnQueue+tOffQueue) is not available
-                        login_logout_staffed = df["Id"].apply(
-                            lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("StaffedTime", 0)
-                        )
-                        existing_staffed = pd.to_numeric(df.get("col_staffed_time", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
-                        df["col_staffed_time"] = existing_staffed.where(existing_staffed > 0, login_logout_staffed)
 
                     # Derived/custom metrics requested from report UI.
                     selected_metric_set = set(sel_mets or [])
@@ -1797,14 +1782,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         df["tBreak"] = sum(break_parts).round(2)
                     if "oEfficiency" in selected_metric_set:
                         handle_sum = _metric_series_or_zero("tHandle")
-                        staffed_sum = _metric_series_or_zero("col_staffed_time")
+                        staffed_sum = (
+                            _metric_series_or_zero("col_staffed_time")
+                            if "col_staffed_time" in df.columns
+                            else _metric_series_or_zero("tOnQueue")
+                        )
                         df["oEfficiency"] = (
-                            handle_sum.divide(staffed_sum.where(staffed_sum > 0), fill_value=0).fillna(0) * 100
-                        ).round(2)
-                    if "oOccupancy" in selected_metric_set:
-                        handle_sum = _metric_series_or_zero("tHandle")
-                        staffed_sum = _metric_series_or_zero("col_staffed_time")
-                        df["oOccupancy"] = (
                             handle_sum.divide(staffed_sum.where(staffed_sum > 0), fill_value=0).fillna(0) * 100
                         ).round(2)
                     if "tChatTalk" in selected_metric_set:
@@ -1840,14 +1823,6 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         df["oAnswerRate"] = (
                             answered_total.divide(inbound_total.where(inbound_total > 0), fill_value=0).fillna(0) * 100
                         ).round(2)
-
-                    # nOffered fallback for agent/detailed reports:
-                    # Genesys API may not return nOffered per userId; use nAlert as proxy.
-                    if "nOffered" in selected_metric_set and r_kind != "Workgroup":
-                        offered = _metric_series_or_zero("nOffered")
-                        alert = _metric_series_or_zero("nAlert")
-                        answered_abandon = _metric_series_or_zero("nAnswered") + _metric_series_or_zero("nAbandon")
-                        df["nOffered"] = offered.where(offered > 0, alert.where(alert > 0, answered_abandon)).clip(lower=0).round(0)
 
                     if do_fill and gran_opt[sel_gran] != "P1D": df = fill_interval_gaps(df, datetime.combine(sd, st_), datetime.combine(ed, et), gran_opt[sel_gran])
 

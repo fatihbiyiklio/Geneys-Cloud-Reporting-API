@@ -264,7 +264,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             df["AvgHandle"] = df.apply(lambda x: x["tHandle"] / x["CountHandle"] if x["CountHandle"] > 0 else 0, axis=1).round(2)
         if "tTalk" in df.columns:
             talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
-            talk_count = pd.to_numeric(df["nTalk"], errors="coerce").fillna(0) if "nTalk" in df.columns else pd.Series(0, index=df.index)
+            talk_count = pd.to_numeric(df.get("nTalk", 0), errors="coerce").fillna(0)
             if "nAnswered" in df.columns:
                 talk_count = talk_count.where(talk_count > 0, pd.to_numeric(df["nAnswered"], errors="coerce").fillna(0))
             if "nHandled" in df.columns:
@@ -282,9 +282,9 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             # Fallback: if only tTalk is available AND nOutbound > 0, use tTalk as approximation
             # (note: this may include inbound talk time if both directions exist in same row).
             outbound_count = pd.to_numeric(df["nOutbound"], errors="coerce").fillna(0)
-            contacting = pd.to_numeric(df["tContacting"], errors="coerce").fillna(0) if "tContacting" in df.columns else pd.Series(0, index=df.index)
-            dialing = pd.to_numeric(df["tDialing"], errors="coerce").fillna(0) if "tDialing" in df.columns else pd.Series(0, index=df.index)
-            connected = pd.to_numeric(df["tConnected"], errors="coerce").fillna(0) if "tConnected" in df.columns else pd.Series(0, index=df.index)
+            contacting = pd.to_numeric(df.get("tContacting", 0), errors="coerce").fillna(0)
+            dialing = pd.to_numeric(df.get("tDialing", 0), errors="coerce").fillna(0)
+            connected = pd.to_numeric(df.get("tConnected", 0), errors="coerce").fillna(0)
             outbound_duration = contacting + dialing + connected
             # If outbound-specific metrics are available, use them; otherwise fallback to tTalk
             if outbound_duration.gt(0).any():
@@ -293,7 +293,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
                 df["tOutbound"] = talk_sum.where(outbound_count > 0, 0).round(2)
 
-        helper_cols = ["nTalk", "nHandle", "nWait", "nAcd", "nAcw", "nHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
+        helper_cols = ["nTalk", "nAnswered", "nAbandon", "nHandle", "nWait", "nAcd", "nAcw", "nHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 
@@ -468,63 +468,6 @@ def process_observations(resp, id_map, presence_map=None):
 
     return list(data_map.values())
 
-def _resolve_presence_category(qualifier, presence_map):
-    """Resolve a qualifier ID/string to a standard presence category.
-    
-    Uses the systemPresence field from presence_map when available (most reliable),
-    then falls back to label-based string matching.
-    
-    Returns one of: 'on_queue', 'off_queue', 'available', 'busy', 'away',
-                     'meal', 'meeting', 'training', 'idle', 'offline', or None.
-    """
-    sys_presence = None
-    label = ""
-    
-    if presence_map and qualifier in presence_map:
-        p_info = presence_map[qualifier]
-        if isinstance(p_info, dict):
-            # Use systemPresence enum for reliable categorization
-            sys_presence = (p_info.get('systemPresence') or '').upper()
-            label = (p_info.get('label') or '').lower()
-        else:
-            label = str(p_info).lower()
-    else:
-        label = qualifier.lower()
-    
-    # Priority 1: systemPresence enum (most reliable, works regardless of language)
-    _SYS_MAP = {
-        "ON_QUEUE": "on_queue", "AVAILABLE": "available", "BUSY": "busy",
-        "AWAY": "away", "BREAK": "away", "MEAL": "meal", "MEETING": "meeting",
-        "TRAINING": "training", "IDLE": "idle", "OFFLINE": "offline",
-    }
-    if sys_presence and sys_presence in _SYS_MAP:
-        return _SYS_MAP[sys_presence]
-    
-    # Priority 2: Label/qualifier string matching (handles custom presences and raw qualifiers)
-    if "on_queue" in label or "on queue" in label or "onqueue" in label or "kuyrukta" in label or "havuz" in label:
-        return "on_queue"
-    if "off_queue" in label or "off queue" in label or "offqueue" in label:
-        return "off_queue"
-    if "meal" in label or "yemek" in label:
-        return "meal"
-    if "meeting" in label or "toplantı" in label:
-        return "meeting"
-    if "training" in label or "eğitim" in label:
-        return "training"
-    if "available" in label or "hazır" in label:
-        return "available"
-    if "busy" in label or "meşgul" in label:
-        return "busy"
-    if "away" in label or "uzakta" in label or "break" in label or "mola" in label:
-        return "away"
-    if "idle" in label or "boşta" in label:
-        return "idle"
-    if "offline" in label or "çevrimdışı" in label:
-        return "offline"
-    
-    return None
-
-
 def process_user_aggregates(resp, presence_map=None):
     """Processes user status aggregates into a dictionary of metric durations."""
     results = {}
@@ -535,10 +478,9 @@ def process_user_aggregates(resp, presence_map=None):
         user_id = result.get('group', {}).get('userId')
         user_data = {
             "tMeal": 0, "tMeeting": 0, "tAvailable": 0, "tBusy": 0, 
-            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "tOffQueue": 0, "StaffedTime": 0,
+            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "StaffedTime": 0,
             "nNotResponding": 0
         }
-        has_routing_status = False
         
         data_list = result.get('data', [])
         for d in data_list:
@@ -547,66 +489,72 @@ def process_user_aggregates(resp, presence_map=None):
                 m_name = m_obj.get('metric')
                 stats = m_obj.get('stats', {})
                 duration = stats.get('sum', 0) / 1000 # Convert to seconds
+                
                 qualifier = m_obj.get('qualifier', '')
                 
-                category = _resolve_presence_category(qualifier, presence_map)
+                # Map qualifier to standard name
+                if presence_map and qualifier in presence_map:
+                    p_info = presence_map[qualifier]
+                    mapped = (p_info['label'] if isinstance(p_info, dict) else p_info).lower()
+                else:
+                    mapped = qualifier.lower()
+                
+                # Use only tOrganizationPresence for presence duration metrics to avoid
+                # double counting. tSystemPresence and tOrganizationPresence cover overlapping
+                # time ranges; summing both would inflate all presence durations.
+                # tOrganizationPresence is more granular (custom presence definitions).
+                if m_name == "tSystemPresence":
+                    # Only use tOnQueue from system presence since it's a routing metric
+                    # not typically available in organization presence.
+                    if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped:
+                        user_data["tOnQueue"] += duration
+                    continue
+                
+                # Map to our columns (tOrganizationPresence only)
+                # Handle English, Turkish, and System Enum formats
+                
+                # On Queue matching
+                if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped: 
+                    user_data["tOnQueue"] += duration
+                
+                # Meal matching
+                elif "meal" in mapped or "yemek" in mapped: 
+                    user_data["tMeal"] += duration
+                
+                # Meeting matching
+                elif "meeting" in mapped or "toplantı" in mapped: 
+                    user_data["tMeeting"] += duration
+                
+                # Training matching
+                elif "training" in mapped or "eğitim" in mapped: 
+                    user_data["tTraining"] += duration
+                
+                # Available/Ready matching
+                elif "available" in mapped or "hazır" in mapped: 
+                    user_data["tAvailable"] += duration
+                
+                # Busy matching
+                elif "busy" in mapped or "meşgul" in mapped: 
+                    user_data["tBusy"] += duration
+                
+                # Away matching
+                elif "away" in mapped or "uzakta" in mapped: 
+                    user_data["tAway"] += duration
                 
                 if m_name == "tNotResponding":
                     user_data["nNotResponding"] += stats.get('count', 0)
-                    continue
-                
-                if m_name == "tRoutingStatus":
-                    # Routing status: ON_QUEUE or OFF_QUEUE (most accurate for staffed time)
-                    has_routing_status = True
-                    if category == "on_queue":
-                        user_data["tOnQueue"] += duration
-                    elif category == "off_queue":
-                        user_data["tOffQueue"] += duration
-                    continue
 
-                if m_name == "tSystemPresence":
-                    # Use tSystemPresence ON_QUEUE as fallback for tOnQueue
-                    if category == "on_queue":
-                        # Will be overridden by tRoutingStatus if available
-                        if not has_routing_status:
-                            user_data["tOnQueue"] += duration
-                    continue
-                
-                # tOrganizationPresence: Map to individual presence duration buckets
-                if m_name == "tOrganizationPresence":
-                    if category == "on_queue":
-                        pass  # Already handled by tSystemPresence/tRoutingStatus
-                    elif category == "meal":
-                        user_data["tMeal"] += duration
-                    elif category == "meeting":
-                        user_data["tMeeting"] += duration
-                    elif category == "training":
-                        user_data["tTraining"] += duration
-                    elif category == "available":
-                        user_data["tAvailable"] += duration
-                    elif category == "busy":
-                        user_data["tBusy"] += duration
-                    elif category == "away":
-                        user_data["tAway"] += duration
-                    
-                    # StaffedTime = all non-offline organization presence time
-                    if category != "offline":
-                        user_data["StaffedTime"] += duration
+                # Staffed time: Use only tOrganizationPresence to avoid double counting.
+                # tSystemPresence and tOrganizationPresence cover overlapping time ranges;
+                # summing both would inflate StaffedTime (and derived metrics like oEfficiency, tBreak).
+                if m_name == "tOrganizationPresence" and "offline" not in mapped:
+                    user_data["StaffedTime"] += duration
         
-        # Prefer routing-status based StaffedTime (tOnQueue + tOffQueue) when available
-        routing_staffed = user_data["tOnQueue"] + user_data["tOffQueue"]
-        if routing_staffed > 0:
-            user_data["StaffedTime"] = routing_staffed
         results[user_id] = user_data
     return results
 
-def process_user_details(resp, utc_offset=3, query_end=None):
-    """Processes user details to find first login, last logout and staffed duration.
-    
-    Args:
-        query_end: UTC datetime marking the end of the queried interval.
-                   Used to cap StaffedTime for still-logged-in users instead of using now().
-    """
+def process_user_details(resp, utc_offset=3):
+    """Processes user details to find first login and last logout of the period."""
     results = {}
     if not resp or 'userDetails' not in resp:
         return results
@@ -625,28 +573,7 @@ def process_user_details(resp, utc_offset=3, query_end=None):
             first_login_utc = active_presences[0].get('startTime')
             last_logout_utc = active_presences[-1].get('endTime')
             
-            # Calculate StaffedTime as Login-to-Logout duration in seconds
-            staffed_seconds = 0
-            try:
-                if first_login_utc and last_logout_utc:
-                    login_dt = datetime.fromisoformat(first_login_utc.replace('Z', '+00:00'))
-                    logout_dt = datetime.fromisoformat(last_logout_utc.replace('Z', '+00:00'))
-                    staffed_seconds = max(0, (logout_dt - login_dt).total_seconds())
-                elif first_login_utc:
-                    # Still logged in — use query_end or current time as end
-                    login_dt = datetime.fromisoformat(first_login_utc.replace('Z', '+00:00'))
-                    from datetime import timezone as tz
-                    now_utc = datetime.now(tz.utc)
-                    # For historical queries, cap at query end time to avoid inflating with current time
-                    cap_dt = query_end if query_end else now_utc
-                    if cap_dt.tzinfo is None:
-                        cap_dt = cap_dt.replace(tzinfo=tz.utc)
-                    end_cap = min(now_utc, cap_dt)
-                    staffed_seconds = max(0, (end_cap - login_dt).total_seconds())
-            except Exception:
-                staffed_seconds = 0
-
-            # Format and adjust to UTC+offset
+            # Format and adjust to UTC+3
             from datetime import timedelta
             def format_utc_to_local(utc_str):
                 if not utc_str: return "N/A"
@@ -659,11 +586,10 @@ def process_user_details(resp, utc_offset=3, query_end=None):
             
             results[user_id] = {
                 "Login": format_utc_to_local(first_login_utc),
-                "Logout": format_utc_to_local(last_logout_utc),
-                "StaffedTime": staffed_seconds,
+                "Logout": format_utc_to_local(last_logout_utc)
             }
         else:
-            results[user_id] = {"Login": "N/A", "Logout": "N/A", "StaffedTime": 0}
+            results[user_id] = {"Login": "N/A", "Logout": "N/A"}
             
     return results
 
