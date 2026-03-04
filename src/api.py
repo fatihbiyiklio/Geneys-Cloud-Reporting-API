@@ -2,13 +2,33 @@ import copy
 import time
 import random
 import re
+import os
+import sys
 import requests
 from datetime import datetime, timezone, timedelta
 from src.monitor import monitor
 
+def _resolve_ca_bundle():
+    """Resolve CA bundle path for frozen (PyInstaller) environments."""
+    try:
+        import certifi
+        ca_path = certifi.where()
+        if os.path.isfile(ca_path):
+            return ca_path
+    except Exception:
+        pass
+    # Frozen app: certifi may point to invalid temp path; use system default
+    if getattr(sys, "frozen", False):
+        # Let requests use default system CA store
+        return True
+    return None
+
 # Shared session for connection pooling (reduces Windows socket/handle overhead)
 _session = requests.Session()
 _session.headers.update({"Content-Type": "application/json"})
+_ca_bundle = _resolve_ca_bundle()
+if _ca_bundle is not None:
+    _session.verify = _ca_bundle
 
 class GenesysAPI:
     ASSIGNMENT_BATCH_SIZE = 50

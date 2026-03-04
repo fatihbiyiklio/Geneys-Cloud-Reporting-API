@@ -264,7 +264,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             df["AvgHandle"] = df.apply(lambda x: x["tHandle"] / x["CountHandle"] if x["CountHandle"] > 0 else 0, axis=1).round(2)
         if "tTalk" in df.columns:
             talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
-            talk_count = pd.to_numeric(df.get("nTalk", 0), errors="coerce").fillna(0)
+            talk_count = pd.to_numeric(df["nTalk"], errors="coerce").fillna(0) if "nTalk" in df.columns else pd.Series(0, index=df.index)
             if "nAnswered" in df.columns:
                 talk_count = talk_count.where(talk_count > 0, pd.to_numeric(df["nAnswered"], errors="coerce").fillna(0))
             if "nHandled" in df.columns:
@@ -282,9 +282,9 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
             # Fallback: if only tTalk is available AND nOutbound > 0, use tTalk as approximation
             # (note: this may include inbound talk time if both directions exist in same row).
             outbound_count = pd.to_numeric(df["nOutbound"], errors="coerce").fillna(0)
-            contacting = pd.to_numeric(df.get("tContacting", 0), errors="coerce").fillna(0)
-            dialing = pd.to_numeric(df.get("tDialing", 0), errors="coerce").fillna(0)
-            connected = pd.to_numeric(df.get("tConnected", 0), errors="coerce").fillna(0)
+            contacting = pd.to_numeric(df["tContacting"], errors="coerce").fillna(0) if "tContacting" in df.columns else pd.Series(0, index=df.index)
+            dialing = pd.to_numeric(df["tDialing"], errors="coerce").fillna(0) if "tDialing" in df.columns else pd.Series(0, index=df.index)
+            connected = pd.to_numeric(df["tConnected"], errors="coerce").fillna(0) if "tConnected" in df.columns else pd.Series(0, index=df.index)
             outbound_duration = contacting + dialing + connected
             # If outbound-specific metrics are available, use them; otherwise fallback to tTalk
             if outbound_duration.gt(0).any():

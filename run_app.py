@@ -69,6 +69,46 @@ def resolve_path(path):
 
     return os.path.join(base_path, path)
 
+
+def _fix_ca_bundle_env():
+    """Fix TLS CA bundle path for frozen (PyInstaller) environments.
+
+    PyInstaller may bundle certifi with a cacert.pem path that becomes
+    invalid after extraction, causing 'Could not find a suitable TLS CA
+    certificate bundle' errors. This sets REQUESTS_CA_BUNDLE to a valid
+    path before any requests are made.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    # If already set and valid, skip
+    existing = os.environ.get("REQUESTS_CA_BUNDLE", "").strip()
+    if existing and os.path.isfile(existing):
+        return
+    # Try certifi package first
+    try:
+        import certifi
+        ca_path = certifi.where()
+        if os.path.isfile(ca_path):
+            os.environ["REQUESTS_CA_BUNDLE"] = ca_path
+            return
+    except Exception:
+        pass
+    # Search common system CA locations on Windows
+    for candidate in [
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl-ca-bundle.crt"),
+        os.path.join(APP_HOME_DIR, "cacert.pem"),
+        os.path.join(APP_HOME_DIR, "certifi", "cacert.pem"),
+    ]:
+        if os.path.isfile(candidate):
+            os.environ["REQUESTS_CA_BUNDLE"] = candidate
+            return
+    # Clear invalid path so requests falls back to system default
+    os.environ.pop("REQUESTS_CA_BUNDLE", None)
+    os.environ.pop("CURL_CA_BUNDLE", None)
+
+
+_fix_ca_bundle_env()
+
 PID_FILE = os.path.join(APP_HOME_DIR, ".app.pid")
 LOCK_FILE = os.path.join(APP_HOME_DIR, ".app.lock")
 CHILD_FLAG = "--streamlit-child"
