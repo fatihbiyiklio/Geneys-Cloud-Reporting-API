@@ -293,7 +293,7 @@ def process_analytics_response(response, lookup_map, report_type, queue_map=None
                 talk_sum = pd.to_numeric(df["tTalk"], errors="coerce").fillna(0)
                 df["tOutbound"] = talk_sum.where(outbound_count > 0, 0).round(2)
 
-        helper_cols = ["nTalk", "nAnswered", "nAbandon", "nHandle", "nWait", "nAcd", "nAcw", "nHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
+        helper_cols = ["nTalk", "nHandle", "nWait", "nAcd", "nAcw", "nHeld", "CountHandle", "_oServiceLevelNumerator", "_oServiceLevelDenominator", "_tTalkMax"]
         cols_to_drop = [c for c in helper_cols if c in df.columns]
         if cols_to_drop: df = df.drop(columns=cols_to_drop)
 

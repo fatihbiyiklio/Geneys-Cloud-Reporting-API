@@ -1824,6 +1824,14 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                             answered_total.divide(inbound_total.where(inbound_total > 0), fill_value=0).fillna(0) * 100
                         ).round(2)
 
+                    # nOffered fallback for agent/detailed reports:
+                    # Genesys API may not return nOffered per userId; use nAlert as proxy.
+                    if "nOffered" in selected_metric_set and r_kind != "Workgroup":
+                        offered = _metric_series_or_zero("nOffered")
+                        alert = _metric_series_or_zero("nAlert")
+                        answered_abandon = _metric_series_or_zero("nAnswered") + _metric_series_or_zero("nAbandon")
+                        df["nOffered"] = offered.where(offered > 0, alert.where(alert > 0, answered_abandon)).clip(lower=0).round(0)
+
                     if do_fill and gran_opt[sel_gran] != "P1D": df = fill_interval_gaps(df, datetime.combine(sd, st_), datetime.combine(ed, et), gran_opt[sel_gran])
 
                     if is_dnis_skill_detailed and r_kind == "Detailed":
