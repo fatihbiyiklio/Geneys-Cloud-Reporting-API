@@ -478,7 +478,7 @@ def process_user_aggregates(resp, presence_map=None):
         user_id = result.get('group', {}).get('userId')
         user_data = {
             "tMeal": 0, "tMeeting": 0, "tAvailable": 0, "tBusy": 0, 
-            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "StaffedTime": 0,
+            "tAway": 0, "tTraining": 0, "tOnQueue": 0, "tOffQueue": 0, "StaffedTime": 0,
             "nNotResponding": 0
         }
         
@@ -503,11 +503,19 @@ def process_user_aggregates(resp, presence_map=None):
                 # double counting. tSystemPresence and tOrganizationPresence cover overlapping
                 # time ranges; summing both would inflate all presence durations.
                 # tOrganizationPresence is more granular (custom presence definitions).
-                if m_name == "tSystemPresence":
-                    # Only use tOnQueue from system presence since it's a routing metric
-                    # not typically available in organization presence.
+                if m_name == "tRoutingStatus":
+                    # Routing status: ON_QUEUE or OFF_QUEUE
                     if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped:
                         user_data["tOnQueue"] += duration
+                    elif "off_queue" in mapped or "off queue" in mapped or "offqueue" in mapped:
+                        user_data["tOffQueue"] += duration
+                    continue
+
+                if m_name == "tSystemPresence":
+                    # Only use tOnQueue from system presence as fallback if tRoutingStatus not available
+                    if "on_queue" in mapped or "on queue" in mapped or "onqueue" in mapped:
+                        # Only add if tRoutingStatus didn't already set it
+                        pass
                     continue
                 
                 # Map to our columns (tOrganizationPresence only)
@@ -550,11 +558,20 @@ def process_user_aggregates(resp, presence_map=None):
                 if m_name == "tOrganizationPresence" and "offline" not in mapped:
                     user_data["StaffedTime"] += duration
         
+        # Prefer routing-status based StaffedTime (tOnQueue + tOffQueue) when available
+        routing_staffed = user_data["tOnQueue"] + user_data["tOffQueue"]
+        if routing_staffed > 0:
+            user_data["StaffedTime"] = routing_staffed
         results[user_id] = user_data
     return results
 
-def process_user_details(resp, utc_offset=3):
-    """Processes user details to find first login, last logout and staffed duration."""
+def process_user_details(resp, utc_offset=3, query_end=None):
+    """Processes user details to find first login, last logout and staffed duration.
+    
+    Args:
+        query_end: UTC datetime marking the end of the queried interval.
+                   Used to cap StaffedTime for still-logged-in users instead of using now().
+    """
     results = {}
     if not resp or 'userDetails' not in resp:
         return results
@@ -581,11 +598,16 @@ def process_user_details(resp, utc_offset=3):
                     logout_dt = datetime.fromisoformat(last_logout_utc.replace('Z', '+00:00'))
                     staffed_seconds = max(0, (logout_dt - login_dt).total_seconds())
                 elif first_login_utc:
-                    # Still logged in — use current time as end
+                    # Still logged in — use query_end or current time as end
                     login_dt = datetime.fromisoformat(first_login_utc.replace('Z', '+00:00'))
                     from datetime import timezone as tz
                     now_utc = datetime.now(tz.utc)
-                    staffed_seconds = max(0, (now_utc - login_dt).total_seconds())
+                    # For historical queries, cap at query end time to avoid inflating with current time
+                    cap_dt = query_end if query_end else now_utc
+                    if cap_dt.tzinfo is None:
+                        cap_dt = cap_dt.replace(tzinfo=tz.utc)
+                    end_cap = min(now_utc, cap_dt)
+                    staffed_seconds = max(0, (end_cap - login_dt).total_seconds())
             except Exception:
                 staffed_seconds = 0
 

@@ -1481,7 +1481,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 # Queue aggregate endpoint does not return agent presence/login-style metrics.
                 queue_incompatible_metrics = {
                     "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining", "tOnQueue",
-                    "tBreak", "oEfficiency",
+                    "tBreak", "oEfficiency", "oOccupancy",
                     "col_staffed_time", "col_login", "col_logout",
                 }
                 dropped_queue_metrics = [m for m in sel_mets_effective if m in queue_incompatible_metrics]
@@ -1719,7 +1719,7 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                 if not df.empty:
                     p_keys = [
                         "tMeal", "tMeeting", "tAvailable", "tBusy", "tAway", "tTraining",
-                        "tOnQueue", "tBreak", "oEfficiency", "col_staffed_time", "nNotResponding",
+                        "tOnQueue", "tBreak", "oEfficiency", "oOccupancy", "col_staffed_time", "nNotResponding",
                     ]
                     if any(m in sel_mets_effective for m in p_keys) and is_agent:
                         p_map = process_user_aggregates(api.get_user_aggregates(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), st.session_state.get('presence_map'))
@@ -1735,16 +1735,17 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                                 keep_existing = existing_numeric.notna() & (existing_numeric != 0)
                                 df[target_col] = existing_numeric.where(keep_existing, fallback_series)
                     
-                    if any(m in sel_mets_effective for m in ["col_login", "col_logout", "col_staffed_time", "oEfficiency", "tBreak"]) and is_agent:
+                    if any(m in sel_mets_effective for m in ["col_login", "col_logout", "col_staffed_time", "oEfficiency", "oOccupancy", "tBreak"]) and is_agent:
                         u_offset = utc_offset_hours
-                        d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), utc_offset=u_offset)
+                        d_map = process_user_details(api.get_user_status_details(s_dt, e_dt, sel_ids or list(st.session_state.users_info.keys())), utc_offset=u_offset, query_end=e_dt)
                         if "col_login" in sel_mets: df["col_login"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Login", "N/A"))
                         if "col_logout" in sel_mets: df["col_logout"] = df["Id"].apply(lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("Logout", "N/A"))
-                        # Use login-to-logout duration as StaffedTime (no fallback — 0 if unavailable)
+                        # Only use login-to-logout StaffedTime as fallback if aggregate StaffedTime (tOnQueue+tOffQueue) is not available
                         login_logout_staffed = df["Id"].apply(
                             lambda x: d_map.get(x.split('|')[0] if '|' in x else x, {}).get("StaffedTime", 0)
                         )
-                        df["col_staffed_time"] = login_logout_staffed
+                        existing_staffed = pd.to_numeric(df.get("col_staffed_time", pd.Series(0, index=df.index)), errors="coerce").fillna(0)
+                        df["col_staffed_time"] = existing_staffed.where(existing_staffed > 0, login_logout_staffed)
 
                     # Derived/custom metrics requested from report UI.
                     selected_metric_set = set(sel_mets or [])
@@ -1789,6 +1790,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
                         handle_sum = _metric_series_or_zero("tHandle")
                         staffed_sum = _metric_series_or_zero("col_staffed_time")
                         df["oEfficiency"] = (
+                            handle_sum.divide(staffed_sum.where(staffed_sum > 0), fill_value=0).fillna(0) * 100
+                        ).round(2)
+                    if "oOccupancy" in selected_metric_set:
+                        handle_sum = _metric_series_or_zero("tHandle")
+                        staffed_sum = _metric_series_or_zero("col_staffed_time")
+                        df["oOccupancy"] = (
                             handle_sum.divide(staffed_sum.where(staffed_sum > 0), fill_value=0).fillna(0) * 100
                         ).round(2)
                     if "tChatTalk" in selected_metric_set:

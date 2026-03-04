@@ -4131,7 +4131,7 @@ class GenesysAPI:
                     "interval": interval,
                     "groupBy": ["userId"],
                     "filter": {"type": "or", "predicates": predicates},
-                    "metrics": ["tSystemPresence", "tOrganizationPresence"]
+                    "metrics": ["tSystemPresence", "tOrganizationPresence", "tRoutingStatus"]
                 }
                 try:
                     data = self._post("/api/v2/analytics/users/aggregates/query", query)
