@@ -298,6 +298,9 @@ def _format_report_datetime_columns(df):
         return df
     out = df.copy()
     for col in out.columns:
+        col_name = str(col or "").strip().lower()
+        if "login" in col_name or "logout" in col_name:
+            continue
         series = out[col]
         if not _is_datetime_like_column(col, series):
             continue

@@ -559,38 +559,65 @@ def process_user_details(resp, utc_offset=3):
     if not resp or 'userDetails' not in resp:
         return results
 
+    def parse_utc(utc_str):
+        if not utc_str:
+            return None
+        try:
+            normalized = str(utc_str).replace('Z', '+00:00')
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            return dt
+        except Exception:
+            return None
+
+    def format_local_time(dt_obj):
+        if not dt_obj:
+            return "N/A"
+        try:
+            dt_local = dt_obj + timedelta(hours=utc_offset)
+            return dt_local.strftime("%H:%M:%S")
+        except Exception:
+            return "N/A"
+
+    merged = {}
     for user in resp['userDetails']:
         user_id = user.get('userId')
-        primary_presences = user.get('primaryPresence', [])
-        
-        # Filter out offline status
-        active_presences = [p for p in primary_presences if p.get('systemPresence', '').lower() != 'offline']
-        
-        if active_presences:
-            # Sort by start time
-            active_presences.sort(key=lambda x: x.get('startTime', ''))
-            
-            first_login_utc = active_presences[0].get('startTime')
-            last_logout_utc = active_presences[-1].get('endTime')
-            
-            # Format and adjust to UTC+3
-            from datetime import timedelta
-            def format_utc_to_local(utc_str):
-                if not utc_str: return "N/A"
-                try:
-                    dt = datetime.fromisoformat(utc_str.replace('Z', ''))
-                    dt_local = dt + timedelta(hours=utc_offset)
-                    return dt_local.strftime("%H:%M:%S")
-                except:
-                    return "N/A"
-            
+        if not user_id:
+            continue
+
+        if user_id not in merged:
+            merged[user_id] = {"login": None, "logout": None, "seen": False}
+
+        primary_presences = user.get('primaryPresence', []) or []
+        active_presences = [
+            p for p in primary_presences
+            if str(p.get('systemPresence', '') or '').lower() != 'offline'
+        ]
+        if not active_presences:
+            continue
+
+        merged[user_id]["seen"] = True
+        for presence in active_presences:
+            start_dt = parse_utc(presence.get('startTime'))
+            end_dt = parse_utc(presence.get('endTime'))
+
+            if start_dt is not None:
+                if merged[user_id]["login"] is None or start_dt < merged[user_id]["login"]:
+                    merged[user_id]["login"] = start_dt
+            if end_dt is not None:
+                if merged[user_id]["logout"] is None or end_dt > merged[user_id]["logout"]:
+                    merged[user_id]["logout"] = end_dt
+
+    for user_id, values in merged.items():
+        if values.get("seen"):
             results[user_id] = {
-                "Login": format_utc_to_local(first_login_utc),
-                "Logout": format_utc_to_local(last_logout_utc)
+                "Login": format_local_time(values.get("login")),
+                "Logout": format_local_time(values.get("logout")),
             }
         else:
             results[user_id] = {"Login": "N/A", "Logout": "N/A"}
-            
+
     return results
 
 def process_conversation_details(response, user_map=None, queue_map=None, wrapup_map=None, include_attributes=False, utc_offset=3, skill_map=None, language_map=None):

@@ -4297,11 +4297,53 @@ class GenesysAPI:
                 warnings.append(f"User details skipped: {invalid_count} invalid userId")
             return {"userDetails": [], "_warnings": warnings}
 
-        BATCH_SIZE = 25
+        # Keep batch conservative: some orgs/endpoints behave inconsistently on large OR-predicate user filters.
+        BATCH_SIZE = 20
         combined_details = []
         _warnings = []
         if invalid_count > 0:
             _warnings.append(f"User details skipped: {invalid_count} invalid userId")
+
+        def _query_user_details(interval_value, user_batch, page_size=100, max_pages=50):
+            """Run details query for a batch and return collected userDetails rows."""
+            collected = []
+            page = 1
+            while True:
+                query = {
+                    "interval": interval_value,
+                    "userFilters": [
+                        {
+                            "type": "or",
+                            "predicates": [
+                                {
+                                    "type": "dimension",
+                                    "dimension": "userId",
+                                    "operator": "matches",
+                                    "value": uid,
+                                }
+                                for uid in user_batch
+                            ],
+                        }
+                    ],
+                    "paging": {"pageSize": page_size, "pageNumber": page},
+                }
+
+                data = self._post(
+                    "/api/v2/analytics/users/details/query",
+                    query,
+                    timeout=30,
+                    retries=1,
+                    retry_sleep=2,
+                )
+                rows = data.get("userDetails") or []
+                if rows:
+                    collected.extend(rows)
+                if not rows or len(rows) < page_size:
+                    break
+                page += 1
+                if page > max_pages:
+                    break
+            return collected
         
         # Chunk by 7 days for Details queries
         chunk_days = 7
@@ -4314,25 +4356,34 @@ class GenesysAPI:
                 batch = cleaned_ids[i:i + BATCH_SIZE]
                 
                 try:
-                    page = 1
-                    while True:
-                        query = {
-                            "interval": interval,
-                            "userFilters": [
-                                {"type": "or", "predicates": [{"type": "dimension", "dimension": "userId", "operator": "matches", "value": uid} for uid in batch]}
-                            ],
-                            "paging": {"pageSize": 100, "pageNumber": page}
-                        }
-                        
-                        data = self._post("/api/v2/analytics/users/details/query", query, timeout=30, retries=1, retry_sleep=2)
-                        
-                        if data and 'userDetails' in data:
-                            combined_details.extend(data['userDetails'])
-                            if len(data['userDetails']) < 100: break
-                            page += 1
-                            if page > 50: break # Safety limit
-                        else:
-                            break
+                    batch_rows = _query_user_details(interval, batch, page_size=100, max_pages=50)
+                    if batch_rows:
+                        combined_details.extend(batch_rows)
+
+                    returned_user_ids = {
+                        str((row or {}).get("userId") or "").strip()
+                        for row in (batch_rows or [])
+                        if isinstance(row, dict)
+                    }
+                    missing_ids = [uid for uid in batch if uid not in returned_user_ids]
+
+                    # Fallback: if batch response omitted requested users, query those users one by one.
+                    # This protects against silent predicate-limit behavior on some tenants.
+                    if missing_ids:
+                        _warnings.append(
+                            f"User details batch partial ({len(batch) - len(missing_ids)}/{len(batch)}) interval={interval}; single-user fallback for {len(missing_ids)} user(s)."
+                        )
+                        for uid in missing_ids:
+                            try:
+                                single_rows = _query_user_details(interval, [uid], page_size=100, max_pages=50)
+                                if single_rows:
+                                    combined_details.extend(single_rows)
+                            except Exception as single_e:
+                                monitor.log_error(
+                                    "API_POST",
+                                    f"Error details single-user fallback uid={uid} interval={interval}: {single_e}",
+                                )
+                                _warnings.append(f"User details fallback failed for {uid}: {single_e}")
                 except Exception as e:
                     monitor.log_error("API_POST", f"Error details batch {i} interval {interval}: {e}")
                     _warnings.append(f"User details batch {i} failed: {e}")
