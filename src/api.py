@@ -875,6 +875,162 @@ class GenesysAPI:
 
         return list(queues_by_id.values())
 
+    # --- OUTBOUND DIALER ---
+    def get_outbound_campaigns(self, page_size=100, max_pages=20):
+        """List outbound campaigns (per Genesys Cloud /api/v2/outbound/campaigns)."""
+        campaigns = []
+        page_number = 1
+        while page_number <= max_pages:
+            data = self._get(
+                "/api/v2/outbound/campaigns",
+                params={"pageNumber": page_number, "pageSize": page_size},
+            )
+            entities = data.get("entities") if isinstance(data, dict) else []
+            if not entities:
+                break
+            campaigns.extend(entities)
+            if not data.get("nextUri"):
+                break
+            page_number += 1
+        return campaigns
+
+    def get_outbound_campaign(self, campaign_id):
+        campaign_id = str(campaign_id or "").strip()
+        if not campaign_id:
+            raise ValueError("campaign_id is required")
+        return self._get(f"/api/v2/outbound/campaigns/{campaign_id}")
+
+    def create_outbound_campaign(self, payload):
+        payload = payload or {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        return self._post("/api/v2/outbound/campaigns", payload)
+
+    def update_outbound_campaign(self, campaign_id, payload):
+        campaign_id = str(campaign_id or "").strip()
+        if not campaign_id:
+            raise ValueError("campaign_id is required")
+        payload = payload or {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        try:
+            return self._put(f"/api/v2/outbound/campaigns/{campaign_id}", payload)
+        except Exception as e:
+            if self._is_http_status(e, 405):
+                return self._patch(f"/api/v2/outbound/campaigns/{campaign_id}", payload)
+            raise
+
+    def start_outbound_campaign(self, campaign_id):
+        campaign_id = str(campaign_id or "").strip()
+        if not campaign_id:
+            raise ValueError("campaign_id is required")
+        return self._post(f"/api/v2/outbound/campaigns/{campaign_id}/start", data={})
+
+    def stop_outbound_campaign(self, campaign_id):
+        campaign_id = str(campaign_id or "").strip()
+        if not campaign_id:
+            raise ValueError("campaign_id is required")
+        return self._post(f"/api/v2/outbound/campaigns/{campaign_id}/stop", data={})
+
+    def get_outbound_contact_lists(self, page_size=100, max_pages=20):
+        """List outbound contact lists (per Genesys Cloud /api/v2/outbound/contactlists)."""
+        contact_lists = []
+        page_number = 1
+        while page_number <= max_pages:
+            data = self._get(
+                "/api/v2/outbound/contactlists",
+                params={"pageNumber": page_number, "pageSize": page_size},
+            )
+            entities = data.get("entities") if isinstance(data, dict) else []
+            if not entities:
+                break
+            contact_lists.extend(entities)
+            if not data.get("nextUri"):
+                break
+            page_number += 1
+        return contact_lists
+
+    def get_outbound_contact_list(self, contact_list_id):
+        contact_list_id = str(contact_list_id or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        return self._get(f"/api/v2/outbound/contactlists/{contact_list_id}")
+
+    def create_outbound_contact_list(self, payload):
+        payload = payload or {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        return self._post("/api/v2/outbound/contactlists", payload)
+
+    def update_outbound_contact_list(self, contact_list_id, payload):
+        contact_list_id = str(contact_list_id or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        payload = payload or {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        try:
+            return self._put(f"/api/v2/outbound/contactlists/{contact_list_id}", payload)
+        except Exception as e:
+            if self._is_http_status(e, 405):
+                return self._patch(f"/api/v2/outbound/contactlists/{contact_list_id}", payload)
+            raise
+
+    def add_contacts_to_outbound_contact_list(self, contact_list_id, contacts, priority=False, clear_system_data=False):
+        """Bulk upload contacts to an outbound contact list.
+
+        Genesys deployments may accept different envelope keys; use fallbacks.
+        """
+        contact_list_id = str(contact_list_id or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        if not isinstance(contacts, list) or not contacts:
+            raise ValueError("contacts must be a non-empty list")
+
+        base_path = f"/api/v2/outbound/contactlists/{contact_list_id}/contacts"
+        params = {
+            "priority": str(bool(priority)).lower(),
+            "clearSystemData": str(bool(clear_system_data)).lower(),
+        }
+        payload_candidates = [
+            {"contacts": contacts},
+            {"data": contacts},
+            contacts,
+        ]
+
+        last_error = None
+        for payload in payload_candidates:
+            try:
+                return self._post(base_path, data=payload, timeout=30, retries=1, params=params)
+            except Exception as e:
+                last_error = e
+                continue
+
+        if last_error:
+            raise last_error
+        return {"status": "unknown"}
+
+    def get_outbound_campaign_progress(self, campaign_id=None):
+        """Fetch outbound campaign progress.
+
+        Tries collection and per-campaign endpoints for compatibility.
+        """
+        if campaign_id:
+            cid = str(campaign_id).strip()
+            if not cid:
+                raise ValueError("campaign_id is invalid")
+            try:
+                return self._get(f"/api/v2/outbound/campaigns/{cid}/progress")
+            except Exception:
+                all_progress = self._get("/api/v2/outbound/campaigns/progress")
+                entities = all_progress.get("entities") if isinstance(all_progress, dict) else []
+                for item in entities or []:
+                    if str(item.get("campaign", {}).get("id") or item.get("campaignId") or "").strip() == cid:
+                        return item
+                return {}
+
+        return self._get("/api/v2/outbound/campaigns/progress")
+
     def get_queue_wrapup_timeout(self, queue_id):
         """Fetch wrap-up timeout (seconds) for a single queue."""
         qid = str(queue_id or "").strip()

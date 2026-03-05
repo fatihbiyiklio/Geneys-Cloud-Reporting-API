@@ -5,6 +5,7 @@ from .pages import (
     render_org_settings_page,
     render_admin_panel_page,
     render_dashboard_page,
+    render_dialer_page,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "render_org_settings_page",
     "render_admin_panel_page",
     "render_dashboard_page",
+    "render_dialer_page",
 ]

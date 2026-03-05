@@ -4,6 +4,7 @@ from .users import render_users_page
 from .org_settings import render_org_settings_page
 from .admin_panel import render_admin_panel_page
 from .dashboard import render_dashboard_page
+from .dialer import render_dialer_page
 
 __all__ = [
     "render_metrics_guide_page",
@@ -12,4 +13,5 @@ __all__ = [
     "render_org_settings_page",
     "render_admin_panel_page",
     "render_dashboard_page",
+    "render_dialer_page",
 ]

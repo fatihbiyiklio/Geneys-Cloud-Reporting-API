@@ -7,6 +7,7 @@ from src.app.pages import (
     render_org_settings_page,
     render_admin_panel_page,
     render_dashboard_page,
+    render_dialer_page,
 )
 
 
@@ -42,4 +43,8 @@ def render_page(context: Mapping[str, Any]) -> None:
 
     if page == get_text(lang, "menu_dashboard"):
         render_dashboard_page(dict(context))
+        return
+
+    if page == get_text(lang, "menu_dialer"):
+        render_dialer_page(dict(context))
         return

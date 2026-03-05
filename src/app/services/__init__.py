@@ -4,6 +4,7 @@ from .users_service import render_users_service
 from .org_settings_service import render_org_settings_service
 from .admin_panel_service import render_admin_panel_service
 from .dashboard_service import render_dashboard_service
+from .dialer_service import render_dialer_service
 
 __all__ = [
     "render_metrics_guide_service",
@@ -12,4 +13,5 @@ __all__ = [
     "render_org_settings_service",
     "render_admin_panel_service",
     "render_dashboard_service",
+    "render_dialer_service",
 ]

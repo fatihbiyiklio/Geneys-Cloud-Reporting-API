@@ -668,6 +668,55 @@ st.markdown("""
         color: #1e293b;
         font-weight: 700;
     }
+
+    .app-login-loader {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin: 1rem 0 0.25rem 0;
+        padding: 0.9rem 1rem;
+        border: 1px solid #dbeafe;
+        border-radius: 12px;
+        background: linear-gradient(90deg, #eff6ff 0%, #f8fafc 100%);
+    }
+
+    .app-login-loader-dot {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #2563eb;
+        box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.35);
+        animation: appLoginPulse 1.1s ease-out infinite;
+        flex-shrink: 0;
+    }
+
+    .app-login-loader-title {
+        font-weight: 700;
+        color: #1e3a8a;
+        line-height: 1.2;
+    }
+
+    .app-login-loader-desc {
+        font-size: 0.88rem;
+        color: #475569;
+        line-height: 1.2;
+        margin-top: 0.1rem;
+    }
+
+    @keyframes appLoginPulse {
+        0% {
+            transform: scale(0.9);
+            box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.35);
+        }
+        70% {
+            transform: scale(1);
+            box-shadow: 0 0 0 10px rgba(37, 99, 235, 0);
+        }
+        100% {
+            transform: scale(0.9);
+            box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -759,6 +808,26 @@ def _get_or_create_key():
 
 def _get_cipher():
     return Fernet(_get_or_create_key())
+
+
+def _render_login_bootstrap_loader(placeholder, title, description=None):
+    """Render a visible login bootstrap loader instead of a blank screen."""
+    if placeholder is None:
+        return
+    safe_title = html.escape(str(title or "Yukleniyor..."))
+    safe_desc = html.escape(str(description or ""))
+    placeholder.markdown(
+        (
+            "<div class='app-login-loader'>"
+            "<div class='app-login-loader-dot'></div>"
+            "<div>"
+            f"<div class='app-login-loader-title'>{safe_title}</div>"
+            f"<div class='app-login-loader-desc'>{safe_desc}</div>"
+            "</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 # --- APP SESSION MANAGEMENT (REMEMBER ME - DISK) ---
 APP_SESSION_TTL = 7 * 24 * 3600  # 7 days
@@ -3170,18 +3239,37 @@ if st.session_state.app_user:
     org = st.session_state.app_user.get('org_code', 'default')
     saved_creds = _resolve_org_config(org_code=org, force_reload=True)
     utc_offset_hours = _resolve_org_utc_offset_hours(org_code=org, default=3.0, force_reload=False)
+    _login_loader_placeholder = st.empty()
+    _post_login_t0 = pytime.perf_counter()
+    _auth_elapsed = 0.0
+    _maps_elapsed = 0.0
+    _dm_elapsed = 0.0
     
     if not st.session_state.api_client and saved_creds and not st.session_state.get('genesys_logged_out'):
         cid, csec, reg = saved_creds.get("client_id"), saved_creds.get("client_secret"), saved_creds.get("region", "mypurecloud.ie")
         if cid and csec:
+            _render_login_bootstrap_loader(
+                _login_loader_placeholder,
+                "Dashboard hazirlaniyor",
+                "Genesys oturumu aciliyor...",
+            )
+            _auth_t0 = pytime.perf_counter()
             client, err = authenticate(cid, csec, reg, org_code=org)
+            _auth_elapsed = pytime.perf_counter() - _auth_t0
             if client:
+                _render_login_bootstrap_loader(
+                    _login_loader_placeholder,
+                    "Dashboard hazirlaniyor",
+                    "Kullanici, kuyruk ve durum bilgileri yukleniyor...",
+                )
+                _maps_t0 = pytime.perf_counter()
                 st.session_state.api_client = client
                 api = GenesysAPI(client)
                 maps = get_shared_org_maps(org, api, ttl_seconds=300)
                 users_info_map = maps.get("users_info", {}) or {}
                 if users_info_map and not any((u.get("username") or "").strip() for u in users_info_map.values()):
                     maps = get_shared_org_maps(org, api, ttl_seconds=300, force_refresh=True)
+                _maps_elapsed = pytime.perf_counter() - _maps_t0
                 st.session_state.users_map = maps.get("users_map", {})
                 st.session_state.users_info = maps.get("users_info", {})
                 if st.session_state.users_info:
@@ -3191,7 +3279,26 @@ if st.session_state.app_user:
                 st.session_state.presence_map = maps.get("presence", {})
                 st.session_state.org_config = saved_creds # Store for later use (refresh interval etc.)
                 st.session_state["_org_config_owner"] = org
+                _render_login_bootstrap_loader(
+                    _login_loader_placeholder,
+                    "Dashboard hazirlaniyor",
+                    "Arka plan veri toplayicisi baslatiliyor...",
+                )
+                _dm_t0 = pytime.perf_counter()
                 refresh_data_manager_queues()
+                _dm_elapsed = pytime.perf_counter() - _dm_t0
+
+    _total_post_login = pytime.perf_counter() - _post_login_t0
+    if _auth_elapsed > 0 or _maps_elapsed > 0 or _dm_elapsed > 0:
+        logger.info(
+            "post-login bootstrap org=%s auth=%.2fs maps=%.2fs dm=%.2fs total=%.2fs",
+            org,
+            _auth_elapsed,
+            _maps_elapsed,
+            _dm_elapsed,
+            _total_post_login,
+        )
+    _login_loader_placeholder.empty()
 
     # Keep DataManager session sync lightweight (throttled)
     if st.session_state.get('api_client') and st.session_state.get('queues_map'):
@@ -3241,6 +3348,8 @@ with st.sidebar:
         menu_options.append(get_text(lang, "menu_reports"))
     if role in ["Admin", "Manager", "Dashboard User"]:
         menu_options.append(get_text(lang, "menu_dashboard"))
+    if role in ["Admin", "Manager"]:
+        menu_options.append(get_text(lang, "menu_dialer"))
     if role == "Admin":
         menu_options.append(get_text(lang, "menu_users"))
         menu_options.append(get_text(lang, "menu_org_settings"))
@@ -3311,7 +3420,7 @@ elif prev_page != page:
     # Do not force an extra rerun on page switch; render target page in the same run.
 
 # Block only reports/dashboard if API is missing
-if page in [get_text(lang, "menu_reports"), get_text(lang, "menu_dashboard")] and not st.session_state.api_client:
+if page in [get_text(lang, "menu_reports"), get_text(lang, "menu_dashboard"), get_text(lang, "menu_dialer")] and not st.session_state.api_client:
     st.title(get_text(lang, "title"))
     st.info(get_text(lang, "welcome"))
     st.stop()
