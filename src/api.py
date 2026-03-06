@@ -812,6 +812,43 @@ class GenesysAPI:
             monitor.log_error("API_POST", f"Error fetching recent conversation details: {e}")
         return conversations
 
+    def get_outbound_conversations_by_queue(self, queue_id, start_date, end_date, page_size=100, max_pages=10):
+        """Fetch outbound conversation details filtered by queue ID (segment-level filter).
+
+        Uses segmentFilters with queueId dimension per Genesys Cloud Swagger
+        (SegmentDetailQueryPredicate.dimension enum includes 'queueId', 'direction', 'wrapUpCode').
+        """
+        interval = f"{start_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')}/{end_date.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
+        conversations = []
+        try:
+            page_number = 1
+            while True:
+                query = {
+                    "interval": interval,
+                    "order": "desc",
+                    "orderBy": "conversationStart",
+                    "paging": {"pageSize": page_size, "pageNumber": page_number},
+                    "segmentFilters": [
+                        {
+                            "type": "and",
+                            "predicates": [
+                                {"type": "dimension", "dimension": "queueId", "operator": "matches", "value": str(queue_id)},
+                                {"type": "dimension", "dimension": "direction", "operator": "matches", "value": "outbound"},
+                            ],
+                        }
+                    ],
+                }
+                data = self._post("/api/v2/analytics/conversations/details/query", query, timeout=20, retries=1)
+                page = data.get("conversations") or []
+                if page:
+                    conversations.extend(page)
+                if not page or len(page) < page_size or page_number >= max_pages:
+                    break
+                page_number += 1
+        except Exception as e:
+            monitor.log_error("API_POST", f"Error fetching outbound conversations for queue {queue_id}: {e}")
+        return conversations
+
     def get_conversation(self, conversation_id):
         """Fetch single conversation with full participant attributes."""
         try:
@@ -894,6 +931,80 @@ class GenesysAPI:
             page_number += 1
         return campaigns
 
+    def get_edge_sites(self, page_size=100, max_pages=20):
+        """List edge sites for outbound campaign site dependency."""
+        entities = []
+        page_number = 1
+        while page_number <= max_pages:
+            data = self._get(
+                "/api/v2/telephony/providers/edges/sites",
+                params={"pageNumber": page_number, "pageSize": page_size},
+            )
+            page_entities = data.get("entities") if isinstance(data, dict) else []
+            if not page_entities:
+                break
+            entities.extend([x for x in page_entities if isinstance(x, dict)])
+            if not data.get("nextUri"):
+                break
+            page_number += 1
+        return entities
+
+    def get_outbound_call_analysis_response_sets(self, page_size=100, max_pages=20):
+        """List call analysis response sets for outbound campaign dependency."""
+        entities = []
+        page_number = 1
+        while page_number <= max_pages:
+            data = self._get(
+                "/api/v2/outbound/callanalysisresponsesets",
+                params={"pageNumber": page_number, "pageSize": page_size},
+            )
+            page_entities = data.get("entities") if isinstance(data, dict) else []
+            if not page_entities:
+                break
+            entities.extend([x for x in page_entities if isinstance(x, dict)])
+            if not data.get("nextUri"):
+                break
+            page_number += 1
+        return entities
+
+    def _validate_or_pick_site_ref(self, site_ref):
+        site_id = ""
+        if isinstance(site_ref, dict):
+            site_id = str(site_ref.get("id") or "").strip()
+
+        if site_id:
+            try:
+                self._get(f"/api/v2/telephony/providers/edges/sites/{site_id}")
+                return {"id": site_id}
+            except Exception:
+                pass
+
+        sites = self.get_edge_sites(page_size=100, max_pages=20)
+        for item in sites:
+            sid = str(item.get("id") or "").strip()
+            if sid:
+                return {"id": sid}
+        return None
+
+    def _validate_or_pick_call_analysis_set_ref(self, ca_ref):
+        ca_id = ""
+        if isinstance(ca_ref, dict):
+            ca_id = str(ca_ref.get("id") or "").strip()
+
+        if ca_id:
+            try:
+                self._get(f"/api/v2/outbound/callanalysisresponsesets/{ca_id}")
+                return {"id": ca_id}
+            except Exception:
+                pass
+
+        sets = self.get_outbound_call_analysis_response_sets(page_size=100, max_pages=20)
+        for item in sets:
+            sid = str(item.get("id") or "").strip()
+            if sid:
+                return {"id": sid}
+        return None
+
     def get_outbound_campaign(self, campaign_id):
         campaign_id = str(campaign_id or "").strip()
         if not campaign_id:
@@ -904,7 +1015,135 @@ class GenesysAPI:
         payload = payload or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a dict")
-        return self._post("/api/v2/outbound/campaigns", payload)
+
+        # Swagger model for POST /api/v2/outbound/campaigns requires:
+        # callerAddress, callerName, contactList{id}, dialingMode, name, phoneColumns.
+        name = str(payload.get("name") or "").strip()
+        mode = str(payload.get("dialingMode") or "").strip().lower()
+        contact_ref = payload.get("contactList") if isinstance(payload.get("contactList"), dict) else {}
+        contact_list_id = str(contact_ref.get("id") or "").strip()
+        caller_name = str(payload.get("callerName") or "").strip()
+        caller_address = str(payload.get("callerAddress") or "").strip()
+
+        if not name:
+            raise ValueError("Campaign name is required")
+        if not mode:
+            raise ValueError("Campaign dialingMode is required")
+        if not contact_list_id:
+            raise ValueError("Campaign contactList.id is required")
+        if not caller_name or not caller_address:
+            raise ValueError("Campaign callerName and callerAddress are required")
+
+        # Ensure contact list has phone columns and use those exact names for campaign.
+        cl_detail = self.get_outbound_contact_list(contact_list_id)
+        phone_columns = self._extract_phone_columns_for_campaign(cl_detail)
+        if not phone_columns:
+            derived_cols = self._derive_phone_columns_from_contact_list(cl_detail)
+            if derived_cols:
+                self._set_contact_list_phone_columns(contact_list_id, cl_detail, derived_cols)
+                cl_detail = self.get_outbound_contact_list(contact_list_id)
+                phone_columns = self._extract_phone_columns_for_campaign(cl_detail)
+
+        if not phone_columns:
+            raise ValueError("Selected contact list has no usable phoneColumns")
+
+        campaign_payload = {
+            "name": name,
+            "dialingMode": mode,
+            "contactList": {"id": contact_list_id},
+            "callerName": caller_name,
+            "callerAddress": caller_address,
+            "phoneColumns": phone_columns,
+        }
+
+        # Keep optional references if present.
+        for optional_key in (
+            "queue",
+            "script",
+            "edgeGroup",
+            "division",
+            "callableTimeSet",
+            "site",
+            "callAnalysisResponseSet",
+        ):
+            val = payload.get(optional_key)
+            if isinstance(val, dict) and str(val.get("id") or "").strip():
+                campaign_payload[optional_key] = {"id": str(val.get("id")).strip()}
+
+        if payload.get("callAnalysisLanguage"):
+            campaign_payload["callAnalysisLanguage"] = str(payload.get("callAnalysisLanguage")).strip()
+
+        # Predictive-style campaigns require valid site and call analysis response set
+        # on many tenants. Auto-resolve if missing/invalid.
+        if mode in {"predictive", "power", "progressive"}:
+            resolved_site = self._validate_or_pick_site_ref(campaign_payload.get("site"))
+            if not resolved_site:
+                raise ValueError("No valid Site found for predictive/power/progressive campaign")
+            campaign_payload["site"] = resolved_site
+
+            resolved_ca_set = self._validate_or_pick_call_analysis_set_ref(campaign_payload.get("callAnalysisResponseSet"))
+            if not resolved_ca_set:
+                raise ValueError("No valid Call Analysis Response Set found for predictive/power/progressive campaign")
+            campaign_payload["callAnalysisResponseSet"] = resolved_ca_set
+
+        return self._post("/api/v2/outbound/campaigns", campaign_payload)
+
+    @staticmethod
+    def _extract_phone_columns_for_campaign(contact_list_detail):
+        raw = (contact_list_detail or {}).get("phoneColumns")
+        out = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if isinstance(item, dict):
+                col = str(item.get("columnName") or "").strip()
+                col_type = str(item.get("type") or "cell").strip() or "cell"
+            elif isinstance(item, str):
+                col = item.strip()
+                col_type = "cell"
+            else:
+                col = ""
+                col_type = "cell"
+            if not col:
+                continue
+            normalized = {"columnName": col, "type": col_type}
+            if normalized not in out:
+                out.append(normalized)
+        return out
+
+    @staticmethod
+    def _derive_phone_columns_from_contact_list(contact_list_detail):
+        columns = (contact_list_detail or {}).get("columnNames")
+        if not isinstance(columns, list):
+            return []
+        candidates = []
+        for c in columns:
+            col = str(c or "").strip()
+            if not col:
+                continue
+            lower = col.lower()
+            if any(tok in lower for tok in ("phone", "telefon", "gsm", "mobile", "cell", "tel")):
+                candidates.append(col)
+        if not candidates and columns:
+            first = str(columns[0] or "").strip()
+            if first:
+                candidates = [first]
+        return [{"columnName": c, "type": "cell"} for c in candidates]
+
+    def _set_contact_list_phone_columns(self, contact_list_id, contact_list_detail, phone_columns):
+        version = (contact_list_detail or {}).get("version")
+        if version is None:
+            # Cannot safely update without optimistic-lock version.
+            return
+
+        payload = {
+            "id": str(contact_list_id),
+            "name": str((contact_list_detail or {}).get("name") or "").strip(),
+            "columnNames": list((contact_list_detail or {}).get("columnNames") or []),
+            "phoneColumns": list(phone_columns or []),
+            "version": version,
+        }
+        self.update_outbound_contact_list(contact_list_id, payload)
 
     def update_outbound_campaign(self, campaign_id, payload):
         campaign_id = str(campaign_id or "").strip()
@@ -960,7 +1199,61 @@ class GenesysAPI:
         payload = payload or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a dict")
-        return self._post("/api/v2/outbound/contactlists", payload)
+
+        normalized = copy.deepcopy(payload)
+        column_names = normalized.get("columnNames")
+        if not isinstance(column_names, list) or not column_names:
+            raise ValueError("columnNames is required and must be a non-empty list")
+
+        safe_columns = [str(c).strip() for c in column_names if str(c).strip()]
+        if not safe_columns:
+            raise ValueError("columnNames contains no valid values")
+        normalized["columnNames"] = safe_columns
+
+        phone_candidates = []
+        for col in safe_columns:
+            col_lower = col.lower()
+            if any(tok in col_lower for tok in ("phone", "tel", "gsm", "mobile", "cell")):
+                phone_candidates.append(col)
+        if not phone_candidates:
+            phone_candidates = [safe_columns[0]]
+
+        provided_phone_cols = normalized.get("phoneColumns")
+        payload_candidates = []
+
+        # 1) Use provided payload as-is first if phoneColumns already exists.
+        if provided_phone_cols:
+            payload_candidates.append(copy.deepcopy(normalized))
+
+        # 2) Most common format: list of objects with columnName + type.
+        for phone_col in phone_candidates:
+            p = copy.deepcopy(normalized)
+            p["phoneColumns"] = [{"columnName": phone_col, "type": "cell"}]
+            payload_candidates.append(p)
+
+        # 3) Some tenants accept object-only format without type.
+        for phone_col in phone_candidates:
+            p = copy.deepcopy(normalized)
+            p["phoneColumns"] = [{"columnName": phone_col}]
+            payload_candidates.append(p)
+
+        # 4) Legacy/flexible fallback: list of strings.
+        for phone_col in phone_candidates:
+            p = copy.deepcopy(normalized)
+            p["phoneColumns"] = [phone_col]
+            payload_candidates.append(p)
+
+        last_error = None
+        for candidate in payload_candidates:
+            try:
+                return self._post("/api/v2/outbound/contactlists", candidate)
+            except Exception as e:
+                last_error = e
+                continue
+
+        if last_error:
+            raise last_error
+        raise Exception("Unable to create contact list with generated payload candidates")
 
     def update_outbound_contact_list(self, contact_list_id, payload):
         contact_list_id = str(contact_list_id or "").strip()
@@ -972,7 +1265,7 @@ class GenesysAPI:
         try:
             return self._put(f"/api/v2/outbound/contactlists/{contact_list_id}", payload)
         except Exception as e:
-            if self._is_http_status(e, 405):
+            if self._is_http_status(e, 405) or self._is_http_status(e, 400):
                 return self._patch(f"/api/v2/outbound/contactlists/{contact_list_id}", payload)
             raise
 
@@ -992,10 +1285,24 @@ class GenesysAPI:
             "priority": str(bool(priority)).lower(),
             "clearSystemData": str(bool(clear_system_data)).lower(),
         }
+        flat_contacts = [c for c in contacts if isinstance(c, dict)]
+        # Canonical swagger payload: WritableDialerContact[] where each item has
+        # contactListId and data object.
+        canonical_contacts = []
+        for row in flat_contacts:
+            if "data" in row and isinstance(row.get("data"), dict):
+                data_obj = row.get("data")
+            else:
+                data_obj = dict(row)
+            canonical_contacts.append({
+                "contactListId": contact_list_id,
+                "data": data_obj,
+            })
+
+        # Keep one legacy fallback for older tenant behavior.
         payload_candidates = [
-            {"contacts": contacts},
-            {"data": contacts},
-            contacts,
+            canonical_contacts,
+            flat_contacts,
         ]
 
         last_error = None
@@ -1004,32 +1311,163 @@ class GenesysAPI:
                 return self._post(base_path, data=payload, timeout=30, retries=1, params=params)
             except Exception as e:
                 last_error = e
+                # Try fallback formats primarily for validation/client errors.
+                if not (self._is_http_status(e, 400) or self._is_http_status(e, 422)):
+                    raise
                 continue
 
         if last_error:
             raise last_error
         return {"status": "unknown"}
 
-    def get_outbound_campaign_progress(self, campaign_id=None):
+    def get_outbound_contact_list_contacts(self, contact_list_id, page_number=1, page_size=100):
+        contact_list_id = str(contact_list_id or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        payload = {
+            "pageNumber": max(1, int(page_number or 1)),
+            "pageSize": min(100, max(1, int(page_size or 100))),
+        }
+        return self._post(f"/api/v2/outbound/contactlists/{contact_list_id}/contacts/search", payload)
+
+    def search_outbound_contact_list_contacts(self, contact_list_id, column, value, page_number=1, page_size=25):
+        """Search contacts in a contact list by a column equals value predicate."""
+        contact_list_id = str(contact_list_id or "").strip()
+        column = str(column or "").strip()
+        value = str(value or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        if not column:
+            raise ValueError("column is required")
+        if not value:
+            raise ValueError("value is required")
+
+        payload = {
+            "pageNumber": max(1, int(page_number or 1)),
+            "pageSize": max(1, int(page_size or 25)),
+            "criteria": {
+                "filterType": "AND",
+                "clauses": [
+                    {
+                        "filterType": "AND",
+                        "predicates": [
+                            {
+                                "column": column,
+                                "operator": "EQUALS",
+                                "value": value,
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+        return self._post(f"/api/v2/outbound/contactlists/{contact_list_id}/contacts/search", payload)
+
+    def get_outbound_contact_list_contact(self, contact_list_id, contact_id):
+        contact_list_id = str(contact_list_id or "").strip()
+        contact_id = str(contact_id or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        if not contact_id:
+            raise ValueError("contact_id is required")
+        return self._get(f"/api/v2/outbound/contactlists/{contact_list_id}/contacts/{contact_id}")
+
+    def update_outbound_contact_list_contact(self, contact_list_id, contact_id, payload):
+        contact_list_id = str(contact_list_id or "").strip()
+        contact_id = str(contact_id or "").strip()
+        payload = payload or {}
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        if not contact_id:
+            raise ValueError("contact_id is required")
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        return self._put(f"/api/v2/outbound/contactlists/{contact_list_id}/contacts/{contact_id}", payload)
+
+    def write_result_code_to_contact_data(self, contact_list_id, contact_id, result_column, result_code, extra_fields=None):
+        """Write result code to an existing contact's data object."""
+        contact_list_id = str(contact_list_id or "").strip()
+        contact_id = str(contact_id or "").strip()
+        result_column = str(result_column or "").strip()
+        result_code = str(result_code or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+        if not contact_id:
+            raise ValueError("contact_id is required")
+        if not result_column:
+            raise ValueError("result_column is required")
+        if not result_code:
+            raise ValueError("result_code is required")
+
+        current = self.get_outbound_contact_list_contact(contact_list_id, contact_id)
+        merged_data = {}
+        if isinstance(current.get("data"), dict):
+            merged_data.update(current.get("data"))
+        merged_data[result_column] = result_code
+
+        if isinstance(extra_fields, dict):
+            for key, value in extra_fields.items():
+                safe_key = str(key or "").strip()
+                if not safe_key:
+                    continue
+                merged_data[safe_key] = value
+
+        payload = {
+            "id": contact_id,
+            "contactListId": contact_list_id,
+            "data": merged_data,
+        }
+        return self.update_outbound_contact_list_contact(contact_list_id, contact_id, payload)
+
+    def get_outbound_campaign_progress(self, campaign_id=None, campaign_ids=None):
         """Fetch outbound campaign progress.
 
-        Tries collection and per-campaign endpoints for compatibility.
+        NOTE: Some tenants do not expose collection endpoint
+        `/api/v2/outbound/campaigns/progress` (404). This method therefore
+        uses per-campaign endpoint as primary source.
         """
+
+        def _single_progress(cid):
+            try:
+                return self._get(f"/api/v2/outbound/campaigns/{cid}/progress")
+            except Exception as e:
+                if self._is_http_status(e, 404):
+                    # Fallback to campaign object when progress endpoint is missing.
+                    campaign = self.get_outbound_campaign(cid)
+                    return {
+                        "campaignId": cid,
+                        "campaignName": campaign.get("name"),
+                        "campaignStatus": campaign.get("campaignStatus") or campaign.get("status"),
+                        "_fallback": "campaign",
+                    }
+                raise
+
         if campaign_id:
             cid = str(campaign_id).strip()
             if not cid:
                 raise ValueError("campaign_id is invalid")
-            try:
-                return self._get(f"/api/v2/outbound/campaigns/{cid}/progress")
-            except Exception:
-                all_progress = self._get("/api/v2/outbound/campaigns/progress")
-                entities = all_progress.get("entities") if isinstance(all_progress, dict) else []
-                for item in entities or []:
-                    if str(item.get("campaign", {}).get("id") or item.get("campaignId") or "").strip() == cid:
-                        return item
-                return {}
+            return _single_progress(cid)
 
-        return self._get("/api/v2/outbound/campaigns/progress")
+        resolved_ids = []
+        if isinstance(campaign_ids, list) and campaign_ids:
+            resolved_ids = [str(cid).strip() for cid in campaign_ids if str(cid).strip()]
+        if not resolved_ids:
+            campaigns = self.get_outbound_campaigns(page_size=100, max_pages=20)
+            resolved_ids = [str(c.get("id") or "").strip() for c in campaigns if str(c.get("id") or "").strip()]
+
+        entities = []
+        errors = []
+        for cid in resolved_ids:
+            try:
+                item = _single_progress(cid)
+                if isinstance(item, dict):
+                    if not item.get("campaignId"):
+                        item["campaignId"] = cid
+                    entities.append(item)
+            except Exception as e:
+                errors.append({"campaignId": cid, "error": self._extract_error_detail(e)})
+
+        return {"entities": entities, "errors": errors}
 
     def get_queue_wrapup_timeout(self, queue_id):
         """Fetch wrap-up timeout (seconds) for a single queue."""
