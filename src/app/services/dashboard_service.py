@@ -146,7 +146,13 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
     if c_c3:
         if st.session_state.dashboard_mode == "Date":
             _local_today = (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date()
-            st.session_state.dashboard_date = st.date_input(get_text(lang, "mode_date"), _local_today, label_visibility="collapsed")
+            st.session_state.dashboard_date = st.date_input(
+                get_text(lang, "mode_date"),
+                _local_today,
+                key="dashboard_date_v2",
+                format="YYYY-MM-DD",
+                label_visibility="collapsed",
+            )
         elif st.session_state.dashboard_mode == "Live": 
             c_auto, c_time, c_agent, c_call = st.columns([1, 1, 1, 1])
             auto_ref = c_auto.toggle(
@@ -974,7 +980,7 @@ def render_dashboard_service(context: Dict[str, Any]) -> None:
                     key="agent_panel_search",
                 )
                 selected_group = st.selectbox("📌 Grup Filtresi", group_options, key="agent_panel_group")
-                st.form_submit_button("Filtreyi Uygula", use_container_width=True)
+                st.form_submit_button("Filtreyi Uygula", width='stretch')
             search_term = str(search_term or "").strip().lower()
             
             if st.session_state.dashboard_mode != "Live":

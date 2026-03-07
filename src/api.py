@@ -59,11 +59,17 @@ class GenesysAPI:
             "Content-Type": "application/json"
         }
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, suppress_error_statuses=None):
         start = time.monotonic()
         headers = self.headers
         retry_429_count = 0
         total_wait_429 = 0.0
+        suppressed_statuses = set()
+        try:
+            for code in (suppress_error_statuses or []):
+                suppressed_statuses.add(int(code))
+        except Exception:
+            suppressed_statuses = set()
         while True:
             try:
                 response = _session.get(f"{self.api_host}{path}", headers=headers, params=params, timeout=10)
@@ -93,9 +99,10 @@ class GenesysAPI:
                         "API_GET",
                         f"HTTP 429 retry budget exceeded on {path} (attempt {retry_429_count}, total_wait={projected_wait:.2f}s)",
                     )
-                monitor.log_error("API_GET", f"HTTP {status_code} on {path}", str(e))
-                if status_code == 401:
-                    monitor.log_error("API_GET", "Token expired (401). Should trigger re-auth here.")
+                if status_code not in suppressed_statuses:
+                    monitor.log_error("API_GET", f"HTTP {status_code} on {path}", str(e))
+                    if status_code == 401:
+                        monitor.log_error("API_GET", "Token expired (401). Should trigger re-auth here.")
                 raise e
             except Exception as e:
                 duration_ms = int((time.monotonic() - start) * 1000)
@@ -1195,6 +1202,115 @@ class GenesysAPI:
             raise ValueError("contact_list_id is required")
         return self._get(f"/api/v2/outbound/contactlists/{contact_list_id}")
 
+    @staticmethod
+    def _extract_contact_list_attempt_limit_id(payload):
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("attemptLimits", "attemptLimit"):
+            attempt_ref = payload.get(key)
+            if isinstance(attempt_ref, dict):
+                attempt_id = str(attempt_ref.get("id") or "").strip()
+                if attempt_id:
+                    return attempt_id
+            elif isinstance(attempt_ref, list):
+                for ref in attempt_ref:
+                    if isinstance(ref, dict):
+                        attempt_id = str(ref.get("id") or "").strip()
+                    else:
+                        attempt_id = str(ref or "").strip()
+                    if attempt_id:
+                        return attempt_id
+            elif attempt_ref:
+                attempt_id = str(attempt_ref).strip()
+                if attempt_id:
+                    return attempt_id
+        return ""
+
+    def get_outbound_contact_list_attempt_limit_id(self, contact_list_id):
+        """Return assigned attempt limit id (if any) for a contact list."""
+        detail = self.get_outbound_contact_list(contact_list_id)
+        return self._extract_contact_list_attempt_limit_id(detail)
+
+    def set_outbound_contact_list_attempt_limit(self, contact_list_id, attempt_limit_id=None):
+        """
+        Assign (or clear) attempt limits on the contact list.
+
+        Genesys applies attempt limits at contact-list level, not directly on campaign.
+        """
+        contact_list_id = str(contact_list_id or "").strip()
+        if not contact_list_id:
+            raise ValueError("contact_list_id is required")
+
+        detail = self.get_outbound_contact_list(contact_list_id)
+        if not isinstance(detail, dict):
+            raise ValueError("contact list detail could not be loaded")
+
+        version = detail.get("version")
+        if version is None:
+            raise ValueError("contact list version is required for update")
+
+        column_names = detail.get("columnNames")
+        if not isinstance(column_names, list) or not column_names:
+            raise ValueError("contact list must have columnNames")
+
+        payload = {
+            "id": contact_list_id,
+            "name": str(detail.get("name") or contact_list_id),
+            "version": int(version),
+            "columnNames": column_names,
+        }
+
+        # Preserve editable optional fields to avoid accidental data loss on PUT.
+        for list_key in (
+            "phoneColumns",
+            "emailColumns",
+            "whatsAppColumns",
+            "previewModeAcceptedValues",
+            "columnDataTypeSpecifications",
+        ):
+            list_val = detail.get(list_key)
+            if isinstance(list_val, list):
+                payload[list_key] = list_val
+
+        for text_key in ("previewModeColumnName", "zipCodeColumnName"):
+            text_val = detail.get(text_key)
+            if isinstance(text_val, str) and text_val.strip():
+                payload[text_key] = text_val
+
+        for bool_key in ("automaticTimeZoneMapping", "trimWhitespace"):
+            if bool_key in detail and detail.get(bool_key) is not None:
+                payload[bool_key] = bool(detail.get(bool_key))
+
+        attempt_limit_id = str(attempt_limit_id or "").strip()
+        attempt_ref = {"id": attempt_limit_id} if attempt_limit_id else None
+
+        candidate_keys = []
+        if "attemptLimits" in detail:
+            candidate_keys.append("attemptLimits")
+        if "attemptLimit" in detail:
+            candidate_keys.append("attemptLimit")
+        if not candidate_keys:
+            # Prefer canonical key first, then legacy fallback.
+            candidate_keys = ["attemptLimits", "attemptLimit"]
+
+        last_exc = None
+        for key in candidate_keys:
+            try:
+                candidate_payload = copy.deepcopy(payload)
+                candidate_payload[key] = attempt_ref
+                if key == "attemptLimits":
+                    candidate_payload.pop("attemptLimit", None)
+                else:
+                    candidate_payload.pop("attemptLimits", None)
+                return self.update_outbound_contact_list(contact_list_id, candidate_payload)
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if last_exc is not None:
+            raise last_exc
+        return self.update_outbound_contact_list(contact_list_id, payload)
+
     def create_outbound_contact_list(self, payload):
         payload = payload or {}
         if not isinstance(payload, dict):
@@ -1469,6 +1585,45 @@ class GenesysAPI:
 
         return {"entities": entities, "errors": errors}
 
+    def get_outbound_attempt_limits_list(self, page_size=100, max_pages=10):
+        """Fetch all outbound attempt limits."""
+        limits = []
+        page_number = 1
+        while page_number <= max_pages:
+            data = self._get(
+                "/api/v2/outbound/attemptlimits",
+                params={"pageNumber": page_number, "pageSize": page_size},
+            )
+            entities = data.get("entities") if isinstance(data, dict) else []
+            if not entities:
+                break
+            limits.extend(entities)
+            if not data.get("nextUri"):
+                break
+            page_number += 1
+        return limits
+
+    def get_outbound_attempt_limit(self, attempt_limit_id):
+        limit_id = str(attempt_limit_id or "").strip()
+        if not limit_id:
+            raise ValueError("attempt_limit_id is required")
+        return self._get(f"/api/v2/outbound/attemptlimits/{limit_id}")
+
+    def create_outbound_attempt_limit(self, payload):
+        payload = payload or {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        return self._post("/api/v2/outbound/attemptlimits", payload)
+
+    def update_outbound_attempt_limit(self, attempt_limit_id, payload):
+        limit_id = str(attempt_limit_id or "").strip()
+        if not limit_id:
+            raise ValueError("attempt_limit_id is required")
+        payload = payload or {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        return self._put(f"/api/v2/outbound/attemptlimits/{limit_id}", payload)
+
     def get_queue_wrapup_timeout(self, queue_id):
         """Fetch wrap-up timeout (seconds) for a single queue."""
         qid = str(queue_id or "").strip()
@@ -1579,24 +1734,105 @@ class GenesysAPI:
             time.sleep(0.2)
         return results
 
+    def get_wrapup_codes_listing(self, page_size=100, max_pages=20, name=None):
+        """Fetch wrap-up codes as a flat listing."""
+        entities = []
+        page_number = 1
+        while page_number <= max_pages:
+            params = {"pageNumber": page_number, "pageSize": page_size}
+            if name:
+                params["name"] = str(name).strip()
+            try:
+                data = self._get("/api/v2/routing/wrapupcodes", params=params)
+            except Exception as e:
+                monitor.log_error("API_GET", f"Error fetching wrap-up code listing: {e}")
+                break
+            page_entities = data.get("entities") if isinstance(data, dict) else []
+            if not page_entities:
+                break
+            entities.extend([x for x in page_entities if isinstance(x, dict)])
+            if not data.get("nextUri"):
+                break
+            page_number += 1
+        return entities
+
     def get_wrapup_codes(self):
-        """Fetches all wrap-up codes for mapping."""
+        """Fetch all wrap-up codes as id->name mapping."""
         codes = {}
-        try:
-            page_number = 1
-            while True:
-                data = self._get("/api/v2/routing/wrapupcodes", params={"pageNumber": page_number, "pageSize": 100})
-                if 'entities' in data:
-                    for code in data['entities']:
-                        codes[code['id']] = code['name']
-                    if not data.get('nextUri'):
-                        break
-                    page_number += 1
-                else:
-                    break
-        except Exception as e:
-            monitor.log_error("API_GET", f"Error fetching wrap-up codes: {e}")
+        for item in self.get_wrapup_codes_listing(page_size=100, max_pages=50):
+            code_id = str(item.get("id") or "").strip()
+            code_name = str(item.get("name") or code_id).strip()
+            if code_id:
+                codes[code_id] = code_name
         return codes
+
+    def get_wrapup_code(self, code_id):
+        """Fetch single wrap-up code object by id."""
+        cid = str(code_id or "").strip()
+        if not cid:
+            raise ValueError("code_id is required")
+        return self._get(f"/api/v2/routing/wrapupcodes/{cid}")
+
+    def create_wrapup_code(self, name, description=""):
+        """Create a tenant-wide wrap-up code."""
+        code_name = str(name or "").strip()
+        if not code_name:
+            raise ValueError("name is required")
+        payload = {"name": code_name}
+        code_desc = str(description or "").strip()
+        if code_desc:
+            payload["description"] = code_desc
+        return self._post("/api/v2/routing/wrapupcodes", payload)
+
+    def get_queue_wrapup_codes(self, queue_id, page_size=100, max_pages=20, name=None):
+        """Get wrap-up codes assigned to a queue."""
+        qid = str(queue_id or "").strip()
+        if not qid:
+            raise ValueError("queue_id is required")
+        entities = []
+        page_number = 1
+        while page_number <= max_pages:
+            params = {"pageNumber": page_number, "pageSize": page_size}
+            if name:
+                params["name"] = str(name).strip()
+            data = self._get(f"/api/v2/routing/queues/{qid}/wrapupcodes", params=params)
+            page_entities = data.get("entities") if isinstance(data, dict) else []
+            if not page_entities:
+                break
+            entities.extend([x for x in page_entities if isinstance(x, dict)])
+            if not data.get("nextUri"):
+                break
+            page_number += 1
+        return entities
+
+    def add_queue_wrapup_codes(self, queue_id, code_ids):
+        """Assign one or more wrap-up codes to a queue."""
+        qid = str(queue_id or "").strip()
+        if not qid:
+            raise ValueError("queue_id is required")
+        clean_ids = []
+        for raw_id in code_ids or []:
+            code_id = str(raw_id or "").strip()
+            if code_id and code_id not in clean_ids:
+                clean_ids.append(code_id)
+        if not clean_ids:
+            return []
+
+        responses = []
+        for chunk in self._chunk_list(clean_ids, 100):
+            body = [{"id": cid} for cid in chunk]
+            responses.append(self._post(f"/api/v2/routing/queues/{qid}/wrapupcodes", body))
+        return responses
+
+    def remove_queue_wrapup_code(self, queue_id, code_id):
+        """Remove a wrap-up code assignment from a queue."""
+        qid = str(queue_id or "").strip()
+        cid = str(code_id or "").strip()
+        if not qid:
+            raise ValueError("queue_id is required")
+        if not cid:
+            raise ValueError("code_id is required")
+        return self._delete(f"/api/v2/routing/queues/{qid}/wrapupcodes/{cid}")
 
     def get_routing_skills(self):
         """Fetches all routing skills for id->name mapping."""

@@ -1,8 +1,8 @@
 import copy
 import json
 import re
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -77,17 +77,42 @@ def _campaign_row(c):
     }
 
 
-def _contact_list_row(item):
+def _contact_list_row(item, attempt_limit_names: Dict[str, str] = None):
     column_names = item.get("columnNames")
     if isinstance(column_names, list):
         columns = len(column_names)
     else:
         columns = 0
+    attempt_limit_names = attempt_limit_names or {}
+    attempt_ref = item.get("attemptLimits")
+    if not attempt_ref:
+        attempt_ref = item.get("attemptLimit")
+    attempt_limit_value = ""
+    if isinstance(attempt_ref, dict):
+        attempt_limit_name = str(attempt_ref.get("name") or "").strip()
+        attempt_limit_id = str(attempt_ref.get("id") or "").strip()
+        attempt_limit_value = attempt_limit_name or str(attempt_limit_names.get(attempt_limit_id) or attempt_limit_id).strip()
+    elif isinstance(attempt_ref, list):
+        for ref in attempt_ref:
+            if isinstance(ref, dict):
+                attempt_limit_name = str(ref.get("name") or "").strip()
+                attempt_limit_id = str(ref.get("id") or "").strip()
+                attempt_limit_value = attempt_limit_name or str(attempt_limit_names.get(attempt_limit_id) or attempt_limit_id).strip()
+                if attempt_limit_value:
+                    break
+            elif ref:
+                ref_id = str(ref).strip()
+                attempt_limit_value = str(attempt_limit_names.get(ref_id) or ref_id).strip()
+                if attempt_limit_value:
+                    break
+    elif attempt_ref:
+        ref_id = str(attempt_ref).strip()
+        attempt_limit_value = str(attempt_limit_names.get(ref_id) or ref_id).strip()
     return {
         "id": item.get("id"),
         "name": item.get("name"),
         "columns": columns,
-        "attemptLimit": item.get("attemptLimit"),
+        "attemptLimit": attempt_limit_value,
         "callableTimeSet": (item.get("callableTimeSet") or {}).get("name") or item.get("callableTimeSetId"),
         "lastModified": item.get("dateModified") or item.get("modifiedDate") or "",
     }
@@ -288,11 +313,21 @@ def _auto_map_source(columns: List[str], aliases: List[str]) -> str:
     return ""
 
 
-def _fetch_paged_entities(api: GenesysAPI, path: str, page_size: int = 100, max_pages: int = 20) -> List[Dict[str, Any]]:
+def _fetch_paged_entities(
+    api: GenesysAPI,
+    path: str,
+    page_size: int = 100,
+    max_pages: int = 20,
+    suppress_error_statuses: List[int] = None,
+) -> List[Dict[str, Any]]:
     entities: List[Dict[str, Any]] = []
     page_number = 1
     while page_number <= max_pages:
-        data = api._get(path, params={"pageNumber": page_number, "pageSize": page_size})
+        data = api._get(
+            path,
+            params={"pageNumber": page_number, "pageSize": page_size},
+            suppress_error_statuses=suppress_error_statuses,
+        )
         page_entities = data.get("entities") if isinstance(data, dict) else None
         if not isinstance(page_entities, list) or not page_entities:
             break
@@ -319,7 +354,12 @@ def _build_option_map(entities: List[Dict[str, Any]], name_keys: List[str] = Non
                     break
         if not label:
             label = eid
-        out[f"{label} ({eid})"] = eid
+            
+        original_label = label
+        while label in out:
+            label += " "
+            
+        out[label] = eid
     return out
 
 
@@ -576,14 +616,14 @@ def _normalize_phone_value(raw: Any) -> str:
         return ""
 
     if text.startswith("+") and text[1:].isdigit() and len(text) >= 8:
-        return f"tel:{text}"
+        return text
 
     digits = "".join(ch for ch in text if ch.isdigit())
     if len(digits) < 7:
         return ""
     if text.startswith("+"):
-        return f"tel:+{digits}"
-    return f"tel:{digits}"
+        return f"+{digits}"
+    return digits
 
 
 def _phone_match_candidates(phone: str) -> List[str]:
@@ -632,6 +672,387 @@ def _resolve_contact_list_id_from_conversation(conv: Dict[str, Any], campaign_co
     return str(direct or "").strip()
 
 
+def _resolve_campaign_id_from_conversation(conv: Dict[str, Any]) -> str:
+    if not isinstance(conv, dict):
+        return ""
+    conv_attrs = conv.get("attributes") if isinstance(conv.get("attributes"), dict) else {}
+    campaign_id = _extract_id_from_attributes(conv_attrs, "campaign")
+    if campaign_id:
+        return campaign_id
+    for participant in conv.get("participants") or []:
+        attrs = participant.get("attributes") if isinstance(participant.get("attributes"), dict) else {}
+        campaign_id = _extract_id_from_attributes(attrs, "campaign")
+        if campaign_id:
+            return campaign_id
+    return ""
+
+
+def _parse_iso_datetime(value: Any):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _format_local_timestamp(raw_iso: Any, utc_offset_hours: float) -> str:
+    dt = _parse_iso_datetime(raw_iso)
+    if dt is None:
+        return str(raw_iso or "").replace("T", " ")[:19]
+    try:
+        if getattr(dt, "tzinfo", None) is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return (dt + timedelta(hours=float(utc_offset_hours or 0.0))).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(raw_iso or "").replace("T", " ")[:19]
+
+
+def _collect_ids_from_attrs(attrs: Any, key_hint: str) -> List[str]:
+    if not isinstance(attrs, dict):
+        return []
+    out: List[str] = []
+    hint = str(key_hint or "").lower()
+    for key, value in attrs.items():
+        key_text = str(key or "").lower()
+        if hint not in key_text:
+            continue
+        if _looks_like_uuid(value):
+            id_text = str(value).strip()
+            if id_text and id_text not in out:
+                out.append(id_text)
+    return out
+
+
+def _collect_conversation_ids(conv: Any, key_hint: str) -> List[str]:
+    if not isinstance(conv, dict):
+        return []
+    out: List[str] = []
+    for item in _collect_ids_from_attrs(conv.get("attributes"), key_hint):
+        if item not in out:
+            out.append(item)
+    for participant in conv.get("participants") or []:
+        for item in _collect_ids_from_attrs(participant.get("attributes"), key_hint):
+            if item not in out:
+                out.append(item)
+    return out
+
+
+def _conversation_matches_campaign(conv: Dict[str, Any], campaign_id: str, contact_list_id: str, call_conv: Optional[Dict[str, Any]] = None) -> bool:
+    campaign_id = str(campaign_id or "").strip()
+    contact_list_id = str(contact_list_id or "").strip()
+    if not campaign_id and not contact_list_id:
+        return True
+
+    candidate_campaign_ids: List[str] = []
+    candidate_contact_ids: List[str] = []
+    for source in (conv, call_conv):
+        if not isinstance(source, dict):
+            continue
+        resolved = _resolve_campaign_id_from_conversation(source)
+        if resolved and resolved not in candidate_campaign_ids:
+            candidate_campaign_ids.append(resolved)
+        for item in _collect_conversation_ids(source, "campaign"):
+            if item not in candidate_campaign_ids:
+                candidate_campaign_ids.append(item)
+        for item in _collect_conversation_ids(source, "contactlist"):
+            if item not in candidate_contact_ids:
+                candidate_contact_ids.append(item)
+
+    if campaign_id and campaign_id in candidate_campaign_ids:
+        return True
+    if contact_list_id and contact_list_id in candidate_contact_ids:
+        return True
+
+    # If attributes are unavailable in the payload, keep queue-level data visible
+    # instead of showing false-zero campaign results.
+    if not candidate_campaign_ids and not candidate_contact_ids:
+        return True
+    return False
+
+
+def _build_users_reverse_map() -> Dict[str, str]:
+    users_info = st.session_state.get("users_info") or {}
+    users_map_rev: Dict[str, str] = {}
+    for uid, user_info in users_info.items():
+        if not isinstance(user_info, dict):
+            continue
+        name = str(user_info.get("name") or user_info.get("username") or "").strip()
+        if name:
+            users_map_rev[str(uid).strip()] = name
+    return users_map_rev
+
+
+def _normalize_wrapup_display(
+    api: GenesysAPI,
+    raw_value: Any,
+    wrapup_id_to_name: Dict[str, str],
+    wrapup_id_resolution_cache: Dict[str, str],
+) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    if _looks_like_uuid(text):
+        mapped = str(wrapup_id_to_name.get(text) or "").strip()
+        if mapped:
+            return mapped
+        if text in wrapup_id_resolution_cache:
+            return wrapup_id_resolution_cache[text]
+        try:
+            detail = api.get_wrapup_code(text) or {}
+            resolved = str(detail.get("name") or detail.get("code") or detail.get("id") or text).strip()
+        except Exception:
+            resolved = text
+        wrapup_id_resolution_cache[text] = resolved
+        return resolved
+    return text
+
+
+def _extract_wrapup_value(
+    api: GenesysAPI,
+    raw_wrapup: Any,
+    wrapup_id_to_name: Dict[str, str],
+    wrapup_id_resolution_cache: Dict[str, str],
+) -> str:
+    if not isinstance(raw_wrapup, dict):
+        return _normalize_wrapup_display(api, raw_wrapup, wrapup_id_to_name, wrapup_id_resolution_cache)
+    code_val = str(raw_wrapup.get("code") or "").strip()
+    name_val = str(raw_wrapup.get("name") or "").strip()
+    id_val = str(raw_wrapup.get("id") or "").strip()
+    if code_val and not _looks_like_uuid(code_val):
+        return code_val
+    if name_val:
+        return name_val
+    if code_val:
+        return _normalize_wrapup_display(api, code_val, wrapup_id_to_name, wrapup_id_resolution_cache)
+    if id_val:
+        return _normalize_wrapup_display(api, id_val, wrapup_id_to_name, wrapup_id_resolution_cache)
+    return ""
+
+
+def _pick_phone_from_candidates(candidates: List[Any], caller_address: str = "", prefer_non_caller: bool = True) -> str:
+    normalized: List[str] = []
+    for raw_val in candidates:
+        phone = _normalize_phone_value(raw_val)
+        if phone and phone not in normalized:
+            normalized.append(phone)
+    if not normalized:
+        return ""
+    if prefer_non_caller and caller_address:
+        for phone in normalized:
+            if phone != caller_address:
+                return phone
+    return normalized[0]
+
+
+def _get_call_conversation(api: GenesysAPI, conv_id: str, conv_call_cache: Dict[str, Any]) -> Dict[str, Any]:
+    conv_id = str(conv_id or "").strip()
+    if not conv_id:
+        return {}
+    cached = conv_call_cache.get(conv_id)
+    if isinstance(cached, dict):
+        return cached
+    try:
+        call_conv = api.get_conversation_call(conv_id) or {}
+    except Exception:
+        call_conv = {}
+    if isinstance(call_conv, dict):
+        conv_call_cache[conv_id] = call_conv
+    return call_conv if isinstance(call_conv, dict) else {}
+
+
+def _normalize_interaction_row(
+    api: GenesysAPI,
+    conv: Dict[str, Any],
+    utc_offset_hours: float,
+    users_map_rev: Dict[str, str],
+    wrapup_id_to_name: Dict[str, str],
+    wrapup_id_resolution_cache: Dict[str, str],
+    caller_address: str = "",
+    call_conv: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    source_conv = call_conv if isinstance(call_conv, dict) and isinstance(call_conv.get("participants"), list) else conv
+    participants = source_conv.get("participants") or conv.get("participants") or []
+
+    conv_id = str(conv.get("conversationId") or conv.get("id") or source_conv.get("conversationId") or source_conv.get("id") or "").strip()
+    start_raw = source_conv.get("conversationStart") or conv.get("conversationStart")
+    end_raw = source_conv.get("conversationEnd") or conv.get("conversationEnd")
+    start_dt = _parse_iso_datetime(start_raw)
+    end_dt = _parse_iso_datetime(end_raw)
+
+    duration_seconds = 0
+    if start_dt is not None and end_dt is not None:
+        try:
+            duration_seconds = max(0, int((end_dt - start_dt).total_seconds()))
+        except Exception:
+            duration_seconds = 0
+
+    agent_names: List[str] = []
+    has_agent_participant = False
+    agent_ani_candidates: List[Any] = []
+    user_ani_candidates: List[Any] = []
+    dnis_candidates: List[Any] = []
+    agent_wrapup_last = ""
+    user_wrapup_last = ""
+
+    for participant in participants:
+        purpose = str(participant.get("purpose") or "").lower()
+        is_agent = purpose == "agent"
+        is_user = purpose in {"user", "customer", "external"}
+        if is_agent:
+            has_agent_participant = True
+
+        participant_name = str(participant.get("participantName") or participant.get("name") or "").strip()
+        user_id = str(
+            ((participant.get("user") or {}).get("id") if isinstance(participant.get("user"), dict) else participant.get("userId"))
+            or ""
+        ).strip()
+        if not participant_name and user_id:
+            participant_name = users_map_rev.get(user_id, "")
+        if is_agent and participant_name and participant_name not in agent_names:
+            agent_names.append(participant_name)
+
+        participant_wrapup = _extract_wrapup_value(
+            api,
+            participant.get("wrapup"),
+            wrapup_id_to_name,
+            wrapup_id_resolution_cache,
+        )
+        if participant_wrapup:
+            if is_agent:
+                agent_wrapup_last = participant_wrapup
+            elif is_user:
+                user_wrapup_last = participant_wrapup
+
+        if is_agent:
+            agent_ani_candidates.extend([participant.get("ani"), participant.get("address")])
+        elif is_user:
+            user_ani_candidates.extend([participant.get("ani"), participant.get("address")])
+        dnis_candidates.extend([participant.get("dnis"), participant.get("address")])
+
+        for session in participant.get("sessions") or []:
+            if is_agent:
+                agent_ani_candidates.extend([session.get("ani"), session.get("address")])
+            elif is_user:
+                user_ani_candidates.extend([session.get("ani"), session.get("address")])
+            dnis_candidates.extend([session.get("dnis"), session.get("address")])
+
+            for segment in session.get("segments") or []:
+                if is_agent:
+                    agent_ani_candidates.extend([segment.get("ani"), segment.get("address")])
+                elif is_user:
+                    user_ani_candidates.extend([segment.get("ani"), segment.get("address")])
+                dnis_candidates.extend([segment.get("dnis"), segment.get("address")])
+
+                segment_wrapup_raw = (
+                    segment.get("wrapUpCode")
+                    or segment.get("wrapupCode")
+                    or segment.get("wrapUp")
+                    or segment.get("wrapup")
+                )
+                segment_wrapup = _extract_wrapup_value(
+                    api,
+                    segment_wrapup_raw,
+                    wrapup_id_to_name,
+                    wrapup_id_resolution_cache,
+                )
+                if segment_wrapup:
+                    if is_agent:
+                        agent_wrapup_last = segment_wrapup
+                    elif is_user:
+                        user_wrapup_last = segment_wrapup
+
+    call_type = "Agent" if has_agent_participant else "Sistem"
+    if call_type == "Agent":
+        phone = (
+            _pick_phone_from_candidates(agent_ani_candidates, caller_address=caller_address, prefer_non_caller=True)
+            or _pick_phone_from_candidates(user_ani_candidates, caller_address=caller_address, prefer_non_caller=True)
+            or _pick_phone_from_candidates(dnis_candidates, caller_address=caller_address, prefer_non_caller=False)
+        )
+    else:
+        phone = (
+            _pick_phone_from_candidates(dnis_candidates, caller_address=caller_address, prefer_non_caller=False)
+            or _pick_phone_from_candidates(user_ani_candidates, caller_address=caller_address, prefer_non_caller=False)
+            or _pick_phone_from_candidates(agent_ani_candidates, caller_address=caller_address, prefer_non_caller=False)
+        )
+
+    wrapup_code = agent_wrapup_last or user_wrapup_last
+    if not wrapup_code:
+        fallback_raw = _extract_wrapup_code_from_conversation(source_conv)
+        if not fallback_raw and source_conv is not conv:
+            fallback_raw = _extract_wrapup_code_from_conversation(conv)
+        wrapup_code = _normalize_wrapup_display(api, fallback_raw, wrapup_id_to_name, wrapup_id_resolution_cache)
+
+    bucket = _classify_outbound_result_bucket(wrapup_code)
+    return {
+        "Başlangıç": _format_local_timestamp(start_raw, utc_offset_hours),
+        "Bitiş": _format_local_timestamp(end_raw, utc_offset_hours),
+        "Telefon": phone,
+        "Çağrı Tipi": call_type,
+        "Agent": ", ".join(agent_names),
+        "Wrap-up Kodu": wrapup_code,
+        "Durasyon (sn)": duration_seconds,
+        "Sonuç Sınıfı": {
+            "mesgul": "Meşgul",
+            "ulasilamadi": "Ulaşılamadı",
+            "tamamlanan": "Tamamlanan",
+        }.get(bucket, "Tekrar Aranacak"),
+        "Konuşma ID": conv_id,
+    }
+
+
+def _normalize_interaction_rows(
+    api: GenesysAPI,
+    conversations: List[Dict[str, Any]],
+    campaign_id: str,
+    contact_list_id: str,
+    utc_offset_hours: float,
+    users_map_rev: Dict[str, str],
+    wrapup_id_to_name: Dict[str, str],
+    wrapup_id_resolution_cache: Dict[str, str],
+    caller_address: str = "",
+    conv_call_cache: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    call_cache = conv_call_cache if isinstance(conv_call_cache, dict) else {}
+    for conv in conversations or []:
+        if not isinstance(conv, dict):
+            continue
+        conv_id = str(conv.get("conversationId") or conv.get("id") or "").strip()
+        call_conv = _get_call_conversation(api, conv_id, call_cache) if conv_id else {}
+        if not _conversation_matches_campaign(conv, campaign_id, contact_list_id, call_conv=call_conv):
+            continue
+        rows.append(
+            _normalize_interaction_row(
+                api=api,
+                conv=conv,
+                call_conv=call_conv,
+                utc_offset_hours=utc_offset_hours,
+                users_map_rev=users_map_rev,
+                wrapup_id_to_name=wrapup_id_to_name,
+                wrapup_id_resolution_cache=wrapup_id_resolution_cache,
+                caller_address=caller_address,
+            )
+        )
+    return rows
+
+
+def _classify_outbound_result_bucket(raw_value: Any) -> str:
+    text = str(raw_value or "").strip().lower()
+    if not text:
+        return "tekrar_aranacak"
+    if any(tok in text for tok in ("busy", "mesgul")):
+        return "mesgul"
+    if any(tok in text for tok in ("noanswer", "no_answer", "unreach", "notreach", "ula", "answeringmachine", "voicemail")):
+        return "ulasilamadi"
+    if any(tok in text for tok in ("complete", "completed", "success", "connected", "contacted", "tamam")):
+        return "tamamlanan"
+    return "tekrar_aranacak"
+
+
 def _ensure_contact_list_result_column(api: GenesysAPI, contact_list_detail: Dict[str, Any], result_column: str) -> Dict[str, Any]:
     result_column = str(result_column or "").strip()
     if not result_column:
@@ -670,7 +1091,7 @@ def _auto_sync_result_codes(api: GenesysAPI, campaigns: List[Dict[str, Any]], re
         "errors": 0,
     }
 
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     start_utc = now_utc - timedelta(minutes=max(1, int(lookback_minutes or 20)))
     conversations = api.get_conversation_details_recent(start_utc, now_utc, page_size=100, max_pages=3, order="desc")
 
@@ -706,14 +1127,14 @@ def _auto_sync_result_codes(api: GenesysAPI, campaigns: List[Dict[str, Any]], re
         contact_list_id = _resolve_contact_list_id_from_conversation(conv, campaign_contact_map)
         if not contact_list_id:
             stats["skipped_no_contactlist"] += 1
-            processed[dedupe_key] = datetime.utcnow().isoformat(timespec="seconds")
+            processed[dedupe_key] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             continue
 
         phone = _extract_phone_from_conversation(conv)
         phone_candidates = _phone_match_candidates(phone)
         if not phone_candidates:
             stats["skipped_no_phone"] += 1
-            processed[dedupe_key] = datetime.utcnow().isoformat(timespec="seconds")
+            processed[dedupe_key] = datetime.now(timezone.utc).isoformat(timespec="seconds")
             continue
 
         detail = cl_cache.get(contact_list_id)
@@ -767,11 +1188,11 @@ def _auto_sync_result_codes(api: GenesysAPI, campaigns: List[Dict[str, Any]], re
                 result_code=wrapup_code,
                 extra_fields={
                     "resultConversationId": conv_id,
-                    "resultUpdatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "resultUpdatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                 },
             )
             stats["updated"] += 1
-            processed[dedupe_key] = datetime.utcnow().isoformat(timespec="seconds")
+            processed[dedupe_key] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         except Exception:
             stats["errors"] += 1
 
@@ -797,9 +1218,40 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
         return
 
     api = GenesysAPI(api_client)
+    endpoint_status_cache = st.session_state.get("_dialer_optional_endpoint_status")
+    if not isinstance(endpoint_status_cache, dict):
+        endpoint_status_cache = {}
+        st.session_state["_dialer_optional_endpoint_status"] = endpoint_status_cache
+    endpoint_scope = str(st.session_state.get("app_user", {}).get("org_code") or getattr(api, "api_host", "") or "default")
+
+    def _get_optional_entities(path: str, page_size: int = 100, max_pages: int = 20) -> List[Dict[str, Any]]:
+        cache_key = f"{endpoint_scope}:{path}"
+        cached_status = endpoint_status_cache.get(cache_key)
+        if cached_status in {"403", "404"}:
+            return []
+        try:
+            entities = _fetch_paged_entities(
+                api,
+                path,
+                page_size=page_size,
+                max_pages=max_pages,
+                suppress_error_statuses=[403, 404],
+            )
+            endpoint_status_cache[cache_key] = "ok"
+            return entities
+        except Exception as exc:
+            try:
+                status_code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+            except Exception:
+                status_code = 0
+            if status_code in (403, 404):
+                endpoint_status_cache[cache_key] = str(status_code)
+                return []
+            raise
 
     tabs = st.tabs([
         "Kampanya Yönetimi",
+        "Eylem Planı / Strateji",
         "Excel / Contact List",
         "Takip & Sonuçlar",
     ])
@@ -834,7 +1286,12 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
 
         if campaign_rows:
             with st.expander("📋 Kampanya Listesi", expanded=True):
-                st.dataframe(pd.DataFrame(campaign_rows), use_container_width=True, hide_index=True)
+                campaign_df = pd.DataFrame(campaign_rows)
+                if "id" in campaign_df.columns:
+                    campaign_df = campaign_df.drop(columns=["id"])
+                if "ID" in campaign_df.columns:
+                    campaign_df = campaign_df.drop(columns=["ID"])
+                st.dataframe(campaign_df, width='stretch', hide_index=True)
         else:
             st.info("Outbound kampanya bulunamadı.")
 
@@ -847,7 +1304,10 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                 continue
             name = str(c.get("name") or cid)
             status = str(c.get("campaignStatus") or c.get("status") or "-")
-            campaign_options[f"{name} [{status}] ({cid})"] = cid
+            label = f"{name} [{status}]"
+            while label in campaign_options:
+                 label += " "
+            campaign_options[label] = cid
 
         queue_options = {}
         try:
@@ -856,7 +1316,10 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                 qid = str(q_id or "").strip()
                 if not qid:
                     continue
-                queue_options[f"{q_name} ({qid})"] = qid
+                label = q_name
+                while label in queue_options:
+                    label += " "
+                queue_options[label] = qid
         except Exception:
             queue_options = {}
 
@@ -869,7 +1332,10 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                 cid = str(item.get("id") or "").strip()
                 if not cid:
                     continue
-                cl_options_tab0[f"{item.get('name') or cid} ({cid})"] = cid
+                label = str(item.get('name') or cid)
+                while label in cl_options_tab0:
+                    label += " "
+                cl_options_tab0[label] = cid
         except Exception:
             cl_options_tab0 = {}
 
@@ -888,7 +1354,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
         except Exception:
             script_options = {}
         try:
-            edge_entities = _fetch_paged_entities(api, "/api/v2/telephony/providers/edges/edgegroups", page_size=100, max_pages=20)
+            edge_entities = _get_optional_entities("/api/v2/telephony/providers/edges/edgegroups", page_size=100, max_pages=20)
             edge_group_options = _build_option_map(edge_entities, name_keys=["name"]) 
         except Exception:
             edge_group_options = {}
@@ -898,7 +1364,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
         except Exception:
             division_options = {}
         try:
-            caller_entities = _fetch_paged_entities(api, "/api/v2/outbound/callerids", page_size=100, max_pages=20)
+            caller_entities = _get_optional_entities("/api/v2/outbound/callerids", page_size=100, max_pages=20)
             for item in caller_entities:
                 cid = str(item.get("id") or "").strip()
                 if not cid:
@@ -908,7 +1374,9 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                 if not name:
                     name = addr or cid
                 label = f"{name} / {addr}" if addr else name
-                caller_id_options[f"{label} ({cid})"] = cid
+                while label in caller_id_options:
+                    label += " "
+                caller_id_options[label] = cid
                 caller_details_by_id[cid] = {"name": name, "address": addr}
         except Exception:
             caller_id_options = {}
@@ -931,21 +1399,21 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                 selected_campaign_id = campaign_options[selected_label]
 
                 c1, c2, c3 = st.columns(3)
-                if c1.button("▶ Kampanyayı Başlat", use_container_width=True):
+                if c1.button("▶ Kampanyayı Başlat", width='stretch'):
                     try:
                         api.start_outbound_campaign(selected_campaign_id)
                         _audit_user_action("dialer_campaign_start", f"Campaign started: {selected_campaign_id}", "success")
                         st.success("Kampanya başlatıldı.")
                     except Exception as exc:
                         st.error(f"Başlatma hatası: {exc}")
-                if c2.button("⏹ Kampanyayı Durdur", use_container_width=True):
+                if c2.button("⏹ Kampanyayı Durdur", width='stretch'):
                     try:
                         api.stop_outbound_campaign(selected_campaign_id)
                         _audit_user_action("dialer_campaign_stop", f"Campaign stopped: {selected_campaign_id}", "success")
                         st.success("Kampanya durduruldu.")
                     except Exception as exc:
                         st.error(f"Durdurma hatası: {exc}")
-                if c3.button("Yeniden Yükle", use_container_width=True):
+                if c3.button("Yeniden Yükle", width='stretch'):
                     for suffix in ("name", "mode", "contact", "queue", "script", "edge", "division", "site", "ca_set"):
                         st.session_state.pop(f"dialer_campaign_{suffix}_{selected_campaign_id}", None)
                     st.rerun()
@@ -980,7 +1448,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                         "Temel Bilgiler",
                         help_text="Kampanya Adı, Dialing Mode ve Contact List temel işletim parametreleridir. Contact List telefon kolonları doğru tanımlı olmalı.",
                     )
-                    f1, f2, f3 = st.columns(3)
+                    f1, f2, f3, f3_2 = st.columns(4)
                     campaign_name = f1.text_input("Kampanya Adı", value=current_name, key=f"dialer_campaign_name_{selected_campaign_id}")
                     campaign_mode = f2.selectbox("Dialing Mode", dialing_modes, index=mode_default_idx, key=f"dialer_campaign_mode_{selected_campaign_id}")
                     cl_labels = list(cl_options_tab0.keys())
@@ -988,12 +1456,36 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                     if current_contact:
                         for idx, label in enumerate(cl_labels):
                             if cl_options_tab0.get(label) == current_contact:
+                                cl_default_idx = idx
                                 break
                     if cl_labels:
                         selected_contact_label = f3.selectbox("Contact List", cl_labels, index=cl_default_idx, key=f"dialer_campaign_contact_{selected_campaign_id}")
                         selected_contact_id = cl_options_tab0.get(selected_contact_label)
                     else:
                         selected_contact_id = st.text_input("Contact List ID", value=current_contact, key=f"dialer_campaign_contact_{selected_campaign_id}")
+
+                    # Arama Limiti (Attempt Limit) fallback
+                    try:
+                        al_options_local = _build_option_map(api.get_outbound_attempt_limits_list(page_size=100, max_pages=10), ["name"])
+                    except Exception:
+                        al_options_local = {}
+                    
+                    current_attempt_limit = ""
+                    if current_contact:
+                        try:
+                            current_attempt_limit = str(
+                                api.get_outbound_contact_list_attempt_limit_id(current_contact) or ""
+                            ).strip()
+                        except Exception:
+                            current_attempt_limit = ""
+                    if al_options_local:
+                        al_labels = list(al_options_local.keys())
+                        al_idx = _label_index_for_value(al_options_local, current_attempt_limit)
+                        al_label = f3_2.selectbox("Arama Şablonu (Attempt Limit)", ["(Seçim Yok)"] + al_labels, index=0 if not current_attempt_limit else al_idx + 1, key=f"dialer_campaign_al_{selected_campaign_id}")
+                        selected_attempt_limit_id = al_options_local.get(al_label) if al_label != "(Seçim Yok)" else None
+                    else:
+                        selected_attempt_limit_id = f3_2.text_input("Attempt Limit ID", value=current_attempt_limit, key=f"dialer_campaign_al_{selected_campaign_id}")
+                    f3_2.caption("Not: Attempt Limit kampanyaya değil Contact List'e atanır.")
 
                 with st.container(border=True):
                     _section_header(
@@ -1088,7 +1580,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
 
                 st.divider()
                 update_col1, update_col2 = st.columns([2, 1])
-                if update_col1.button("Kampanya Ayarlarını Kaydet", key=f"dialer_campaign_update_btn_{selected_campaign_id}", use_container_width=True, type="primary"):
+                if update_col1.button("Kampanya Ayarlarını Kaydet", key=f"dialer_campaign_update_btn_{selected_campaign_id}", width='stretch', type="primary"):
                     try:
                         payload = copy.deepcopy(campaign_detail if isinstance(campaign_detail, dict) else {})
                         payload["id"] = selected_campaign_id
@@ -1112,13 +1604,31 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                             payload["site"] = {"id": site_id}
                         if call_analysis_set_id:
                             payload["callAnalysisResponseSet"] = {"id": call_analysis_set_id}
+                        
                         api.update_outbound_campaign(selected_campaign_id, payload)
+                        # Attempt limit is applied at contact-list level in Genesys.
+                        attempt_target_contact_id = str(selected_contact_id or current_contact or "").strip()
+                        if attempt_target_contact_id:
+                            api.set_outbound_contact_list_attempt_limit(
+                                attempt_target_contact_id,
+                                selected_attempt_limit_id,
+                            )
+                            verified_attempt_limit_id = str(
+                                api.get_outbound_contact_list_attempt_limit_id(attempt_target_contact_id) or ""
+                            ).strip()
+                            expected_attempt_limit_id = str(selected_attempt_limit_id or "").strip()
+                            if verified_attempt_limit_id != expected_attempt_limit_id:
+                                raise ValueError(
+                                    "Attempt Limit atamasi dogrulanamadi. "
+                                    f"ContactList={attempt_target_contact_id}, expected={expected_attempt_limit_id or '-'}, "
+                                    f"actual={verified_attempt_limit_id or '-'}"
+                                )
                         _audit_user_action("dialer_campaign_update", f"Campaign updated: {selected_campaign_id}", "success")
                         st.success("Kampanya ayarları güncellendi.")
                     except Exception as exc:
                         st.error(f"Güncelleme hatası: {_error_detail(exc)}")
 
-                if update_col2.button("Bu ayarlarla yeni kampanya oluştur", key=f"dialer_campaign_clone_btn_{selected_campaign_id}", use_container_width=True):
+                if update_col2.button("Bu ayarlarla yeni kampanya oluştur", key=f"dialer_campaign_clone_btn_{selected_campaign_id}", width='stretch'):
                     try:
                         create_payload = {
                             "name": f"{campaign_name}-copy",
@@ -1143,6 +1653,22 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                         if caller_address:
                             create_payload["callerAddress"] = caller_address
                         created = api.create_outbound_campaign(create_payload)
+                        attempt_target_contact_id = str(selected_contact_id or "").strip()
+                        if attempt_target_contact_id:
+                            api.set_outbound_contact_list_attempt_limit(
+                                attempt_target_contact_id,
+                                selected_attempt_limit_id,
+                            )
+                            verified_attempt_limit_id = str(
+                                api.get_outbound_contact_list_attempt_limit_id(attempt_target_contact_id) or ""
+                            ).strip()
+                            expected_attempt_limit_id = str(selected_attempt_limit_id or "").strip()
+                            if verified_attempt_limit_id != expected_attempt_limit_id:
+                                raise ValueError(
+                                    "Attempt Limit atamasi dogrulanamadi. "
+                                    f"ContactList={attempt_target_contact_id}, expected={expected_attempt_limit_id or '-'}, "
+                                    f"actual={verified_attempt_limit_id or '-'}"
+                                )
                         created_id = str((created or {}).get("id") or "")
                         _audit_user_action("dialer_campaign_create", f"Campaign created: {created_id}", "success")
                         st.success(f"Yeni kampanya oluşturuldu. ID: {created_id or '-'}")
@@ -1157,7 +1683,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                     "Temel Bilgiler",
                     help_text="Kampanya Adı, Dialing Mode ve Contact List seçimi zorunlu temel alanlardır.",
                 )
-                create_c1, create_c2, create_c3 = st.columns(3)
+                create_c1, create_c2, create_c3, create_c3_2 = st.columns(4)
                 create_name = create_c1.text_input(
                     "Kampanya Adı",
                     value=f"Yeni Kampanya {datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -1170,6 +1696,19 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                     create_contact_id = cl_options_tab0.get(create_contact_label)
                 else:
                     create_contact_id = create_c3.text_input("Contact List ID", value="", key="dialer_create_campaign_contact")
+
+                try:
+                    al_options_create = _build_option_map(api.get_outbound_attempt_limits_list(page_size=100, max_pages=10), ["name"])
+                except Exception:
+                    al_options_create = {}
+
+                if al_options_create:
+                    create_al_labels = list(al_options_create.keys())
+                    create_al_label = create_c3_2.selectbox("Arama Şablonu (Attempt Limit)", ["(Seçim Yok)"] + create_al_labels, index=0, key="dialer_create_campaign_al")
+                    create_attempt_limit_id = al_options_create.get(create_al_label) if create_al_label != "(Seçim Yok)" else None
+                else:
+                    create_attempt_limit_id = create_c3_2.text_input("Attempt Limit ID", value="", key="dialer_create_campaign_al")
+                create_c3_2.caption("Not: Attempt Limit kampanyaya değil Contact List'e atanır.")
 
             with st.container(border=True):
                 _section_header(
@@ -1257,7 +1796,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                     )
 
             st.divider()
-            if st.button("Kampanya Oluştur", key="dialer_create_campaign_form_btn", use_container_width=True, type="primary"):
+            if st.button("Kampanya Oluştur", key="dialer_create_campaign_form_btn", width='stretch', type="primary"):
                 if not create_name.strip():
                     st.error("Kampanya adı zorunludur.")
                 elif not create_contact_id:
@@ -1306,6 +1845,11 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                                 if create_call_analysis_set_id:
                                     create_payload["callAnalysisResponseSet"] = {"id": str(create_call_analysis_set_id).strip()}
                                 created = api.create_outbound_campaign(create_payload)
+                                if create_contact_id:
+                                    api.set_outbound_contact_list_attempt_limit(
+                                        str(create_contact_id).strip(),
+                                        str(create_attempt_limit_id or "").strip(),
+                                    )
                                 created_id = str((created or {}).get("id") or "")
                                 _audit_user_action("dialer_campaign_create_template", f"Campaign created via form: {created_id}", "success")
                                 st.success(f"Kampanya oluşturuldu. ID: {created_id or '-'}")
@@ -1316,6 +1860,140 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
             st.stop()
 
     with tabs[1]:
+        st.subheader("Kampanya Stratejileri (Attempt Limits & CARS)")
+        st.caption("Arama limitleri, otomatik yeniden aramalar (Meşgul, Cevapsız) ve Telesekreter (Answering Machine) davranışlarını ayarlayın.")
+
+        try:
+            attempt_limits = api.get_outbound_attempt_limits_list(page_size=100, max_pages=10)
+            call_analysis_sets = api.get_outbound_call_analysis_response_sets(page_size=100, max_pages=10)
+        except Exception as exc:
+            st.error(f"Strateji verileri alınamadı: {exc}")
+            attempt_limits = []
+            call_analysis_sets = []
+
+        al_options = {}
+        for al in attempt_limits:
+            if isinstance(al, dict) and al.get("id"):
+                label = str(al.get('name') or al.get('id'))
+                while label in al_options:
+                    label += " "
+                al_options[label] = str(al.get("id"))
+                
+        cars_options = {}
+        for c in call_analysis_sets:
+            if isinstance(c, dict) and c.get("id"):
+                label = str(c.get('name') or c.get('id'))
+                while label in cars_options:
+                    label += " "
+                cars_options[label] = str(c.get("id"))
+
+        strat_tabs = st.tabs(["Arama Limitleri (Attempt Limits)", "Çağrı Analiz Testleri (CARS)"])
+
+        with strat_tabs[0]:
+            st.caption("Bir müşterinin gün içinde/toplamda en fazla kaç kez aranacağını ve meşgul/cevapsız durumlarında ne kadar bekleneceğini belirler.")
+            al_rows = []
+            for al in attempt_limits:
+                if not isinstance(al, dict):
+                    continue
+                recall = al.get("recallEntries") or {}
+                busy_min = recall.get("busy", {}).get("minutesBetweenAttempts", "-")
+                no_ans_min = recall.get("noAnswer", {}).get("minutesBetweenAttempts", "-")
+                ans_mach_min = recall.get("answeringMachine", {}).get("minutesBetweenAttempts", "-")
+                al_rows.append({
+                    "Strateji Adı": al.get("name"),
+                    "Maks. Arama": al.get("maxAttemptsPerContact"),
+                    "Meşgul Bekleme (dk)": busy_min,
+                    "Cevapsız Bekleme (dk)": no_ans_min,
+                    "Sekreter Bekleme (dk)": ans_mach_min,
+                    "ID": al.get("id"),
+                })
+            if al_rows:
+                st.dataframe(pd.DataFrame(al_rows), width='stretch', hide_index=True)
+            else:
+                st.info("Arama limiti şablonu bulunmamaktadır.")
+
+            with st.expander("🛠️ Yeni Arama Limiti (Attempt Limit) Oluştur veya Güncelle", expanded=False):
+                action_al = st.radio("İşlem", ["Yeni Şablon", "Mevcut Şablonu Güncelle"], horizontal=True, key="al_action")
+                sel_al_id = None
+                default_name = f"Strateji {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                default_max = 5
+                default_busy = 15
+                default_noans = 60
+                default_sec = 120
+
+                if action_al == "Mevcut Şablonu Güncelle":
+                    sel_al_label = st.selectbox("Şablon Seç", [""] + list(al_options.keys()), key="al_select")
+                    if sel_al_label:
+                        sel_al_id = al_options[sel_al_label]
+                        al_detail = next((al for al in attempt_limits if al.get("id") == sel_al_id), {})
+                        default_name = str(al_detail.get("name") or "")
+                        default_max = int(al_detail.get("maxAttemptsPerContact") or 5)
+                        rec = al_detail.get("recallEntries") or {}
+                        default_busy = int(rec.get("busy", {}).get("minutesBetweenAttempts") or 15)
+                        default_noans = int(rec.get("noAnswer", {}).get("minutesBetweenAttempts") or 60)
+                        default_sec = int(rec.get("answeringMachine", {}).get("minutesBetweenAttempts") or 120)
+
+                al_name = st.text_input("Şablon Adı", value=default_name, key="al_name_input")
+                al_max = st.number_input("Maksimum Arama Sayısı (Kişi Başına)", min_value=1, max_value=50, value=default_max, key="al_max_input")
+
+                st.markdown("**Duruma Göre Yeniden Arama Süreleri (Dakika)**")
+                cl_busy, cl_noans, cl_sec = st.columns(3)
+                al_busy = cl_busy.number_input("Meşgul (Busy) Bekleme", min_value=1, max_value=1440, value=default_busy, key="al_busy_input")
+                al_noans = cl_noans.number_input("Cevapsız (No Answer) Bekleme", min_value=1, max_value=1440, value=default_noans, key="al_noans_input")
+                al_sec = cl_sec.number_input("Sekreter (Answering Machine) Bekleme", min_value=1, max_value=1440, value=default_sec, key="al_sec_input")
+
+                if st.button("Kaydet", key="al_save_btn", type="primary", width='stretch'):
+                    if not al_name.strip():
+                        st.error("Şablon adı giriniz.")
+                    else:
+                        payload = {
+                            "name": al_name.strip(),
+                            "maxAttemptsPerContact": al_max,
+                            "maxAttemptsPerNumber": al_max,
+                            "timeZoneId": "Europe/Istanbul",
+                            "resetPeriod": "NEVER",
+                            "recallEntries": {
+                                "busy": {"minutesBetweenAttempts": al_busy},
+                                "noAnswer": {"minutesBetweenAttempts": al_noans},
+                                "answeringMachine": {"minutesBetweenAttempts": al_sec}
+                            }
+                        }
+                        try:
+                            if action_al == "Mevcut Şablonu Güncelle" and sel_al_id:
+                                # fetch explicit version before updating
+                                detail = api.get_outbound_attempt_limit(sel_al_id)
+                                payload["id"] = sel_al_id
+                                payload["version"] = detail.get("version") or 1
+                                api.update_outbound_attempt_limit(sel_al_id, payload)
+                                st.success("Arama Limiti güncellendi!")
+                            else:
+                                api.create_outbound_attempt_limit(payload)
+                                st.success("Yeni Arama Limiti oluşturuldu!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Hata: {_error_detail(e)}")
+
+        with strat_tabs[1]:
+            st.caption("Karşı tarafı kimin açtığını analiz eder. Örn: Telesekreter (Answering Machine) açarsa aramayı kapat vs.")
+            cars_rows = []
+            for c in call_analysis_sets:
+                if not isinstance(c, dict):
+                    continue
+                resps = c.get("responses") or {}
+                am_action = resps.get("callableAnsweringMachine", {}).get("reactionType", "-")
+                cars_rows.append({
+                    "Analiz Seti Adı": c.get("name"),
+                    "Telesekreter Aksiyonu": am_action,
+                    "ID": c.get("id"),
+                })
+            if cars_rows:
+                st.dataframe(pd.DataFrame(cars_rows), width='stretch', hide_index=True)
+            else:
+                st.info("CARS şablonu bulunmamaktadır.")
+
+            st.info("CARS oluşturma ve detaylı düzenlemeler (Transfer to ACD, Drop vs.) için şu an Genesys Cloud arayüzünü kullanmanız önerilir. Görüntüleme bu panelden sağlanmaktadır.")
+
+    with tabs[2]:
         st.caption("Liste yapısını düzenleyin, telefon kolonlarını netleştirin ve Excel yüklemelerini daha kontrollü yönetin.")
 
         contact_lists = []
@@ -1328,7 +2006,19 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
             if contact_forbidden:
                 _render_forbidden_hint("Outbound Contact List")
 
-        cl_rows = [_contact_list_row(c) for c in contact_lists if isinstance(c, dict)]
+        attempt_limit_names = {}
+        try:
+            for al in (api.get_outbound_attempt_limits_list(page_size=100, max_pages=10) or []):
+                if not isinstance(al, dict):
+                    continue
+                al_id = str(al.get("id") or "").strip()
+                al_name = str(al.get("name") or "").strip()
+                if al_id and al_name:
+                    attempt_limit_names[al_id] = al_name
+        except Exception:
+            attempt_limit_names = {}
+
+        cl_rows = [_contact_list_row(c, attempt_limit_names=attempt_limit_names) for c in contact_lists if isinstance(c, dict)]
         total_contact_lists = len(cl_rows)
         phone_ready_lists = 0
         total_columns = 0
@@ -1346,7 +2036,12 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
 
         if cl_rows:
             with st.expander("📂 Contact List Envanteri", expanded=True):
-                st.dataframe(pd.DataFrame(cl_rows), use_container_width=True, hide_index=True)
+                cl_df = pd.DataFrame(cl_rows)
+                if "id" in cl_df.columns:
+                    cl_df = cl_df.drop(columns=["id"])
+                if "ID" in cl_df.columns:
+                    cl_df = cl_df.drop(columns=["ID"])
+                st.dataframe(cl_df, width='stretch', hide_index=True)
         else:
             st.info("Contact list bulunamadı.")
 
@@ -1355,11 +2050,13 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
             for item in contact_lists
             if isinstance(item, dict) and item.get("id")
         }
-        cl_options = {
-            f"{item.get('name') or item.get('id')} ({item.get('id')})": str(item.get("id"))
-            for item in contact_lists
-            if isinstance(item, dict) and item.get("id")
-        }
+        cl_options = {}
+        for item in contact_lists:
+            if isinstance(item, dict) and item.get("id"):
+                label = str(item.get('name') or item.get('id'))
+                while label in cl_options:
+                    label += " "
+                cl_options[label] = str(item.get("id"))
 
         with st.expander("🗂️ Contact List Tasarımı", expanded=False):
             st.caption("JSON kullanmadan yeni liste oluşturun veya mevcut listede telefon kolonunu güncelleyin.")
@@ -1391,7 +2088,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
             else:
                 create_phone_col = ""
 
-            if st.button("Yeni Contact List Oluştur", key="dialer_cl_form_create_btn", use_container_width=True):
+            if st.button("Yeni Contact List Oluştur", key="dialer_cl_form_create_btn", width='stretch'):
                 if not create_cl_name.strip():
                     st.error("Contact list adı zorunludur.")
                 elif not create_cl_columns:
@@ -1456,7 +2153,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                 else:
                     st.warning("Bu contact list'te phoneColumns tanımlı değil. Kampanya oluşturmak için tanımlamanız gerekir.")
 
-                if st.button("Contact List'i Güncelle", key="dialer_cl_form_update_btn", use_container_width=True):
+                if st.button("Contact List'i Güncelle", key="dialer_cl_form_update_btn", width='stretch'):
                     try:
                         detail_version = (detail or {}).get("version") if isinstance(detail, dict) else None
                         if detail_version is None:
@@ -1493,7 +2190,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
 
             if not df.empty:
                 st.caption(f"Satır: {len(df)} | Sütun: {len(df.columns)}")
-                st.dataframe(df.head(100), use_container_width=True, hide_index=True)
+                st.dataframe(df.head(100), width='stretch', hide_index=True)
 
                 target_mode = st.radio("Hedef", ["Mevcut Contact List", "Yeni Contact List"], horizontal=True)
                 target_contact_list_id = None
@@ -1586,7 +2283,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                     f"Önizleme: {len(mapped_records_preview)} kayıt hazır, telefon eksikliği nedeniyle atlanan: {skipped_preview}"
                 )
                 if mapped_records_preview:
-                    st.dataframe(pd.DataFrame(mapped_records_preview).head(50), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(mapped_records_preview).head(50), width='stretch', hide_index=True)
 
                 mapped_column_names = [k for k, v in field_map.items() if v]
                 for col in custom_columns:
@@ -1621,7 +2318,7 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                             + ", ".join(missing_cols)
                         )
 
-                if st.button("Eşlenmiş Veriyi Contact List'e Yükle", key="dialer_upload_excel_btn", use_container_width=True):
+                if st.button("Eşlenmiş Veriyi Contact List'e Yükle", key="dialer_upload_excel_btn", width='stretch'):
                     if not target_contact_list_id:
                         st.error("Önce hedef contact list seçin/oluşturun.")
                     elif not field_map.get("phone"):
@@ -1689,492 +2386,513 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
         if contact_forbidden:
             st.stop()
 
-    with tabs[2]:
-        st.caption("Kampanya performansını, sonuç dağılımını ve autosync akışını aynı panelden izleyin.")
+    with tabs[3]:
+        st.caption("Seçili kampanya wrap-up/sonuç analizi, kampanya bazlı kod yönetimi ve manuel senkron araçları.")
+        action_c1, action_c2, action_c3 = st.columns(3)
+        refresh_tracking = action_c1.button("Takip Verisini Yenile", key="dialer_tracking_force_refresh_btn", width="stretch")
+        refresh_wrapup_catalog = action_c2.button("Wrap-up Kodlarını Yenile", key="dialer_wrapup_catalog_refresh_btn", width="stretch")
+        clear_conv_cache = action_c3.button("Konuşma Cache Temizle", key="dialer_conv_cache_clear_btn", width="stretch")
+        if clear_conv_cache:
+            st.session_state.pop("dialer_conv_call_cache", None)
+            st.success("Konuşma cache temizlendi.")
 
-        refresh = st.button("Takip Verisini Yenile", key="dialer_progress_refresh_btn", use_container_width=True)
-        progress_cache_key = "dialer_progress_cache"
+        try:
+            utc_offset_local = float(globals().get("utc_offset_hours", 3.0) or 3.0)
+        except Exception:
+            utc_offset_local = 3.0
 
-        if refresh or progress_cache_key not in st.session_state:
+        users_map_rev = _build_users_reverse_map()
+        wrapup_map_key = "dialer_wrapup_id_to_name_cache"
+        wrapup_list_key = "dialer_wrapup_codes_listing_cache"
+        wrapup_resolve_cache_key = "dialer_wrapup_id_resolution_cache"
+
+        if refresh_wrapup_catalog or wrapup_map_key not in st.session_state:
             try:
-                cached_campaign_ids = st.session_state.get("dialer_campaign_ids_cache") or []
-                st.session_state[progress_cache_key] = api.get_outbound_campaign_progress(
-                    campaign_ids=cached_campaign_ids,
-                )
-            except Exception as exc:
-                st.error(f"Kampanya progress verisi alınamadı: {exc}")
-                if _is_forbidden_error(exc):
-                    _render_forbidden_hint("Campaign Progress")
-                st.session_state[progress_cache_key] = {}
+                st.session_state[wrapup_map_key] = api.get_wrapup_codes() or {}
+            except Exception:
+                st.session_state[wrapup_map_key] = {}
+        if refresh_wrapup_catalog or wrapup_list_key not in st.session_state:
+            try:
+                st.session_state[wrapup_list_key] = api.get_wrapup_codes_listing(page_size=100, max_pages=50) or []
+            except Exception:
+                st.session_state[wrapup_list_key] = []
+        wrapup_id_to_name = st.session_state.get(wrapup_map_key) or {}
+        wrapup_codes_listing = st.session_state.get(wrapup_list_key) or []
+        wrapup_id_resolution_cache = st.session_state.get(wrapup_resolve_cache_key)
+        if not isinstance(wrapup_id_resolution_cache, dict):
+            wrapup_id_resolution_cache = {}
+            st.session_state[wrapup_resolve_cache_key] = wrapup_id_resolution_cache
+        conv_call_cache = st.session_state.get("dialer_conv_call_cache")
+        if not isinstance(conv_call_cache, dict):
+            conv_call_cache = {}
+            st.session_state["dialer_conv_call_cache"] = conv_call_cache
 
-        progress_payload = st.session_state.get(progress_cache_key) or {}
-        progress_entities = _as_list_entities(progress_payload)
-        if not progress_entities and isinstance(progress_payload, dict) and progress_payload:
-            progress_entities = [progress_payload]
+        campaign_options: Dict[str, Dict[str, Any]] = {}
+        for campaign in campaigns:
+            if not isinstance(campaign, dict) or not campaign.get("id"):
+                continue
+            label = f"{str(campaign.get('name') or campaign.get('id'))} [{str(campaign.get('campaignStatus') or campaign.get('status') or '-')}]"
+            while label in campaign_options:
+                label += " "
+            campaign_options[label] = campaign
 
-        if not progress_entities:
-            st.info("Kampanya takip verisi bulunamadı. Campaign Progress endpoint erişimini kontrol edin.")
+        if not campaign_options:
+            st.info("Takip ekranı için kampanya bulunamadı.")
         else:
-            # Build a quick name lookup from the campaigns we already fetched
-            campaign_name_lookup = {
-                str(c.get("id") or ""): str(c.get("name") or "")
-                for c in campaigns
-                if isinstance(c, dict) and c.get("id")
-            }
-            rows: List[Dict[str, Any]] = []
-            for item in progress_entities:
-                if not isinstance(item, dict):
-                    continue
-                # CampaignProgress schema fields (Genesys Cloud API):
-                # campaign{id,name}, contactList{id,name},
-                # numberOfContactsCalled, numberOfContactsMessaged,
-                # totalNumberOfContacts, percentage, numberOfContactsSkipped{reason:count}
-                camp = item.get("campaign") if isinstance(item.get("campaign"), dict) else {}
-                cl_ref = item.get("contactList") if isinstance(item.get("contactList"), dict) else {}
-                camp_id = str(item.get("campaignId") or camp.get("id") or "").strip()
-                skipped_map = item.get("numberOfContactsSkipped") or {}
-                total_skipped = sum(int(v or 0) for v in skipped_map.values()) if isinstance(skipped_map, dict) else 0
-                total_contacts = int(item.get("totalNumberOfContacts") or 0)
-                num_called = int(item.get("numberOfContactsCalled") or 0)
-                num_messaged = int(item.get("numberOfContactsMessaged") or 0)
-                percentage = int(item.get("percentage") or 0)
-                ulasilamayan = max(0, total_contacts - num_called - total_skipped)
-                row = {
-                    "Kampanya Adı": (
-                        item.get("campaignName")
-                        or camp.get("name")
-                        or campaign_name_lookup.get(camp_id)
-                        or camp_id
-                        or ""
-                    ),
-                    "Contact List": cl_ref.get("name") or cl_ref.get("id") or "",
-                    "Aranan": num_called,
-                    "Ulaşılamayan": ulasilamayan,
-                    "Mesaj": num_messaged,
-                    "Atlanan": total_skipped,
-                    "Toplam": total_contacts,
-                    "Tamamlanma %": percentage,
-                    "_campaignId": item.get("campaignId") or camp.get("id") or "",
-                }
-                rows.append(row)
+            with st.expander("🔍 Seçili Kampanya Sonuç Analizi", expanded=True):
+                selected_tracking_label = st.selectbox(
+                    "Sonuçlarını görmek istediğiniz kampanya",
+                    list(campaign_options.keys()),
+                    key="dialer_tracking_campaign_select",
+                )
+                tracking_campaign = campaign_options.get(selected_tracking_label) or {}
+                tracking_campaign_id = str(tracking_campaign.get("id") or "").strip()
 
-            df_progress = pd.DataFrame(rows)
-            with st.expander("📊 Kampanya İlerleme Özeti", expanded=True):
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Toplam Kampanya", len(rows))
-                c2.metric("Toplam Aranan", int(pd.to_numeric(df_progress["Aranan"], errors="coerce").fillna(0).sum()))
-                c3.metric("Ulaşılamayan", int(pd.to_numeric(df_progress["Ulaşılamayan"], errors="coerce").fillna(0).sum()))
-                c4.metric("Toplam Atlanan", int(pd.to_numeric(df_progress["Atlanan"], errors="coerce").fillna(0).sum()))
-                total_all = int(pd.to_numeric(df_progress["Toplam"], errors="coerce").fillna(0).sum())
-                c5.metric("Toplam Kayıt", total_all)
-                display_cols = [c for c in df_progress.columns if not c.startswith("_")]
-                st.dataframe(df_progress[display_cols], use_container_width=True, hide_index=True)
-                st.download_button(
-                    label="⬇️ İlerleme Tablosunu İndir (CSV)",
-                    data=df_progress[display_cols].to_csv(index=False).encode("utf-8-sig"),
-                    file_name="kampanya_ilerleme.csv",
-                    mime="text/csv",
-                    key="dialer_progress_download_btn",
+                tracking_detail = {}
+                try:
+                    tracking_detail = api.get_outbound_campaign(tracking_campaign_id) or {}
+                except Exception:
+                    tracking_detail = tracking_campaign if isinstance(tracking_campaign, dict) else {}
+
+                tracking_queue_id = str(
+                    (tracking_detail.get("queue") or {}).get("id")
+                    or tracking_detail.get("queueId")
+                    or (tracking_campaign.get("queue") or {}).get("id")
+                    or tracking_campaign.get("queueId")
+                    or ""
+                ).strip()
+                tracking_contact_list_id = str(
+                    (tracking_detail.get("contactList") or {}).get("id")
+                    or tracking_detail.get("contactListId")
+                    or (tracking_campaign.get("contactList") or {}).get("id")
+                    or tracking_campaign.get("contactListId")
+                    or ""
+                ).strip()
+                tracking_caller_address = _normalize_phone_value(
+                    tracking_detail.get("callerAddress") or tracking_campaign.get("callerAddress") or ""
                 )
 
-            with st.expander("🔍 Seçili Kampanya Sonuç Analizi", expanded=True):
-                tracking_options = {
-                    f"{str(c.get('name') or c.get('id'))} ({str(c.get('campaignStatus') or c.get('status') or '-')})": str(c.get('id'))
-                    for c in campaigns
-                    if isinstance(c, dict) and c.get("id")
-                }
+                t1, t2 = st.columns([1, 1])
+                lookback_hours = int(
+                    t1.number_input(
+                        "Periyot (saat)",
+                        min_value=1,
+                        max_value=168,
+                        value=24,
+                        step=1,
+                        key=f"dialer_tracking_lookback_h_{tracking_campaign_id}",
+                    )
+                )
+                fetch_dashboard = t2.button(
+                    "Dashboard Yenile",
+                    key=f"dialer_tracking_refresh_btn_{tracking_campaign_id}",
+                    width="stretch",
+                )
 
-                if not tracking_options:
-                    st.info("Sonuç analizi için kampanya bulunamadı.")
+                if not tracking_queue_id:
+                    st.warning("Seçilen kampanyada queue bilgisi yok. Analiz için queue tanımlı olmalı.")
                 else:
-                    selected_tracking_label = st.selectbox(
-                        "Sonuçlarını görmek istediğiniz kampanya",
-                        list(tracking_options.keys()),
-                        key="dialer_tracking_campaign_select",
-                    )
-                    tracking_campaign_id = tracking_options.get(selected_tracking_label)
-                    tracking_campaign = next(
-                        (c for c in campaigns if isinstance(c, dict) and str(c.get("id") or "") == str(tracking_campaign_id or "")),
-                        {},
-                    )
-
-                    tracking_contact_list_id = str(
-                        (tracking_campaign.get("contactList") or {}).get("id")
-                        or tracking_campaign.get("contactListId")
-                        or ""
-                    ).strip()
-
-                    if not tracking_contact_list_id and tracking_campaign_id:
+                    cache_key = f"dialer_campaign_dashboard_{tracking_campaign_id}_{lookback_hours}"
+                    if refresh_tracking or fetch_dashboard or cache_key not in st.session_state:
+                        end_utc = datetime.now(timezone.utc)
+                        start_utc = end_utc - timedelta(hours=lookback_hours)
                         try:
-                            tracking_detail = api.get_outbound_campaign(tracking_campaign_id)
-                            tracking_contact_list_id = str(
-                                (tracking_detail.get("contactList") or {}).get("id")
-                                or tracking_detail.get("contactListId")
-                                or ""
-                            ).strip()
-                        except Exception:
-                            tracking_contact_list_id = ""
-
-                    if not tracking_contact_list_id:
-                        st.warning("Seçilen kampanyaya bağlı bir contact list bulunamadı.")
-                    else:
-                        try:
-                            tracking_contact_list_detail = api.get_outbound_contact_list(tracking_contact_list_id)
+                            queue_conversations = api.get_outbound_conversations_by_queue(
+                                tracking_queue_id,
+                                start_utc,
+                                end_utc,
+                                page_size=100,
+                                max_pages=20,
+                            )
                         except Exception as exc:
-                            tracking_contact_list_detail = {}
-                            st.error(f"Contact list detayı alınamadı: {_error_detail(exc)}")
+                            st.error(f"Konuşma verisi alınamadı: {_error_detail(exc)}")
+                            queue_conversations = []
 
-                        tracking_columns = list((tracking_contact_list_detail or {}).get("columnNames") or [])
-                        # Build options: Sistem Kodu (=lastResult renamed) first, then wrapUpCode, then contact list columns
-                        result_column_options = ["Sistem Kodu", "wrapUpCode", "lastAttempt"]
-                        for col in tracking_columns:
-                            # Skip raw "lastResult" — it's exposed as "Sistem Kodu" above
-                            if col not in result_column_options and col.lower() != "lastresult":
-                                result_column_options.append(col)
-                        inferred_result_column = _pick_result_column(result_column_options) or "Sistem Kodu"
-
-                        top1, top2, top3 = st.columns([2, 1, 1])
-                        tracking_result_column = top1.selectbox(
-                            "Sonuç kolonu",
-                            result_column_options or ["resultCode"],
-                            index=(result_column_options.index(inferred_result_column) if inferred_result_column in result_column_options else 0),
-                            key="dialer_tracking_result_column",
+                        interactions = _normalize_interaction_rows(
+                            api=api,
+                            conversations=queue_conversations,
+                            campaign_id=tracking_campaign_id,
+                            contact_list_id=tracking_contact_list_id,
+                            utc_offset_hours=utc_offset_local,
+                            users_map_rev=users_map_rev,
+                            wrapup_id_to_name=wrapup_id_to_name,
+                            wrapup_id_resolution_cache=wrapup_id_resolution_cache,
+                            caller_address=tracking_caller_address,
+                            conv_call_cache=conv_call_cache,
                         )
-                        tracking_sample_size = int(
-                            top2.number_input(
-                                "Örnek kayıt",
-                                min_value=50,
-                                max_value=2000,
-                                value=300,
-                                step=50,
-                                key="dialer_tracking_sample_size",
+                        st.session_state[cache_key] = {
+                            "interactions": interactions,
+                            "start_utc": start_utc,
+                            "end_utc": end_utc,
+                            "queue_id": tracking_queue_id,
+                            "campaign_id": tracking_campaign_id,
+                            "contact_list_id": tracking_contact_list_id,
+                        }
+
+                    payload = st.session_state.get(cache_key) or {}
+                    st.session_state["dialer_last_tracking_payload"] = payload
+                    df_int = pd.DataFrame(payload.get("interactions") or [])
+                    start_utc = payload.get("start_utc")
+                    end_utc = payload.get("end_utc")
+
+                    total_calls = len(df_int.index)
+                    busy_calls = int((df_int["Sonuç Sınıfı"] == "Meşgul").sum()) if not df_int.empty else 0
+                    unreachable_calls = int((df_int["Sonuç Sınıfı"] == "Ulaşılamadı").sum()) if not df_int.empty else 0
+                    completed_calls = int((df_int["Sonuç Sınıfı"] == "Tamamlanan").sum()) if not df_int.empty else 0
+                    retry_calls = int((df_int["Sonuç Sınıfı"] == "Tekrar Aranacak").sum()) if not df_int.empty else 0
+
+                    left, right = st.columns([3, 2])
+                    with left:
+                        _section_header("Campaign Overview")
+                        o1, o2, o3, o4, o5 = st.columns(5)
+                        o1.metric("Toplam", total_calls)
+                        o2.metric("Meşgul", busy_calls)
+                        o3.metric("Ulaşılamadı", unreachable_calls)
+                        o4.metric("Tamamlanan", completed_calls)
+                        o5.metric("Tekrar Aranacak", retry_calls)
+                        if start_utc and end_utc:
+                            st.caption(
+                                f"Dönem: {_format_local_timestamp(start_utc.isoformat(), utc_offset_local)} - "
+                                f"{_format_local_timestamp(end_utc.isoformat(), utc_offset_local)} | "
+                                f"Queue: {tracking_queue_id} | ContactList: {tracking_contact_list_id or '-'}"
                             )
-                        )
-                        show_empty_results = top3.checkbox(
-                            "Boş sonuçları göster",
-                            value=True,
-                            key="dialer_tracking_show_empty_results",
-                        )
 
-                        sampled_entities = _fetch_contact_list_sample(
-                            api,
-                            tracking_contact_list_id,
-                            max_records=tracking_sample_size,
-                        )
-                        flattened_rows = [
-                            _flatten_contact_entity(item, preferred_columns=tracking_columns)
-                            for item in sampled_entities
-                        ]
-
-                        if not flattened_rows:
-                            st.info("Contact list içinde örnek kayıt bulunamadı.")
+                    with right:
+                        _section_header("Wrap-up Details")
+                        if df_int.empty:
+                            st.info("Wrap-up dağılımı için veri bulunamadı.")
                         else:
-                            result_summary_df = _build_result_summary(flattened_rows, tracking_result_column)
-                            if not show_empty_results and not result_summary_df.empty:
-                                result_summary_df = result_summary_df[result_summary_df["sonuc"] != "(Boş)"]
-
-                            matched_count = 0
-                            for row in flattened_rows:
-                                raw_value = row.get(tracking_result_column)
-                                text_value = str(raw_value).strip() if raw_value is not None else ""
-                                if text_value:
-                                    matched_count += 1
-
-                            empty_count = max(0, len(flattened_rows) - matched_count)
-                            r1, r2, r3, r4 = st.columns(4)
-                            r1.metric("İncelenen Kayıt", len(flattened_rows))
-                            r2.metric("Sonuç Girilmiş", matched_count)
-                            r3.metric("Boş Sonuç", empty_count)
-                            r4.metric("Farklı Sonuç", int(len(result_summary_df.index)))
-
-                            summary_col, preview_col = st.columns([1, 2])
-                            with summary_col:
-                                _section_header("Sonuç Dağılımı")
-                                st.dataframe(result_summary_df, use_container_width=True, hide_index=True)
-
-                            preview_rows = flattened_rows
-                            if not show_empty_results:
-                                preview_rows = [
-                                    row
-                                    for row in flattened_rows
-                                    if str(row.get(tracking_result_column) or "").strip()
-                                ]
-
-                            # Preview: selected result col + phone cols + name fields (no duplicate native cols)
-                            preview_columns = [
-                                col
-                                for col in [tracking_result_column] + _extract_phone_columns(tracking_contact_list_detail if isinstance(tracking_contact_list_detail, dict) else {})
-                                if col
-                            ]
-                            for fallback_col in ["firstName", "lastName", "name", "externalId", "resultUpdatedAt"]:
-                                if fallback_col in tracking_columns and fallback_col not in preview_columns:
-                                    preview_columns.append(fallback_col)
-
-                            with preview_col:
-                                _section_header("Örnek Kayıtlar")
-                                st.caption(
-                                    f"Contact List ID: {tracking_contact_list_id} | Sonuç kolonu: {tracking_result_column}"
-                                )
-                                preview_df = pd.DataFrame(preview_rows)
-                                if not preview_df.empty and preview_columns:
-                                    preview_df = preview_df.reindex(columns=preview_columns)
-                                # Drop columns that are entirely empty to keep view clean
-                                if not preview_df.empty:
-                                    preview_df = preview_df.dropna(axis=1, how="all")
-                                st.dataframe(
-                                    preview_df,
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-
-                            st.download_button(
-                                label="⬇️ Tüm Kayıtları İndir (CSV)",
-                                data=pd.DataFrame(flattened_rows).to_csv(index=False).encode("utf-8-sig"),
-                                file_name=f"contact_list_{tracking_contact_list_id}_sample.csv",
-                                mime="text/csv",
-                                key="dialer_tracking_download_btn",
+                            wrapup_dist = (
+                                df_int["Wrap-up Kodu"]
+                                .astype(str)
+                                .str.strip()
+                                .replace("", "(Boş)")
+                                .value_counts()
+                                .reset_index()
                             )
+                            wrapup_dist.columns = ["Wrap-up", "Adet"]
+                            st.bar_chart(wrapup_dist.set_index("Wrap-up")["Adet"], width="stretch")
+
+                    st.divider()
+                    _section_header("Interactions")
+                    if df_int.empty:
+                        st.info("Seçilen kampanya için etkileşim bulunamadı.")
+                    else:
+                        order_cols = [
+                            "Agent",
+                            "Telefon",
+                            "Çağrı Tipi",
+                            "Başlangıç",
+                            "Bitiş",
+                            "Durasyon (sn)",
+                            "Sonuç Sınıfı",
+                            "Wrap-up Kodu",
+                            "Konuşma ID",
+                        ]
+                        display_df = df_int.reindex(columns=order_cols)
+                        st.dataframe(display_df, width="stretch", hide_index=True)
+                        st.download_button(
+                            label="⬇️ Interaction Verisini İndir (CSV)",
+                            data=display_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"campaign_{tracking_campaign_id}_interactions.csv",
+                            mime="text/csv",
+                            key=f"dialer_tracking_download_btn_{tracking_campaign_id}",
+                        )
+
+            with st.expander("🧩 Kampanya Sonuç Kodu Yönetimi", expanded=False):
+                mgmt_label = st.selectbox(
+                    "Kampanya",
+                    list(campaign_options.keys()),
+                    key="dialer_wrapup_mgmt_campaign_select",
+                )
+                mgmt_campaign = campaign_options.get(mgmt_label) or {}
+                mgmt_campaign_id = str(mgmt_campaign.get("id") or "").strip()
+                mgmt_detail = {}
+                try:
+                    mgmt_detail = api.get_outbound_campaign(mgmt_campaign_id) or {}
+                except Exception:
+                    mgmt_detail = mgmt_campaign if isinstance(mgmt_campaign, dict) else {}
+
+                mgmt_queue_id = str(
+                    (mgmt_detail.get("queue") or {}).get("id")
+                    or mgmt_detail.get("queueId")
+                    or (mgmt_campaign.get("queue") or {}).get("id")
+                    or mgmt_campaign.get("queueId")
+                    or ""
+                ).strip()
+                if not mgmt_queue_id:
+                    st.warning("Kampanya için queue bilgisi bulunamadı. Sonuç kodu yönetimi queue seviyesinde çalışır.")
+                else:
+                    same_queue_campaigns = []
+                    for item in campaigns:
+                        if not isinstance(item, dict):
+                            continue
+                        item_queue_id = str((item.get("queue") or {}).get("id") or item.get("queueId") or "").strip()
+                        if item_queue_id == mgmt_queue_id:
+                            same_queue_campaigns.append(str(item.get("name") or item.get("id") or ""))
+                    if len(same_queue_campaigns) > 1:
+                        st.warning(
+                            "Bu queue birden fazla kampanya tarafından kullanılıyor. "
+                            "Yapacağınız wrap-up kod değişikliği aynı queue'yu kullanan kampanyaları da etkiler."
+                        )
+                        st.caption("Etkilenen kampanyalar: " + ", ".join(same_queue_campaigns))
+
+                    queue_codes_cache_key = f"dialer_queue_wrapup_codes_{mgmt_queue_id}"
+                    queue_refresh_clicked = st.button(
+                        "Queue Sonuç Kodlarını Getir",
+                        key=f"dialer_wrapup_queue_refresh_{mgmt_queue_id}",
+                        width="stretch",
+                    )
+                    if refresh_tracking or refresh_wrapup_catalog or queue_refresh_clicked or queue_codes_cache_key not in st.session_state:
+                        try:
+                            st.session_state[queue_codes_cache_key] = api.get_queue_wrapup_codes(
+                                mgmt_queue_id,
+                                page_size=100,
+                                max_pages=20,
+                            ) or []
+                        except Exception as exc:
+                            st.error(f"Queue wrap-up kodları alınamadı: {_error_detail(exc)}")
+                            st.session_state[queue_codes_cache_key] = []
+                    queue_codes = st.session_state.get(queue_codes_cache_key) or []
+
+                    st.metric("Queue'ya Atalı Sonuç Kodu", len(queue_codes))
+                    if queue_codes:
+                        queue_df = pd.DataFrame(
+                            [
+                                {
+                                    "Kod": str(item.get("name") or item.get("id") or "").strip(),
+                                    "Açıklama": str(item.get("description") or "").strip(),
+                                }
+                                for item in queue_codes
+                                if isinstance(item, dict)
+                            ]
+                        )
+                        st.dataframe(queue_df, width="stretch", hide_index=True)
+                    else:
+                        st.info("Queue için wrap-up kodu bulunamadı.")
+
+                    assigned_ids = {
+                        str(item.get("id") or "").strip()
+                        for item in queue_codes
+                        if isinstance(item, dict) and str(item.get("id") or "").strip()
+                    }
+
+                    add_options: Dict[str, str] = {}
+                    for item in wrapup_codes_listing:
+                        if not isinstance(item, dict):
+                            continue
+                        code_id = str(item.get("id") or "").strip()
+                        code_name = str(item.get("name") or code_id).strip()
+                        if not code_id or code_id in assigned_ids:
+                            continue
+                        label = code_name
+                        if item.get("description"):
+                            label = f"{label} - {str(item.get('description')).strip()}"
+                        label = f"{label} [{code_id}]"
+                        while label in add_options:
+                            label += " "
+                        add_options[label] = code_id
+
+                    mgmt_add_col1, mgmt_add_col2 = st.columns([4, 1])
+                    selected_to_add = mgmt_add_col1.multiselect(
+                        "Queue'ya Eklenecek Hazır Sonuç Kodları",
+                        list(add_options.keys()),
+                        key=f"dialer_wrapup_queue_add_select_{mgmt_queue_id}",
+                    )
+                    if mgmt_add_col2.button(
+                        "Ekle",
+                        key=f"dialer_wrapup_queue_add_btn_{mgmt_queue_id}",
+                        width="stretch",
+                        disabled=not selected_to_add,
+                    ):
+                        selected_ids = [add_options[label] for label in selected_to_add if label in add_options]
+                        try:
+                            api.add_queue_wrapup_codes(mgmt_queue_id, selected_ids)
+                            st.success(f"{len(selected_ids)} sonuç kodu queue'ya eklendi.")
+                            st.session_state.pop(queue_codes_cache_key, None)
+                            st.session_state.pop(wrapup_map_key, None)
+                            st.session_state.pop(wrapup_list_key, None)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Queue sonuç kodu ekleme hatası: {_error_detail(exc)}")
+
+                    remove_options: Dict[str, str] = {}
+                    for item in queue_codes:
+                        if not isinstance(item, dict):
+                            continue
+                        code_id = str(item.get("id") or "").strip()
+                        if not code_id:
+                            continue
+                        label = f"{str(item.get('name') or code_id).strip()} [{code_id}]"
+                        while label in remove_options:
+                            label += " "
+                        remove_options[label] = code_id
+
+                    mgmt_rm_col1, mgmt_rm_col2 = st.columns([4, 1])
+                    remove_label = mgmt_rm_col1.selectbox(
+                        "Queue'dan Çıkarılacak Sonuç Kodu",
+                        ["(Seçim Yok)"] + list(remove_options.keys()),
+                        key=f"dialer_wrapup_queue_remove_select_{mgmt_queue_id}",
+                    )
+                    remove_id = remove_options.get(remove_label)
+                    if mgmt_rm_col2.button(
+                        "Çıkar",
+                        key=f"dialer_wrapup_queue_remove_btn_{mgmt_queue_id}",
+                        width="stretch",
+                        disabled=not remove_id,
+                    ):
+                        try:
+                            api.remove_queue_wrapup_code(mgmt_queue_id, remove_id)
+                            st.success("Sonuç kodu queue'dan çıkarıldı.")
+                            st.session_state.pop(queue_codes_cache_key, None)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Queue sonuç kodu çıkarma hatası: {_error_detail(exc)}")
+
+                    st.divider()
+                    st.caption("Yeni sonuç kodu tenant seviyesinde oluşturulur. İsterseniz aynı anda seçili queue'ya da atanır.")
+                    new_c1, new_c2 = st.columns([2, 1])
+                    new_name = new_c1.text_input(
+                        "Yeni Sonuç Kodu Adı",
+                        key=f"dialer_wrapup_create_name_{mgmt_queue_id}",
+                    ).strip()
+                    new_desc = new_c1.text_input(
+                        "Açıklama",
+                        key=f"dialer_wrapup_create_desc_{mgmt_queue_id}",
+                    ).strip()
+                    assign_after_create = new_c2.checkbox(
+                        "Queue'ya da ata",
+                        value=True,
+                        key=f"dialer_wrapup_create_assign_{mgmt_queue_id}",
+                    )
+                    if new_c2.button(
+                        "Yeni Kod Oluştur",
+                        key=f"dialer_wrapup_create_btn_{mgmt_queue_id}",
+                        width="stretch",
+                        disabled=not new_name,
+                    ):
+                        try:
+                            created = api.create_wrapup_code(new_name, description=new_desc)
+                            created_id = str((created or {}).get("id") or "").strip()
+                            if assign_after_create and created_id:
+                                api.add_queue_wrapup_codes(mgmt_queue_id, [created_id])
+                            st.success("Yeni sonuç kodu oluşturuldu.")
+                            st.session_state.pop(queue_codes_cache_key, None)
+                            st.session_state.pop(wrapup_map_key, None)
+                            st.session_state.pop(wrapup_list_key, None)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Sonuç kodu oluşturma hatası: {_error_detail(exc)}")
 
             with st.expander("🎯 Agent Wrap-up Kodları", expanded=False):
-                wup_campaign_options = {
-                    f"{str(c.get('name') or c.get('id'))} ({str(c.get('campaignStatus') or c.get('status') or '-')})": c
-                    for c in campaigns
-                    if isinstance(c, dict) and c.get("id")
-                }
-                if not wup_campaign_options:
-                    st.info("Wrap-up analizi için kampanya bulunamadı.")
-                else:
-                    wup_c1, wup_c2, wup_c3 = st.columns([3, 1, 1])
-                    wup_sel_label = wup_c1.selectbox(
-                        "Kampanya",
-                        list(wup_campaign_options.keys()),
-                        key="dialer_wupq_campaign_select",
-                    )
-                    wup_lookback_h = int(wup_c2.number_input(
+                wup_sel_label = st.selectbox(
+                    "Kampanya",
+                    list(campaign_options.keys()),
+                    key="dialer_wupq_campaign_select",
+                )
+                wup_campaign = campaign_options.get(wup_sel_label) or {}
+                wup_campaign_id = str(wup_campaign.get("id") or "").strip()
+                wup_lookback_h = int(
+                    st.number_input(
                         "Geriye dön (saat)",
-                        min_value=1, max_value=168, value=24, step=1,
+                        min_value=1,
+                        max_value=168,
+                        value=24,
+                        step=1,
                         key="dialer_wupq_lookback_h",
-                    ))
-                    wup_fetch = wup_c3.button("Getir", key="dialer_wupq_fetch_btn", use_container_width=True)
+                    )
+                )
+                wup_fetch = st.button("Getir", key="dialer_wupq_fetch_btn", width="stretch")
 
-                    wup_campaign = wup_campaign_options.get(wup_sel_label) or {}
-                    wup_queue_id = str((wup_campaign.get("queue") or {}).get("id") or "").strip()
-                    wup_caller_address = _normalize_phone_value((wup_campaign.get("callerAddress") or ""))
-                    if not wup_queue_id:
-                        # Try fetching fresh campaign detail for queue
-                        try:
-                            wup_detail = api.get_outbound_campaign(str(wup_campaign.get("id") or ""))
-                            wup_queue_id = str((wup_detail.get("queue") or {}).get("id") or "").strip()
-                            if not wup_caller_address:
-                                wup_caller_address = _normalize_phone_value((wup_detail.get("callerAddress") or ""))
-                        except Exception:
-                            wup_queue_id = ""
+                wup_detail = {}
+                try:
+                    wup_detail = api.get_outbound_campaign(wup_campaign_id) or {}
+                except Exception:
+                    wup_detail = wup_campaign if isinstance(wup_campaign, dict) else {}
+                wup_queue_id = str(
+                    (wup_detail.get("queue") or {}).get("id")
+                    or wup_detail.get("queueId")
+                    or (wup_campaign.get("queue") or {}).get("id")
+                    or wup_campaign.get("queueId")
+                    or ""
+                ).strip()
+                wup_contact_list_id = str(
+                    (wup_detail.get("contactList") or {}).get("id")
+                    or wup_detail.get("contactListId")
+                    or (wup_campaign.get("contactList") or {}).get("id")
+                    or wup_campaign.get("contactListId")
+                    or ""
+                ).strip()
+                wup_caller_address = _normalize_phone_value(
+                    wup_detail.get("callerAddress") or wup_campaign.get("callerAddress") or ""
+                )
+                if not wup_queue_id:
+                    st.warning("Seçilen kampanya için queue bulunamadı.")
+                else:
+                    wup_cache_key = f"dialer_wupq_cache_{wup_campaign_id}_{wup_lookback_h}"
+                    if refresh_tracking or wup_fetch or wup_cache_key not in st.session_state:
+                        with st.spinner("Konuşmalar getiriliyor..."):
+                            try:
+                                end_utc = datetime.now(timezone.utc)
+                                start_utc = end_utc - timedelta(hours=wup_lookback_h)
+                                wup_conversations = api.get_outbound_conversations_by_queue(
+                                    wup_queue_id,
+                                    start_utc,
+                                    end_utc,
+                                    page_size=100,
+                                    max_pages=20,
+                                )
+                                wup_rows = _normalize_interaction_rows(
+                                    api=api,
+                                    conversations=wup_conversations,
+                                    campaign_id=wup_campaign_id,
+                                    contact_list_id=wup_contact_list_id,
+                                    utc_offset_hours=utc_offset_local,
+                                    users_map_rev=users_map_rev,
+                                    wrapup_id_to_name=wrapup_id_to_name,
+                                    wrapup_id_resolution_cache=wrapup_id_resolution_cache,
+                                    caller_address=wup_caller_address,
+                                    conv_call_cache=conv_call_cache,
+                                )
+                                st.session_state[wup_cache_key] = wup_rows
+                            except Exception as exc:
+                                st.error(f"Konuşmalar alınamadı: {_error_detail(exc)}")
+                                st.session_state[wup_cache_key] = []
 
-                    if not wup_queue_id:
-                        st.warning("Seçilen kampanyaya bağlı bir kuyruk (queue) bulunamadı. Kampanya ayarlarında queue tanımlanmış olmalı.")
+                    wup_rows = st.session_state.get(wup_cache_key) or []
+                    wup_df = pd.DataFrame(wup_rows)
+                    w1, w2, w3 = st.columns(3)
+                    w1.metric("Toplam Konuşma", len(wup_df))
+                    has_wup = int(wup_df["Wrap-up Kodu"].astype(str).str.strip().str.len().gt(0).sum()) if not wup_df.empty else 0
+                    w2.metric("Wrap-up Girilmiş", has_wup)
+                    w3.metric("Wrap-up Girilmemiş", len(wup_df) - has_wup)
+                    if wup_df.empty:
+                        st.info("Seçilen dönemde bu kampanya için wrap-up verisi bulunamadı.")
                     else:
-                        wup_cache_key = f"dialer_wupq_cache_{wup_campaign.get('id')}_{wup_lookback_h}"
-                        if wup_fetch or wup_cache_key not in st.session_state:
-                            with st.spinner("Konuşmalar getiriliyor..."):
-                                try:
-                                    wup_end = datetime.utcnow()
-                                    wup_start = wup_end - timedelta(hours=wup_lookback_h)
-                                    wup_convs = api.get_outbound_conversations_by_queue(
-                                        wup_queue_id,
-                                        wup_start,
-                                        wup_end,
-                                        page_size=100,
-                                        max_pages=10,
-                                    )
-                                    st.session_state[wup_cache_key] = wup_convs
-                                except Exception as exc:
-                                    st.error(f"Konuşmalar alınamadı: {_error_detail(exc)}")
-                                    wup_convs = []
-                                    st.session_state[wup_cache_key] = []
-                        wup_convs = st.session_state.get(wup_cache_key) or []
-
-                        if not wup_convs:
-                            st.info("Seçilen dönemde bu kuyruğa ait outbound konuşma bulunamadı.")
-                        else:
-                            # Build userId -> name map from session state if available
-                            users_info = st.session_state.get("users_info") or {}
-                            users_map_rev = {}
-                            for uid, uinfo in users_info.items():
-                                if isinstance(uinfo, dict):
-                                    name = str(uinfo.get("name") or uinfo.get("username") or "").strip()
-                                    if name:
-                                        users_map_rev[str(uid).strip()] = name
-
-                            # Agent-focused mapping requested by user:
-                            # - Telefon: agent participant session ANI
-                            # - Wrap-up: agent participant segment wrapUpCode (last)
-
-                            wup_conv_call_cache = st.session_state.get("dialer_wup_conv_call_cache")
-                            if not isinstance(wup_conv_call_cache, dict):
-                                wup_conv_call_cache = {}
-                                st.session_state["dialer_wup_conv_call_cache"] = wup_conv_call_cache
-
-                            wup_rows = []
-                            for conv in wup_convs:
-                                if not isinstance(conv, dict):
-                                    continue
-                                conv_start = str(conv.get("conversationStart") or "").replace("T", " ")[:19]
-                                conv_end = str(conv.get("conversationEnd") or "").replace("T", " ")[:19]
-                                conv_id = str(conv.get("conversationId") or conv.get("id") or "").strip()
-
-                                agent_names: List[str] = []
-                                wrapup_code = ""
-                                phone = ""
-                                agent_ani_candidates: List[str] = []
-                                user_ani_candidates: List[str] = []
-                                agent_wrapup_last = ""
-                                user_wrapup_last = ""
-
-                                def _pick_phone(candidates: List[str]) -> str:
-                                    normalized: List[str] = []
-                                    for raw_val in candidates:
-                                        p = _normalize_phone_value(raw_val)
-                                        if p and p not in normalized:
-                                            normalized.append(p)
-                                    if not normalized:
-                                        return ""
-                                    if wup_caller_address:
-                                        for p in normalized:
-                                            if p != wup_caller_address:
-                                                return p
-                                    return normalized[0]
-
-                                # Source of truth: /conversations/calls/{id}
-                                call_conv = wup_conv_call_cache.get(conv_id) if conv_id else None
-                                if not isinstance(call_conv, dict) and conv_id:
-                                    try:
-                                        call_conv = api.get_conversation_call(conv_id)
-                                    except Exception:
-                                        call_conv = {}
-                                    if isinstance(call_conv, dict):
-                                        wup_conv_call_cache[conv_id] = call_conv
-                                call_participants = (call_conv or {}).get("participants") if isinstance(call_conv, dict) else None
-
-                                if isinstance(call_participants, list):
-                                    for p in call_participants:
-                                        purpose = str(p.get("purpose") or "").lower()
-                                        if purpose not in {"agent", "user"}:
-                                            continue
-
-                                        p_name = str(p.get("participantName") or p.get("name") or "").strip()
-                                        uid = str(((p.get("user") or {}).get("id") if isinstance(p.get("user"), dict) else p.get("userId")) or "").strip()
-                                        if not p_name and uid:
-                                            p_name = users_map_rev.get(uid, "")
-                                        if p_name and p_name not in agent_names:
-                                            agent_names.append(p_name)
-
-                                        p_ani = p.get("ani")
-                                        if purpose == "agent":
-                                            agent_ani_candidates.append(p_ani)
-                                        else:
-                                            user_ani_candidates.append(p_ani)
-
-                                        wu_obj = p.get("wrapup")
-                                        if isinstance(wu_obj, dict):
-                                            wu_code = str(wu_obj.get("code") or "").strip()
-                                            if wu_code:
-                                                if purpose == "agent":
-                                                    agent_wrapup_last = wu_code
-                                                else:
-                                                    user_wrapup_last = wu_code
-
-                                        for sess in p.get("sessions") or []:
-                                            if purpose == "agent":
-                                                agent_ani_candidates.append(sess.get("ani"))
-                                            else:
-                                                user_ani_candidates.append(sess.get("ani"))
-                                            for seg in sess.get("segments") or []:
-                                                wu = str(seg.get("wrapUpCode") or seg.get("wrapupCode") or "").strip()
-                                                if wu:
-                                                    if purpose == "agent":
-                                                        agent_wrapup_last = wu
-                                                    else:
-                                                        user_wrapup_last = wu
-
-                                    phone = _pick_phone(agent_ani_candidates) or _pick_phone(user_ani_candidates)
-                                    wrapup_code = agent_wrapup_last or user_wrapup_last
-
-                                if not isinstance(call_participants, list):
-                                    for p in conv.get("participants") or []:
-                                        purpose = str(p.get("purpose") or "").lower()
-                                        if purpose not in {"agent", "user"}:
-                                            continue
-
-                                        p_name = str(p.get("participantName") or "").strip()
-                                        uid = str(p.get("userId") or "").strip()
-                                        if not p_name and uid:
-                                            p_name = users_map_rev.get(uid, "")
-                                        if p_name and p_name not in agent_names:
-                                            agent_names.append(p_name)
-
-                                        for sess in p.get("sessions") or []:
-                                            if purpose == "agent":
-                                                agent_ani_candidates.append(sess.get("ani"))
-                                            else:
-                                                user_ani_candidates.append(sess.get("ani"))
-
-                                            for seg in sess.get("segments") or []:
-                                                wu = str(seg.get("wrapUpCode") or seg.get("wrapupCode") or "").strip()
-                                                if wu:
-                                                    if purpose == "agent":
-                                                        agent_wrapup_last = wu
-                                                    else:
-                                                        user_wrapup_last = wu
-
-                                    if not phone:
-                                        phone = _pick_phone(agent_ani_candidates) or _pick_phone(user_ani_candidates)
-                                    if not wrapup_code:
-                                        wrapup_code = agent_wrapup_last or user_wrapup_last
-
-                                wup_rows.append({
-                                    "Başlangıç": conv_start,
-                                    "Bitiş": conv_end,
-                                    "Telefon": phone,
-                                    "Agent": ", ".join(agent_names),
-                                    "Wrap-up Kodu": wrapup_code,
-                                    "Konuşma ID": conv_id,
-                                })
-
-                            wup_df = pd.DataFrame(wup_rows)
-                            w1, w2, w3 = st.columns(3)
-                            w1.metric("Toplam Konuşma", len(wup_df))
-                            has_wup = int(wup_df["Wrap-up Kodu"].astype(str).str.strip().str.len().gt(0).sum())
-                            w2.metric("Wrap-up Girilmiş", has_wup)
-                            w3.metric("Wrap-up Girilmemiş", len(wup_df) - has_wup)
-
-                            st.dataframe(wup_df, use_container_width=True, hide_index=True)
-                            st.download_button(
-                                label="⬇️ Wrap-up Listesini İndir (CSV)",
-                                data=wup_df.to_csv(index=False).encode("utf-8-sig"),
-                                file_name=f"wrapup_{wup_campaign.get('id')}_{wup_lookback_h}h.csv",
-                                mime="text/csv",
-                                key="dialer_wupq_download_btn",
-                            )
+                        wup_order_cols = [
+                            "Başlangıç",
+                            "Bitiş",
+                            "Telefon",
+                            "Çağrı Tipi",
+                            "Agent",
+                            "Wrap-up Kodu",
+                            "Konuşma ID",
+                        ]
+                        wup_display_df = wup_df.reindex(columns=wup_order_cols)
+                        st.dataframe(wup_display_df, width="stretch", hide_index=True)
+                        st.download_button(
+                            label="⬇️ Wrap-up Listesini İndir (CSV)",
+                            data=wup_display_df.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"wrapup_{wup_campaign_id}_{wup_lookback_h}h.csv",
+                            mime="text/csv",
+                            key="dialer_wupq_download_btn",
+                        )
 
             with st.expander("🔄 Sonuç Kodu Otomatik Senkron", expanded=False):
-                auto_col1, auto_col2, auto_col3 = st.columns(3)
-                auto_enabled = auto_col1.checkbox(
-                    "Otomatik senkron aktif",
-                    value=st.session_state.get("dialer_auto_result_enabled", True),
-                    key="dialer_auto_result_enabled",
-                )
-                auto_interval_sec = int(
-                    auto_col2.number_input(
-                        "Senkron aralığı (sn)",
-                        min_value=10,
-                        max_value=600,
-                        value=int(st.session_state.get("dialer_auto_result_interval", 45)),
-                        step=5,
-                        key="dialer_auto_result_interval",
-                    )
-                )
+                st.caption("Bu bölüm manuel çalışır. Otomatik sayfa yenileme kapalıdır.")
+                auto_col1, auto_col2, auto_col3 = st.columns([1, 2, 1])
                 auto_lookback_min = int(
-                    auto_col3.number_input(
+                    auto_col1.number_input(
                         "Geriye dönük pencere (dk)",
                         min_value=5,
                         max_value=180,
@@ -2183,194 +2901,37 @@ def render_dialer_service(context: Dict[str, Any]) -> None:
                         key="dialer_auto_result_lookback",
                     )
                 )
-                auto_result_column = st.text_input(
+                auto_result_column = auto_col2.text_input(
                     "Sonuç kodu data kolonu",
                     value=str(st.session_state.get("dialer_auto_result_column", "resultCode")),
                     key="dialer_auto_result_column",
                 ).strip() or "resultCode"
+                run_sync = auto_col3.button("Senkronu Çalıştır", key="dialer_auto_result_manual_run_btn", width="stretch")
 
-                now_ts = datetime.utcnow().timestamp()
-                last_run_ts = float(st.session_state.get("dialer_auto_result_last_run", 0) or 0)
-                due = (now_ts - last_run_ts) >= auto_interval_sec
-
-                auto_stats = st.session_state.get("dialer_auto_result_last_stats") or {}
-                if auto_enabled and due:
-                    with st.spinner("Sonuç kodları otomatik senkronize ediliyor..."):
+                if run_sync:
+                    with st.spinner("Sonuç kodları manuel senkronize ediliyor..."):
                         stats = _auto_sync_result_codes(
                             api,
                             campaigns=campaigns,
                             result_column=auto_result_column,
                             lookback_minutes=auto_lookback_min,
                         )
-                    st.session_state["dialer_auto_result_last_run"] = now_ts
                     st.session_state["dialer_auto_result_last_stats"] = stats
-                    auto_stats = stats
+                    st.session_state["dialer_auto_result_last_run"] = datetime.now(timezone.utc).isoformat()
 
+                auto_stats = st.session_state.get("dialer_auto_result_last_stats") or {}
                 if auto_stats:
                     stat1, stat2, stat3, stat4 = st.columns(4)
                     stat1.metric("Taranan", int(auto_stats.get("scanned", 0)))
                     stat2.metric("İşlenen", int(auto_stats.get("updated", 0)))
                     stat3.metric("Eşleşmeyen", int(auto_stats.get("not_found", 0)))
                     stat4.metric("Hata", int(auto_stats.get("errors", 0)))
-                elif auto_enabled:
-                    st.caption("AutoSync hazır. İlk senkron için kısa süre bekleniyor.")
-
-                if auto_enabled:
-                    remain = max(0, int(auto_interval_sec - (now_ts - float(st.session_state.get("dialer_auto_result_last_run", 0) or 0))))
-                    st.caption(f"Bir sonraki otomatik senkron: ~{remain} sn")
-                    st.markdown(
-                        f"<meta http-equiv='refresh' content='{max(10, auto_interval_sec)}'>",
-                        unsafe_allow_html=True,
-                    )
                 else:
-                    st.info("Otomatik senkron pasif. Açarsanız wrap-up sonuçları data'ya otomatik işlenir.")
+                    st.info("Henüz manuel senkron çalıştırılmadı.")
 
-            with st.expander("✏️ Manuel Sonuç Kodu Yaz", expanded=False):
-                st.caption("Gerekirse tekil manuel güncelleme için kullanın.")
+                last_run_iso = str(st.session_state.get("dialer_auto_result_last_run") or "").strip()
+                if last_run_iso:
+                    st.caption(f"Son manuel senkron: {_format_local_timestamp(last_run_iso, utc_offset_local)}")
 
-                result_contact_lists = []
-                try:
-                    result_contact_lists = api.get_outbound_contact_lists(page_size=100, max_pages=20)
-                except Exception as exc:
-                    st.error(f"Contact list alınamadı: {_error_detail(exc)}")
-
-                result_cl_options = {
-                    f"{item.get('name') or item.get('id')} ({item.get('id')})": str(item.get("id"))
-                    for item in result_contact_lists
-                    if isinstance(item, dict) and item.get("id")
-                }
-
-                if not result_cl_options:
-                    st.info("Sonuç kodu yazmak için contact list bulunamadı.")
-                else:
-                    sel_cl_label = st.selectbox(
-                        "Contact List",
-                        list(result_cl_options.keys()),
-                        key="dialer_result_code_contact_list",
-                    )
-                    sel_cl_id = result_cl_options.get(sel_cl_label)
-
-                    try:
-                        sel_cl_detail = api.get_outbound_contact_list(sel_cl_id)
-                    except Exception as exc:
-                        st.error(f"Contact list detayı alınamadı: {_error_detail(exc)}")
-                        sel_cl_detail = {}
-
-                    sel_columns = list((sel_cl_detail or {}).get("columnNames") or [])
-                    sel_phone_columns = _extract_phone_columns(sel_cl_detail if isinstance(sel_cl_detail, dict) else {})
-
-                    default_match_column = sel_phone_columns[0] if sel_phone_columns else (sel_columns[0] if sel_columns else "phone")
-                    match_col_idx = sel_columns.index(default_match_column) if default_match_column in sel_columns else 0
-                    match_column = st.selectbox(
-                        "Eşleşme kolonu",
-                        sel_columns if sel_columns else [default_match_column],
-                        index=match_col_idx if sel_columns else 0,
-                        key="dialer_result_code_match_column",
-                    )
-                    match_value = st.text_input("Eşleşme değeri", value="", key="dialer_result_code_match_value")
-
-                    result_default = "resultCode" if "resultCode" in sel_columns else ("wrapUpCode" if "wrapUpCode" in sel_columns else "resultCode")
-                    result_col_options = list(sel_columns)
-                    if "(Yeni kolon)" not in result_col_options:
-                        result_col_options.append("(Yeni kolon)")
-                    result_col_default_idx = result_col_options.index(result_default) if result_default in result_col_options else 0
-                    selected_result_col = st.selectbox(
-                        "Sonuç kodu kolonu",
-                        result_col_options,
-                        index=result_col_default_idx,
-                        key="dialer_result_code_column_select",
-                    )
-                    if selected_result_col == "(Yeni kolon)":
-                        result_column = st.text_input("Yeni kolon adı", value="resultCode", key="dialer_result_code_column_new")
-                    else:
-                        result_column = selected_result_col
-
-                    result_code = st.text_input("Sonuç kodu", value="", key="dialer_result_code_value")
-                    update_all = st.checkbox("Eşleşen tüm kayıtları güncelle", value=False, key="dialer_result_code_update_all")
-
-                    if st.button("Sonuç Kodunu Data'ya Yaz", key="dialer_result_code_apply_btn", use_container_width=True):
-                        if not sel_cl_id:
-                            st.error("Contact list seçimi zorunludur.")
-                        elif not match_column or not str(match_column).strip():
-                            st.error("Eşleşme kolonu zorunludur.")
-                        elif not str(match_value or "").strip():
-                            st.error("Eşleşme değeri zorunludur.")
-                        elif not str(result_column or "").strip():
-                            st.error("Sonuç kodu kolonu zorunludur.")
-                        elif not str(result_code or "").strip():
-                            st.error("Sonuç kodu zorunludur.")
-                        else:
-                            try:
-                                # Ensure target result column exists in contact list schema.
-                                if result_column not in sel_columns:
-                                    version = (sel_cl_detail or {}).get("version")
-                                    if version is None:
-                                        raise ValueError("Contact list version alınamadı, yeni kolon eklenemiyor")
-                                    update_cols = list(sel_columns)
-                                    update_cols.append(result_column)
-                                    update_payload = {
-                                        "id": sel_cl_id,
-                                        "name": str((sel_cl_detail or {}).get("name") or ""),
-                                        "columnNames": update_cols,
-                                        "phoneColumns": (sel_cl_detail or {}).get("phoneColumns") or [],
-                                        "version": version,
-                                    }
-                                    api.update_outbound_contact_list(sel_cl_id, update_payload)
-                                    sel_columns = update_cols
-
-                                search_res = api.search_outbound_contact_list_contacts(
-                                    sel_cl_id,
-                                    column=match_column,
-                                    value=str(match_value).strip(),
-                                    page_number=1,
-                                    page_size=100,
-                                )
-                                matched_entities = search_res.get("entities") if isinstance(search_res, dict) else []
-                                matched_entities = [x for x in matched_entities if isinstance(x, dict) and x.get("id")]
-                                if not matched_entities:
-                                    st.warning("Eşleşen contact kaydı bulunamadı.")
-                                else:
-                                    target_entities = matched_entities if update_all else matched_entities[:1]
-                                    ok = 0
-                                    fail = 0
-                                    last_err = None
-                                    for entity in target_entities:
-                                        contact_id = str(entity.get("id") or "").strip()
-                                        if not contact_id:
-                                            continue
-                                        try:
-                                            api.write_result_code_to_contact_data(
-                                                sel_cl_id,
-                                                contact_id,
-                                                result_column=result_column,
-                                                result_code=str(result_code).strip(),
-                                                extra_fields={"resultUpdatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z"},
-                                            )
-                                            ok += 1
-                                        except Exception as exc:
-                                            fail += 1
-                                            last_err = _error_detail(exc)
-
-                                    _audit_user_action(
-                                        "dialer_result_code_write",
-                                        f"resultCode write contactList={sel_cl_id} match={match_column}:{match_value} ok={ok} fail={fail}",
-                                        "success" if fail == 0 else "warning",
-                                        metadata={
-                                            "contact_list_id": sel_cl_id,
-                                            "match_column": match_column,
-                                            "match_value": str(match_value),
-                                            "result_column": result_column,
-                                            "result_code": str(result_code),
-                                            "ok": ok,
-                                            "fail": fail,
-                                        },
-                                    )
-
-                                    st.success(f"Sonuç kodu işlendi. Başarılı: {ok}, Hatalı: {fail}")
-                                    if last_err:
-                                        st.caption(f"Son hata: {last_err}")
-                            except Exception as exc:
-                                st.error(f"Sonuç kodu işleme hatası: {_error_detail(exc)}")
-
-            with st.expander("Ham Progress JSON", expanded=False):
-                st.code(_safe_json_dumps(progress_payload), language="json")
+            with st.expander("Ham Sonuç JSON", expanded=False):
+                st.code(_safe_json_dumps(st.session_state.get("dialer_last_tracking_payload") or {}), language="json")

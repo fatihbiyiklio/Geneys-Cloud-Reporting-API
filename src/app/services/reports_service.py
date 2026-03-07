@@ -260,10 +260,12 @@ def render_reports_service(context: Dict[str, Any]) -> None:
     # Date & Time Selection (One Row)
     # Use UTC offset to determine "today" in the organization's local timezone
     _local_today = (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date()
+    rep_start_date_key = "rep_start_date_v2"
+    rep_end_date_key = "rep_end_date_v2"
     c_d1, c_d2, c_d3, c_d4 = st.columns(4)
-    sd = c_d1.date_input("Start Date", _local_today)
+    sd = c_d1.date_input("Start Date", _local_today, key=rep_start_date_key, format="YYYY-MM-DD")
     st_ = c_d2.time_input(get_text(lang, "start_time"), time(0, 0))
-    ed = c_d3.date_input("End Date", _local_today)
+    ed = c_d3.date_input("End Date", _local_today, key=rep_end_date_key, format="YYYY-MM-DD")
     et = c_d4.time_input(get_text(lang, "end_time"), time(23, 59))
     interaction_agent_names = []
     interaction_agent_ids = []

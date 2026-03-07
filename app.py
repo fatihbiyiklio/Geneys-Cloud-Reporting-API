@@ -22,6 +22,7 @@ import psutil
 import re
 import html
 import builtins
+from urllib.parse import unquote
 
 def _load_fernet_class():
     """Reuse Fernet across Streamlit reruns to avoid reinitializing PyO3 modules."""
@@ -474,8 +475,13 @@ def cleanup_temp_files(max_age_hours=None, aggressive=False):
                 except Exception:
                     continue
 
+    force_target_cleanup = max_age_seconds <= 0
+
     # Also clean only temp-like leftovers in logs directory.
     log_temp_suffixes = (".tmp", ".temp", ".part", ".partial", ".download", ".crdownload")
+    if force_target_cleanup:
+        log_temp_suffixes += (".log",)
+        
     logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
     if os.path.isdir(logs_dir):
         try:
@@ -486,13 +492,13 @@ def cleanup_temp_files(max_age_hours=None, aggressive=False):
                 file_path = os.path.join(logs_dir, file_name)
                 if not os.path.isfile(file_path):
                     continue
+                if lower_name == "app.log":
+                    continue
                 summary["scanned_files"] += 1
                 if _is_old_enough(file_path):
                     _remove_file(file_path)
         except Exception as exc:
             _record_error(f"Logs dizini temizlenemedi: {logs_dir} ({exc})")
-
-    force_target_cleanup = max_age_seconds <= 0
 
     # Include persistent high-growth files in cleanup scope.
     # app.log is actively written, so truncate instead of delete.
@@ -829,63 +835,133 @@ def _render_login_bootstrap_loader(placeholder, title, description=None):
         unsafe_allow_html=True,
     )
 
-# --- APP SESSION MANAGEMENT (REMEMBER ME - DISK) ---
-APP_SESSION_TTL = 7 * 24 * 3600  # 7 days
+# --- APP SESSION MANAGEMENT (REMEMBER ME - COOKIE) ---
+APP_SESSION_TTL = 24 * 3600  # 24 hours
+REMEMBER_COOKIE_NAME = "genesys_remember_v1"
+REMEMBER_COOKIE_VERSION = 1
+REMEMBER_COOKIE_OPS_KEY = "_pending_remember_cookie_ops"
 
-def _session_file_path():
-    """Return the path to the encrypted session file."""
-    base_dir = os.environ.get("GENESYS_STATE_DIR") or ORG_BASE_DIR
+
+def _queue_remember_cookie_op(action, name, value="", max_age=None):
     try:
-        os.makedirs(base_dir, exist_ok=True)
+        action = str(action or "").strip().lower()
+        name = str(name or "").strip()
+        if action not in {"set", "delete"} or not name:
+            return
+        ops = st.session_state.get(REMEMBER_COOKIE_OPS_KEY)
+        if not isinstance(ops, list):
+            ops = []
+        op = {"action": action, "name": name}
+        if action == "set":
+            op["value"] = str(value or "")
+            op["max_age"] = int(max(1, int(max_age or APP_SESSION_TTL)))
+        ops.append(op)
+        st.session_state[REMEMBER_COOKIE_OPS_KEY] = ops
     except Exception:
         pass
-    return os.path.join(base_dir, ".session.enc")
+
+
+def _flush_remember_cookie_ops():
+    ops = st.session_state.get(REMEMBER_COOKIE_OPS_KEY)
+    if not isinstance(ops, list) or not ops:
+        return
+    st.session_state[REMEMBER_COOKIE_OPS_KEY] = []
+    try:
+        import streamlit.components.v1 as components
+        ops_json = json.dumps(ops, ensure_ascii=False)
+        components.html(
+            f"""
+            <script>
+            (function() {{
+                try {{
+                    const ops = {ops_json};
+                    const secureAttr = window.location.protocol === "https:" ? "; Secure" : "";
+                    ops.forEach(function(op) {{
+                        const name = String((op && op.name) || "").trim();
+                        if (!name) return;
+                        if (op.action === "set") {{
+                            const value = encodeURIComponent(String((op && op.value) || ""));
+                            const maxAge = Number((op && op.max_age) || 0);
+                            if (!(maxAge > 0)) return;
+                            document.cookie = name + "=" + value + "; Path=/; Max-Age=" + String(maxAge) + "; SameSite=Lax" + secureAttr;
+                            return;
+                        }}
+                        document.cookie = name + "=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax" + secureAttr;
+                    }});
+                }} catch (e) {{}}
+            }})();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+    except Exception:
+        pass
+
+
+def _read_cookie_value(name):
+    try:
+        cookies = getattr(st.context, "cookies", None)
+        if cookies is None:
+            return ""
+        raw = cookies.get(str(name or "").strip())
+        if raw is None:
+            return ""
+        text = str(raw).strip()
+        if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+            text = text[1:-1]
+        return unquote(text)
+    except Exception:
+        return ""
+
 
 def load_app_session():
-    """Load saved session from encrypted disk file. Returns user data dict or None."""
-    path = _session_file_path()
-    if not os.path.exists(path):
+    """Load encrypted remember-me payload from browser cookie."""
+    raw_cookie = _read_cookie_value(REMEMBER_COOKIE_NAME)
+    if not raw_cookie:
         return None
     try:
         cipher = _get_cipher()
-        with open(path, "rb") as f:
-            data = cipher.decrypt(f.read()).decode("utf-8")
+        data = cipher.decrypt(raw_cookie.encode("utf-8")).decode("utf-8")
         session = json.loads(data)
-        timestamp = session.get("timestamp", 0)
-        if pytime.time() - timestamp > APP_SESSION_TTL:
+        if not isinstance(session, dict):
+            delete_app_session()
+            return None
+        timestamp = float(session.get("timestamp", 0) or 0)
+        if timestamp <= 0 or (pytime.time() - timestamp) > APP_SESSION_TTL:
+            delete_app_session()
+            return None
+        payload_version = int(session.get("v", 0) or 0)
+        if payload_version != REMEMBER_COOKIE_VERSION:
             delete_app_session()
             return None
         return session
     except Exception:
-        # Corrupted or invalid file – remove silently
         delete_app_session()
         return None
 
+
 def save_app_session(user_data):
-    """Save user session to encrypted disk file."""
-    path = _session_file_path()
+    """Save encrypted remember-me payload in browser cookie."""
     try:
+        payload = {
+            "v": REMEMBER_COOKIE_VERSION,
+            "timestamp": pytime.time(),
+            **(user_data or {}),
+        }
         cipher = _get_cipher()
-        payload = {**user_data, "timestamp": pytime.time()}
-        encrypted = cipher.encrypt(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-        with open(path, "wb") as f:
-            f.write(encrypted)
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+        encrypted = cipher.encrypt(
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).decode("utf-8")
+        _queue_remember_cookie_op("set", REMEMBER_COOKIE_NAME, encrypted, APP_SESSION_TTL)
         return True
     except Exception:
         return False
 
+
 def delete_app_session():
-    """Delete session file from disk."""
-    path = _session_file_path()
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
+    """Delete remember-me cookie from browser."""
+    _queue_remember_cookie_op("delete", REMEMBER_COOKIE_NAME)
 
 def _hydrate_app_user_from_saved_session(session_data):
     """Validate saved session against current users DB and return hydrated user dict."""
@@ -2946,6 +3022,7 @@ def log_to_console(message, level='error'):
     st.markdown(js_code, unsafe_allow_html=True)
 
 init_session_state()
+_flush_remember_cookie_ops()
 _maybe_periodic_temp_cleanup()
 
 # Ensure shared DataManager is available after login
@@ -3030,39 +3107,78 @@ if not st.session_state.app_user:
                             st.error(msg)
         st.stop()
 
-    # Try auto-login from saved session file
-    saved_session = load_app_session()
-    if saved_session:
-        hydrated_user = _hydrate_app_user_from_saved_session(saved_session)
-        if hydrated_user and not hydrated_user.get("must_change_password"):
-            _log_user_action(
-                action="app_auto_login_file",
-                detail="Auto login from saved session file.",
-                status="success",
-                source="auth",
-                username=hydrated_user.get("username"),
-                org_code=hydrated_user.get("org_code"),
-                role=hydrated_user.get("role"),
-                page="LOGIN",
-            )
-            st.session_state.app_user = hydrated_user
-            st.session_state.remember_me_enabled = True
-            ensure_data_manager()
-            st.rerun()
-        else:
-            # Session invalid or user must change password
-            delete_app_session()
+    saved_session = load_app_session() or {}
+    remembered_org = "default"
+    remembered_username = ""
+    remember_default = False
+    if isinstance(saved_session, dict) and saved_session:
+        remember_default = True
+        remembered_username = str(saved_session.get("username") or "").strip()
+        try:
+            remembered_org = _safe_org_code(saved_session.get("org_code", "default")) or "default"
+        except Exception:
+            remembered_org = "default"
+
+    if remember_default and remembered_username:
+        u_org_safe = None
+        try:
+            u_org_safe = _safe_org_code(remembered_org)
+        except Exception:
+            u_org_safe = None
+
+        if u_org_safe:
+            lock_state = _get_login_lock_state(u_org_safe, remembered_username)
+            if not lock_state.get("locked"):
+                remembered_user_data = _hydrate_app_user_from_saved_session(
+                    {"username": remembered_username, "org_code": u_org_safe}
+                )
+
+                if remembered_user_data:
+                    _clear_login_failures(u_org_safe, remembered_username)
+                    safe_remembered_user = {k: v for k, v in remembered_user_data.items() if k != "password"}
+                    full_remembered_user = {"username": remembered_username, **safe_remembered_user}
+                    _log_user_action(
+                        action="app_auto_login_cookie",
+                        detail="Auto login from remember-me cookie.",
+                        status="success",
+                        source="auth",
+                        username=remembered_username,
+                        org_code=u_org_safe,
+                        role=full_remembered_user.get("role"),
+                        page="LOGIN",
+                    )
+                    st.session_state.app_user = full_remembered_user
+                    st.session_state.remember_me_enabled = True
+                    st.session_state.genesys_logged_out = False
+                    st.session_state.dashboard_config_loaded = False
+                    st.session_state.pop("_dashboard_config_owner", None)
+                    ensure_data_manager()
+                    st.rerun()
+                else:
+                    _log_user_action(
+                        action="app_auto_login_cookie_failed",
+                        detail="Cookie was present but user validation failed.",
+                        status="warning",
+                        source="auth",
+                        username=remembered_username,
+                        org_code=u_org_safe,
+                        page="LOGIN",
+                    )
+                    delete_app_session()
+                    remember_default = False
+                    remembered_org = "default"
+                    remembered_username = ""
 
     st.markdown("<h1 style='text-align: center;'>Genesys Reporting API</h1>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
         st.subheader(get_text(st.session_state.language, "login_title"))
-        u_org = st.text_input(get_text(st.session_state.language, "org_code"), value="default")
-        u_name = st.text_input(get_text(st.session_state.language, "username"))
-        u_pass = st.text_input(get_text(st.session_state.language, "password"), type="password")
+        u_org = st.text_input(get_text(st.session_state.language, "org_code"), value=remembered_org)
+        u_name = st.text_input(get_text(st.session_state.language, "username"), value=remembered_username)
+        u_pass = st.text_input(get_text(st.session_state.language, "password"), value="", type="password")
         remember_me = st.checkbox(
             get_text(st.session_state.language, "remember_me"),
-            value=False,
+            value=remember_default,
             help="Bu cihazda oturumu hatırla.",
         )
 
@@ -3070,7 +3186,7 @@ if not st.session_state.app_user:
         login_submitted = st.button(
             get_text(st.session_state.language, "login"),
             key="app_login_submit_btn",
-            use_container_width=True,
+            width='stretch',
         )
         if login_submitted:
             u_name_clean = str(u_name or "").strip()
@@ -3324,7 +3440,7 @@ with st.sidebar:
             _remove_org_session(st.session_state.app_user.get('org_code', 'default'))
         except Exception:
             pass
-        # Clear saved session file
+        # Clear remember-me cookie
         delete_app_session()
         st.session_state.remember_me_enabled = False
         # Clear all session state

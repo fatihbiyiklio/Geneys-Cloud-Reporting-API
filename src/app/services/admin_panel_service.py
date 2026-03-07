@@ -717,7 +717,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 disconnect_clicked = st.button(
                     f"🔌 {get_text(lang, 'disconnect_btn')}",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     key="admin_disconnect_btn"
                 )
             
@@ -1012,7 +1012,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 "📥 Seçili Kuyrukların Süresini Getir",
                                 key="admin_wrapup_fetch_btn",
                                 disabled=not selected_wrapup_queue_ids,
-                                use_container_width=True,
+                                width='stretch',
                             ):
                                 with st.spinner("Wrap-up süreleri getiriliyor..."):
                                     st.session_state[wrapup_snapshot_key] = api.get_queues_wrapup_timeouts(selected_wrapup_queue_ids)
@@ -1075,7 +1075,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                 type="primary",
                                 key="admin_wrapup_apply_btn",
                                 disabled=not update_target_queue_ids,
-                                use_container_width=True,
+                                width='stretch',
                             ):
                                 with st.spinner("Wrap-up süreleri güncelleniyor..."):
                                     update_results = api.set_queues_wrapup_timeout(
@@ -1622,7 +1622,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             
             with search_col2:
                 st.markdown("<br>", unsafe_allow_html=True)
-                search_clicked = st.button("🔍 Ara", type="primary", use_container_width=True, key="admin_user_search_btn")
+                search_clicked = st.button("🔍 Ara", type="primary", width='stretch', key="admin_user_search_btn")
             if search_clicked:
                 st.session_state.admin_user_search_triggered = True
                 st.session_state.admin_user_search_last_id = (user_id_input or "").strip()
@@ -1815,7 +1815,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                         "➕ Seçili Gruplara Ekle",
                                         key=f"admin_user_group_add_btn_{user_id_clean}",
                                         disabled=not add_selection,
-                                        use_container_width=True,
+                                        width='stretch',
                                     ):
                                         added = 0
                                         failed = []
@@ -1859,7 +1859,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                         "➖ Seçili Gruplardan Çıkar",
                                         key=f"admin_user_group_remove_btn_{user_id_clean}",
                                         disabled=not remove_selection,
-                                        use_container_width=True,
+                                        width='stretch',
                                     ):
                                         removed = 0
                                         failed = []
@@ -1902,7 +1902,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                             if st.button(
                                 "🔄 Kuyruk Üyeliklerini Yenile",
                                 key=f"admin_user_queue_refresh_btn_{user_id_clean}",
-                                use_container_width=True,
+                                width='stretch',
                             ):
                                 st.session_state[queue_memberships_refresh_key] = True
                                 _audit_user_action(
@@ -1989,14 +1989,14 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                     if st.button(
                                         "☑️ Tümünü Seç",
                                         key=f"admin_user_queue_select_all_btn_{user_id_clean}",
-                                        use_container_width=True,
+                                        width='stretch',
                                     ):
                                         st.session_state[queue_toggle_multiselect_key] = list(selectable_queue_ids)
                                 with queue_sel_col2:
                                     if st.button(
                                         "🧹 Seçimi Temizle",
                                         key=f"admin_user_queue_clear_sel_btn_{user_id_clean}",
-                                        use_container_width=True,
+                                        width='stretch',
                                     ):
                                         st.session_state[queue_toggle_multiselect_key] = []
 
@@ -2013,7 +2013,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                         "✅ Seçili Kuyrukları Aktif Yap",
                                         key=f"admin_user_queue_activate_btn_{user_id_clean}",
                                         disabled=not selected_queue_ids_for_toggle,
-                                        use_container_width=True,
+                                        width='stretch',
                                     ):
                                         with st.spinner("Seçili kuyruklar aktif yapılıyor..."):
                                             results = api.set_user_queues_joined(
@@ -2053,7 +2053,7 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                                         "⏸️ Seçili Kuyrukları Pasif Yap",
                                         key=f"admin_user_queue_deactivate_btn_{user_id_clean}",
                                         disabled=not selected_queue_ids_for_toggle,
-                                        use_container_width=True,
+                                        width='stretch',
                                     ):
                                         with st.spinner("Seçili kuyruklar pasif yapılıyor..."):
                                             results = api.set_user_queues_joined(
@@ -2202,6 +2202,8 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             status_prefix = f"admin_status_audit_tab7_{org}"
             status_rows_key = f"{status_prefix}_rows"
             status_meta_key = f"{status_prefix}_meta"
+            status_start_date_key = f"{status_prefix}_start_date_v2"
+            status_end_date_key = f"{status_prefix}_end_date_v2"
             status_cached_rows = st.session_state.get(status_rows_key) or []
             status_user_options, status_user_labels = _build_user_filter_options(status_cached_rows)
 
@@ -2209,14 +2211,16 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             with status_cfg_col1:
                 status_start_date = st.date_input(
                     "Statü Başlangıç Tarihi",
-                    value=st.session_state.get(f"{status_prefix}_start_date", default_start_date),
-                    key=f"{status_prefix}_start_date",
+                    value=st.session_state.get(status_start_date_key, default_start_date),
+                    key=status_start_date_key,
+                    format="YYYY-MM-DD",
                 )
             with status_cfg_col2:
                 status_end_date = st.date_input(
                     "Statü Bitiş Tarihi",
-                    value=st.session_state.get(f"{status_prefix}_end_date", today_local),
-                    key=f"{status_prefix}_end_date",
+                    value=st.session_state.get(status_end_date_key, today_local),
+                    key=status_end_date_key,
+                    format="YYYY-MM-DD",
                 )
             with status_cfg_col3:
                 status_max_pages = int(
@@ -2259,13 +2263,13 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 run_status_query_clicked = st.button(
                     "🔎 Statü Audit Sorgusunu Çalıştır",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     key=f"{status_prefix}_run_btn",
                 )
             with status_action_col2:
                 clear_status_results_clicked = st.button(
                     "🧹 Statü Sonuçlarını Temizle",
-                    use_container_width=True,
+                    width='stretch',
                     key=f"{status_prefix}_clear_btn",
                 )
 
@@ -2577,6 +2581,8 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             state_prefix = f"admin_queue_audit_tab7_{org}"
             rows_key = f"{state_prefix}_rows"
             meta_key = f"{state_prefix}_meta"
+            queue_start_date_key = f"{state_prefix}_start_date_v2"
+            queue_end_date_key = f"{state_prefix}_end_date_v2"
 
             cached_rows = st.session_state.get(rows_key) or []
             user_options, user_labels = _build_user_filter_options(cached_rows)
@@ -2585,14 +2591,16 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
             with cfg_col1:
                 queue_start_date = st.date_input(
                     "Başlangıç Tarihi",
-                    value=st.session_state.get(f"{state_prefix}_start_date", default_start_date),
-                    key=f"{state_prefix}_start_date",
+                    value=st.session_state.get(queue_start_date_key, default_start_date),
+                    key=queue_start_date_key,
+                    format="YYYY-MM-DD",
                 )
             with cfg_col2:
                 queue_end_date = st.date_input(
                     "Bitiş Tarihi",
-                    value=st.session_state.get(f"{state_prefix}_end_date", today_local),
-                    key=f"{state_prefix}_end_date",
+                    value=st.session_state.get(queue_end_date_key, today_local),
+                    key=queue_end_date_key,
+                    format="YYYY-MM-DD",
                 )
             with cfg_col3:
                 queue_max_pages = int(
@@ -2662,13 +2670,13 @@ def render_admin_panel_service(context: Dict[str, Any]) -> None:
                 run_query_clicked = st.button(
                     "🔎 Audit Sorgusunu Çalıştır",
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                     key=f"{state_prefix}_run_btn",
                 )
             with action_col2:
                 clear_results_clicked = st.button(
                     "🧹 Sonucu Temizle",
-                    use_container_width=True,
+                    width='stretch',
                     key=f"{state_prefix}_clear_btn",
                 )
 
